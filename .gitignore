@@ -1,0 +1,13 @@
+backend/.venv/
+backend/.ruff_cache/
+backend/.pytest_cache/
+backend/**/__pycache__/
+backend/*.log
+backend/*.egg-info/
+backend/build/
+backend/dist/
+.DS_Store
+ui/node_modules/
+ui/dist/
+ui/src-tauri/target/
+ui/src-tauri/Cargo.lock
