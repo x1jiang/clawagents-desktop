@@ -84,6 +84,22 @@ fn keyring_get(service: String, account: String) -> Result<Option<String>, Strin
 }
 
 #[tauri::command]
+fn open_in_finder(path: String) -> Result<(), String> {
+    std::process::Command::new("open")
+        .arg(&path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn gateway_log_path(state: State<'_, AppState>) -> Result<String, String> {
+    let guard = state.inner.lock().map_err(|e| e.to_string())?;
+    let info = guard.as_ref().ok_or_else(|| "gateway not started".to_string())?;
+    Ok(info.sidecar.log_path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
 async fn pick_folder(app: tauri::AppHandle) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
 
@@ -107,6 +123,8 @@ fn main() {
             pick_folder,
             keyring_set,
             keyring_get,
+            open_in_finder,
+            gateway_log_path,
         ])
         .setup(|app| {
             let port = pick_free_port().map_err(|e| format!("pick_free_port: {e}"))?;
