@@ -178,6 +178,16 @@ def create_app() -> tuple:
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
 
+    from clawagents.gateway.projects_api import router as _projects_router
+    from clawagents.gateway.chats_api import router as _chats_router
+    from clawagents.gateway.providers_api import router as _providers_router
+    from clawagents.gateway.permissions_api import router as _permissions_router
+
+    app.include_router(_projects_router)
+    app.include_router(_chats_router)
+    app.include_router(_providers_router)
+    app.include_router(_permissions_router)
+
     attach_websocket(app, llm, _GATEWAY_API_KEY)
 
     return app, llm, active_model
