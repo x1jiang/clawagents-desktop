@@ -98,8 +98,14 @@ def evaluate_tool_permission(
     is_read_only: bool = False,
     file_path: str | None = None,
     command: str | None = None,
+    project_root: str | None = None,
 ) -> PermissionDecision:
-    """Return a structured permission decision for one tool call."""
+    """Return a structured permission decision for one tool call.
+
+    When ``project_root`` is provided and ``mode == ACCEPT_EDITS``, write-class
+    tools targeting paths outside that root require user confirmation rather
+    than auto-allowing. Tools without a ``file_path`` are unaffected.
+    """
     if file_path:
         for candidate in _policy_match_paths(file_path):
             for pattern in SENSITIVE_PATH_PATTERNS:
@@ -119,6 +125,12 @@ def evaluate_tool_permission(
     if mode == PermissionMode.PLAN and is_write_class_tool(tool_name):
         return PermissionDecision(False, reason="Plan mode blocks mutating tools until exit_plan_mode")
     if mode == PermissionMode.ACCEPT_EDITS and is_write_class_tool(tool_name):
+        if project_root and file_path and not _path_inside(file_path, project_root):
+            return PermissionDecision(
+                False,
+                requires_confirmation=True,
+                reason=f"acceptEdits scoped to {project_root}; {file_path} is outside",
+            )
         return PermissionDecision(True, reason="acceptEdits allows write-class tools")
 
     reason = "Mutating tools require user confirmation in default mode."
@@ -126,6 +138,27 @@ def evaluate_tool_permission(
     if hint:
         reason = f"{reason} {hint}"
     return PermissionDecision(False, requires_confirmation=True, reason=reason)
+
+
+def _path_inside(file_path: str, root: str) -> bool:
+    """Return True if file_path is inside root (after normalization).
+
+    Both sides are passed through ``Path.resolve()``, so symlinks are
+    followed. This is intentional: a malicious symlink at
+    ``<root>/escape -> /etc/passwd`` resolves outside the root and is
+    correctly rejected. A trade-off is that legitimate symlinks pointing
+    out of the project (``vendor -> /opt/shared_libs``) downgrade to
+    "requires confirmation" rather than auto-allowing — that is the right
+    side to err on for a security control. Do not flip this to a lexical
+    comparison without re-evaluating the symlink-escape risk.
+    """
+    from pathlib import Path
+
+    try:
+        Path(file_path).resolve().relative_to(Path(root).resolve())
+        return True
+    except ValueError:
+        return False
 
 
 def _policy_match_paths(file_path: str) -> tuple[str, ...]:
