@@ -1447,6 +1447,8 @@ async def run_agent_graph(
     session_preload_limit: int | None = 200,
     handoffs: Optional[list[Handoff]] = None,
     agent_name: Optional[str] = None,
+    session_id: Optional[str] = None,
+    session_dir: Optional[Path] = None,
 ) -> AgentState:
     """Single ReAct loop: LLM → tools → LLM → tools → ... → final answer."""
     if features is not None:
@@ -1588,7 +1590,7 @@ async def run_agent_graph(
     from clawagents.config.features import is_enabled as _feat_enabled
     if _feat_enabled("session_persistence"):
         from clawagents.session.persistence import SessionWriter
-        session_writer = SessionWriter()
+        session_writer = SessionWriter(session_id=session_id, session_dir=session_dir)
         emit("context", {"message": f"session: {session_writer.session_id} → {session_writer.path}"})
 
     # Feature: External Hooks — load shell hooks from .clawagents/hooks.json or env

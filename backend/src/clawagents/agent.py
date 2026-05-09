@@ -165,6 +165,8 @@ class ClawAgent:
         session_preload_limit: Optional[int] = None,
         on_stream_event: Optional[Callable[[StreamEvent], None]] = None,
         handoffs: Optional[list[Handoff]] = None,
+        session_id: Optional[str] = None,
+        session_dir: Optional[Path] = None,
     ) -> AgentState:
         """Start the ReAct agent loop for ``task``.
 
@@ -216,6 +218,8 @@ class ClawAgent:
             ),
             handoffs=handoffs if handoffs is not None else self.handoffs,
             agent_name=self.name,
+            session_id=session_id,
+            session_dir=session_dir,
         )
 
     # ── Convenience hook methods ──────────────────────────────────────
