@@ -29,14 +29,14 @@ def _dict_to_message(d: dict[str, Any]) -> LLMMessage:
 
 @dataclass
 class RunResult:
-    messages: list[LLMMessage]
-    task: str
-    status: str
-    final_output: Any
-    result: str
-    iterations: int
-    max_iterations: int
-    tool_calls: int
+    messages: list[LLMMessage] = field(default_factory=list)
+    task: str = ""
+    status: str = "unknown"
+    final_output: Any = None
+    result: str = ""
+    iterations: int = 0
+    max_iterations: int = 0
+    tool_calls: int = 0
     trajectory_file: str = ""
     session_file: str = ""
     interruptions: list[dict[str, Any]] = field(default_factory=list)

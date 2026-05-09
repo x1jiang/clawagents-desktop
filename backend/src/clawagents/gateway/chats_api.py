@@ -7,6 +7,7 @@ the storage + listing + metadata reads.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import time
 import uuid
@@ -230,16 +231,39 @@ async def run_chat_turn(
     model: str,
     on_event: Callable[[str, dict], None],
 ) -> None:
-    """Invoke the agent for one user turn and emit events.
+    """Invoke the agent for one user turn, emitting SSE-shaped events."""
+    from contextlib import contextmanager
 
-    This is monkeypatched in tests. The real implementation is added in
-    Task 16 (post-plan integration). For now it raises if called without a
-    monkeypatch — proving the wiring works without dragging the LLM stack
-    into the tests.
-    """
-    raise NotImplementedError(
-        "run_chat_turn is wired in Task 16. Tests must monkeypatch this symbol."
-    )
+    from clawagents.agent import create_claw_agent
+
+    @contextmanager
+    def _chdir(path: str):
+        prev = os.getcwd()
+        os.chdir(path)
+        try:
+            yield
+        finally:
+            os.chdir(prev)
+
+    on_event("user_message", {"content": content})
+
+    with _chdir(project_root):
+        agent = create_claw_agent(model=model) if model else create_claw_agent()
+        try:
+            result = await agent.invoke(content, on_event=on_event)
+        except Exception as exc:  # noqa: BLE001
+            on_event("error", {"message": str(exc)})
+            return
+
+    status = getattr(result, "status", "unknown")
+    iterations = getattr(result, "iterations", 0)
+    out = getattr(result, "result", "")
+    on_event("turn_completed", {
+        "chat_id": chat_id,
+        "status": status,
+        "iterations": iterations,
+        "result": out if isinstance(out, str) else str(out),
+    })
 
 
 def _resolve_root_for_chat(chat_id: str) -> tuple[str, str | None]:
