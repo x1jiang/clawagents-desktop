@@ -2,7 +2,8 @@
 
 Saves and restores agent sessions as append-only JSONL files.
 Each line is a typed event: turn_started, assistant_message,
-tool_use, tool_result, turn_completed, usage, system_prompt.
+tool_use, tool_result, turn_completed, usage, system_prompt,
+chat_meta.
 
 Inspired by claw-code-main's session.rs.
 """
@@ -61,6 +62,10 @@ class SessionWriter:
         except FileNotFoundError:
             pass
         atomic_write_text(self.path, existing + json.dumps(event, default=str) + "\n")
+
+    def write_chat_meta(self, *, title: str, model: str, mode: str) -> None:
+        """Record desktop chat metadata. Ignored by message reconstruction."""
+        self.append("chat_meta", {"title": title, "model": model, "mode": mode})
 
     def write_system_prompt(self, content: str) -> None:
         self.append("system_prompt", {"content": content})
