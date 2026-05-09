@@ -304,3 +304,11 @@ async def post_chat_message(chat_id: str, body: MessageBody, request: Request) -
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )
+
+
+@router.post("/chats/{chat_id}/cancel")
+def cancel_chat(chat_id: str) -> dict:
+    _resolve_chat(chat_id)  # 404 if unknown
+    event = _cancel_events.setdefault(chat_id, asyncio.Event())
+    event.set()
+    return {"ok": True}
