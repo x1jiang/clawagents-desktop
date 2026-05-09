@@ -247,10 +247,18 @@ async def run_chat_turn(
 
     on_event("user_message", {"content": content})
 
+    sessions_dir = Path(project_root) / ".clawagents" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
     with _chdir(project_root):
         agent = create_claw_agent(model=model) if model else create_claw_agent()
         try:
-            result = await agent.invoke(content, on_event=on_event)
+            result = await agent.invoke(
+                content,
+                on_event=on_event,
+                session_id=chat_id,
+                session_dir=sessions_dir,
+            )
         except Exception as exc:  # noqa: BLE001
             on_event("error", {"message": str(exc)})
             return
