@@ -44,9 +44,14 @@ class SessionInfo:
 class SessionWriter:
     """Append-only JSONL writer for session events."""
 
-    def __init__(self, session_id: str | None = None):
+    def __init__(
+        self,
+        session_id: str | None = None,
+        *,
+        session_dir: Path | None = None,
+    ):
         self.session_id = session_id or _generate_session_id()
-        self.dir = _sessions_path()
+        self.dir = Path(session_dir) if session_dir is not None else _sessions_path()
         self.dir.mkdir(parents=True, exist_ok=True)
         self.path = self.dir / f"{self.session_id}.jsonl"
         self._turn_count = 0
