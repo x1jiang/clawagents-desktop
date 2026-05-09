@@ -74,6 +74,16 @@ fn resolve_log_path() -> PathBuf {
 }
 
 #[tauri::command]
+fn keyring_set(service: String, account: String, secret: String) -> Result<(), String> {
+    keyring_cmd::set(&service, &account, &secret)
+}
+
+#[tauri::command]
+fn keyring_get(service: String, account: String) -> Result<Option<String>, String> {
+    keyring_cmd::get(&service, &account)
+}
+
+#[tauri::command]
 async fn pick_folder(app: tauri::AppHandle) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
 
@@ -92,7 +102,12 @@ fn main() {
     tauri::Builder::default()
         .manage(AppState::default())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![get_gateway_info, pick_folder])
+        .invoke_handler(tauri::generate_handler![
+            get_gateway_info,
+            pick_folder,
+            keyring_set,
+            keyring_get,
+        ])
         .setup(|app| {
             let port = pick_free_port().map_err(|e| format!("pick_free_port: {e}"))?;
             let token = random_hex_token();
