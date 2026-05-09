@@ -1,0 +1,29 @@
+[package]
+name = "clawagents-desktop"
+version = "0.1.0"
+description = "ClawAgents Desktop — macOS shell"
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "clawagents_desktop_lib"
+path = "src/lib.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.0", features = [] }
+
+[dependencies]
+tauri = { version = "2.0", features = ["macos-private-api"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+keyring = { version = "3", features = ["apple-native"] }
+rand = "0.8"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
