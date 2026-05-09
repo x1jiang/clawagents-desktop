@@ -194,3 +194,113 @@ def delete_chat(chat_id: str) -> Response:
         if scratch.exists():
             shutil.rmtree(scratch)
     return Response(status_code=204)
+
+
+# ─── Streaming turn handler ─────────────────────────────────────────────
+
+import asyncio
+from typing import Any, Awaitable, Callable
+
+from fastapi import Request
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel as _BM
+
+
+class MessageBody(_BM):
+    content: str
+    model_override: str | None = None
+    mode_override: str | None = None
+
+
+# Per-chat cancellation events. A `POST /chats/:id/cancel` flips the event;
+# the running turn checks it at every safe point and aborts cleanly.
+_cancel_events: dict[str, asyncio.Event] = {}
+
+
+def _scratch_for(chat_id: str) -> str:
+    return str(_scratch_dir(chat_id))
+
+
+async def run_chat_turn(
+    *,
+    chat_id: str,
+    content: str,
+    project_root: str,
+    mode: str,
+    model: str,
+    on_event: Callable[[str, dict], None],
+) -> None:
+    """Invoke the agent for one user turn and emit events.
+
+    This is monkeypatched in tests. The real implementation is added in
+    Task 16 (post-plan integration). For now it raises if called without a
+    monkeypatch — proving the wiring works without dragging the LLM stack
+    into the tests.
+    """
+    raise NotImplementedError(
+        "run_chat_turn is wired in Task 16. Tests must monkeypatch this symbol."
+    )
+
+
+def _resolve_root_for_chat(chat_id: str) -> tuple[str, str | None]:
+    """Return (cwd / project_root, project_id|None)."""
+    path, project_id = _resolve_chat(chat_id)
+    if project_id is None:
+        return _scratch_for(chat_id), None
+    project = ProjectStore().get(project_id)
+    return project.root_path, project.id
+
+
+@router.post("/chats/{chat_id}/messages")
+async def post_chat_message(chat_id: str, body: MessageBody, request: Request) -> StreamingResponse:
+    # Resolve early to surface 404 before opening the stream.
+    path, _ = _resolve_chat(chat_id)
+    project_root, project_id = _resolve_root_for_chat(chat_id)
+    meta = _read_chat_meta(path)
+    mode = body.mode_override or meta.get("mode") or "auto"
+    model = body.model_override or meta.get("model") or ""
+
+    cancel_event = _cancel_events.setdefault(chat_id, asyncio.Event())
+    cancel_event.clear()
+
+    queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+    def emit(kind: str, data: dict) -> None:
+        line = f"event: {kind}\ndata: {json.dumps(data, default=str)}\n\n"
+        queue.put_nowait(line)
+
+    async def run() -> None:
+        try:
+            emit("turn_started", {"chat_id": chat_id})
+            await run_chat_turn(
+                chat_id=chat_id,
+                content=body.content,
+                project_root=project_root,
+                mode=mode,
+                model=model,
+                on_event=emit,
+            )
+        except asyncio.CancelledError:
+            emit("error", {"message": "cancelled"})
+        except Exception as exc:  # noqa: BLE001
+            emit("error", {"message": str(exc)})
+        finally:
+            queue.put_nowait(None)
+
+    asyncio.create_task(run())
+
+    async def gen():
+        while True:
+            chunk = await queue.get()
+            if chunk is None:
+                break
+            yield chunk
+            if await request.is_disconnected():
+                cancel_event.set()
+                break
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
