@@ -73,10 +73,26 @@ fn resolve_log_path() -> PathBuf {
     home.join("Library/Logs/ClawAgentsDesktop").join(format!("gateway-{ts}.log"))
 }
 
+#[tauri::command]
+async fn pick_folder(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
+    app.dialog()
+        .file()
+        .set_title("Choose a project folder")
+        .pick_folder(move |path| {
+            let path_string = path.and_then(|p| p.into_path().ok()).map(|p| p.to_string_lossy().into_owned());
+            let _ = tx.send(path_string);
+        });
+    rx.recv().map_err(|e| e.to_string())
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(AppState::default())
-        .invoke_handler(tauri::generate_handler![get_gateway_info])
+        .plugin(tauri_plugin_dialog::init())
+        .invoke_handler(tauri::generate_handler![get_gateway_info, pick_folder])
         .setup(|app| {
             let port = pick_free_port().map_err(|e| format!("pick_free_port: {e}"))?;
             let token = random_hex_token();
