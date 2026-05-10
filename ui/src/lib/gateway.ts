@@ -86,6 +86,10 @@ export class GatewayClient {
     });
   }
 
+  getChat(chatId: string): Promise<{ id: string; title: string; model: string; mode: string; project_id: string | null; created_at: string; last_message_at: string; status: string }> {
+    return this.request(`/chats/${chatId}`);
+  }
+
   getChatMessages(chatId: string): Promise<Array<{ role: string; content: string; tool_call_id?: string | null; tool_calls?: unknown; thinking?: string | null }>> {
     return this.request(`/chats/${chatId}/messages`);
   }

@@ -20,6 +20,7 @@ interface Props {
 export function ChatSurface({ projectId, chatId }: Props) {
   const [mode, setMode] = useState<ExecMode>("auto");
   const [model, setModel] = useState<string>("");
+  const [title, setTitle] = useState<string>("");
   const messages = useChats((s) => s.messages[chatId] ?? []);
   const streaming = useChats((s) => s.streaming[chatId] ?? false);
   const setMessages = useChats((s) => s.setMessages);
@@ -32,6 +33,11 @@ export function ChatSurface({ projectId, chatId }: Props) {
   useEffect(() => {
     if (!client) return;
     (async () => {
+      const meta = await client.getChat(chatId);
+      setTitle(meta.title);
+      if (meta.model) setModel(meta.model);
+      if (meta.mode) setMode(meta.mode as ExecMode);
+
       const replayed = await client.getChatMessages(chatId);
       const initial = replayed
         .filter((m) => m.role === "user" || m.role === "assistant")
@@ -78,8 +84,8 @@ export function ChatSurface({ projectId, chatId }: Props) {
     <div className="flex flex-col h-full">
       <div className="border-b border-gray-200 px-4 py-2 flex items-center justify-between">
         <div className="text-sm text-gray-700">
-          Chat <span className="font-mono text-xs text-gray-500">({chatId})</span>
-          {projectId && <span className="text-xs text-gray-400 ml-2">in project {projectId}</span>}
+          {title || "Chat"}
+          {projectId && <span className="text-xs text-gray-400 ml-2">· in project</span>}
         </div>
         <ModelPicker value={model} onChange={setModel} />
       </div>
