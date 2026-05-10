@@ -235,6 +235,67 @@ def _chat_lock(chat_id: str) -> asyncio.Lock:
     return lock
 
 
+def _translate_event(kind: str, data: dict) -> tuple[str, dict] | None:
+    """Map agent loop EventKinds to the frontend's stream-protocol events.
+
+    The agent emits a richer event vocabulary than the desktop UI cares
+    about. This translator is the single source of truth for what the SSE
+    stream exposes to the frontend. Returns None to drop an event.
+    """
+    # Pass-through (kinds that match exactly — either agent-synthesized events
+    # that already use frontend vocabulary, or frontend-vocabulary events
+    # emitted directly by run_chat_turn itself).
+    if kind in (
+        "turn_started", "error", "permission_required", "user_message",
+        "assistant_token", "tool_use", "turn_completed",
+    ):
+        return kind, data
+
+    # Streaming token deltas
+    if kind == "assistant_delta":
+        # Agent payloads vary; check common field names.
+        text = data.get("delta") or data.get("text") or data.get("content") or ""
+        if not text:
+            return None
+        return "assistant_token", {"text": text}
+
+    # A complete assistant message (no streaming)
+    if kind in ("assistant_message", "final_content"):
+        text = data.get("content") or ""
+        if not text:
+            return None
+        return "assistant_token", {"text": text}
+
+    # Tool call started — mirror the agent's id/name/args shape into tool_use
+    if kind == "tool_call":
+        return "tool_use", {
+            "id": str(data.get("id") or data.get("tool_call_id") or data.get("name", "")),
+            "name": data.get("name", ""),
+            "args": data.get("args") or data.get("arguments") or {},
+        }
+
+    # Tool result — translate name→tool_call_id when id missing
+    if kind == "tool_result":
+        return "tool_result", {
+            "tool_call_id": str(data.get("tool_call_id") or data.get("id") or data.get("name", "")),
+            "success": bool(data.get("success", True)),
+            "output": str(data.get("output") or data.get("preview") or data.get("result") or ""),
+        }
+
+    # Turn end
+    if kind == "agent_done":
+        return "turn_completed", {
+            "status": str(data.get("status", "ok")),
+            "iterations": int(data.get("iterations") or 0),
+            "result": str(data.get("result") or ""),
+        }
+
+    # Drop everything else: retry, warn, context, tool_started, usage,
+    # guardrail_tripped, compact_progress, approval_required, tool_skipped,
+    # final_output. These are debug/internal events the chat UI doesn't render.
+    return None
+
+
 def _scratch_for(chat_id: str) -> str:
     return str(_scratch_dir(chat_id))
 
@@ -339,8 +400,14 @@ async def post_chat_message(chat_id: str, body: MessageBody, request: Request) -
 
     queue: asyncio.Queue[str | None] = asyncio.Queue()
 
+    # Translate agent EventKinds to the frontend's stream-protocol vocabulary.
+    # Unknown event kinds are dropped silently (warn / context / retry / etc.).
     def emit(kind: str, data: dict) -> None:
-        line = f"event: {kind}\ndata: {json.dumps(data, default=str)}\n\n"
+        translated = _translate_event(kind, data)
+        if translated is None:
+            return
+        out_kind, out_data = translated
+        line = f"event: {out_kind}\ndata: {json.dumps(out_data, default=str)}\n\n"
         queue.put_nowait(line)
 
     async def run() -> None:
