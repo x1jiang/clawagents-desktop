@@ -6,6 +6,7 @@ import { Composer } from "./Composer";
 import { UserMessage } from "./Message/UserMessage";
 import { AssistantMessage } from "./Message/AssistantMessage";
 import { ErrorMessage } from "./Message/ErrorMessage";
+import { ToolCall } from "./Message/ToolCall";
 
 interface Props {
   projectId: string | null;
@@ -78,7 +79,19 @@ export function ChatSurface({ projectId, chatId }: Props) {
           if (m.kind === "user_message") return <UserMessage key={i} content={m.content} />;
           if (m.kind === "assistant_message") return <AssistantMessage key={i} content={m.content} />;
           if (m.kind === "error") return <ErrorMessage key={i} message={m.message} />;
-          return null;  // tool_call / permission_required handled in Tasks 10-12
+          if (m.kind === "tool_call") {
+            return (
+              <ToolCall
+                key={i}
+                name={m.name}
+                args={m.args}
+                running={m.running}
+                success={m.success}
+                result={m.result}
+              />
+            );
+          }
+          return null;  // permission_required handled in Task 12
         })}
         {messages.length === 0 && (
           <p className="text-sm text-gray-400">No messages yet.</p>
