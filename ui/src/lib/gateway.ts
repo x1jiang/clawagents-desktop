@@ -1,3 +1,5 @@
+import type { Chat } from "../stores/chats";
+
 export interface Project {
   id: string;
   name: string;
@@ -51,6 +53,43 @@ export class GatewayClient {
     return this.request<Project>("/projects", {
       method: "POST",
       body: JSON.stringify(body),
+    });
+  }
+
+  listProjectChats(projectId: string): Promise<Chat[]> {
+    return this.request<Chat[]>(`/projects/${projectId}/chats`);
+  }
+
+  createProjectChat(projectId: string, body: { title?: string; model?: string; mode?: string }): Promise<{ chat_id: string }> {
+    return this.request<{ chat_id: string }>(`/projects/${projectId}/chats`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  }
+
+  listProjectlessChats(): Promise<Chat[]> {
+    return this.request<Chat[]>("/chats");
+  }
+
+  createProjectlessChat(body: { title?: string; model?: string; mode?: string }): Promise<{ chat_id: string }> {
+    return this.request<{ chat_id: string }>("/chats", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  }
+
+  getChatMessages(chatId: string): Promise<Array<{ role: string; content: string; tool_call_id?: string | null; tool_calls?: unknown; thinking?: string | null }>> {
+    return this.request(`/chats/${chatId}/messages`);
+  }
+
+  cancelChat(chatId: string): Promise<{ ok: boolean }> {
+    return this.request(`/chats/${chatId}/cancel`, { method: "POST" });
+  }
+
+  resolvePermission(requestId: string, decision: "allow_once" | "allow_always" | "deny"): Promise<{ ok: boolean }> {
+    return this.request(`/permissions/${requestId}`, {
+      method: "POST",
+      body: JSON.stringify({ decision }),
     });
   }
 }

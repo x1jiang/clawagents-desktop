@@ -9,8 +9,18 @@ import { useProjects } from "./stores/projects";
 import { useSettings } from "./stores/settings";
 import { Route as RootRoute } from "./routes/__root";
 import { Route as IndexRoute } from "./routes/index";
+import { Route as ProjectRoute } from "./routes/project.$id";
+import { Route as ProjectChatRoute } from "./routes/project.$id.chat.$cid";
+import { Route as ChatRoute } from "./routes/chat.$cid";
+import { Route as SettingsRoute } from "./routes/settings";
 
-const routeTree = RootRoute.addChildren([IndexRoute]);
+const routeTree = RootRoute.addChildren([
+  IndexRoute,
+  ProjectRoute,
+  ProjectChatRoute,
+  ChatRoute,
+  SettingsRoute,
+]);
 const router = createRouter({ routeTree });
 
 declare module "@tanstack/react-router" {
