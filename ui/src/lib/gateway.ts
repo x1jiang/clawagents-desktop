@@ -108,4 +108,11 @@ export class GatewayClient {
   listProviders(): Promise<Array<{ id: string; name: string; available: boolean; models: Array<{ id: string; label: string; available: boolean }> }>> {
     return this.request("/providers");
   }
+
+  setApiKey(provider: "openai" | "anthropic" | "gemini", apiKey: string): Promise<{ ok: boolean; env: string; set: boolean }> {
+    return this.request("/settings/api-keys", {
+      method: "POST",
+      body: JSON.stringify({ provider, api_key: apiKey }),
+    });
+  }
 }

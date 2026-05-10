@@ -182,11 +182,13 @@ def create_app() -> tuple:
     from clawagents.gateway.chats_api import router as _chats_router
     from clawagents.gateway.providers_api import router as _providers_router
     from clawagents.gateway.permissions_api import router as _permissions_router
+    from clawagents.gateway.settings_api import router as _settings_router
 
     app.include_router(_projects_router)
     app.include_router(_chats_router)
     app.include_router(_providers_router)
     app.include_router(_permissions_router)
+    app.include_router(_settings_router)
 
     attach_websocket(app, llm, _GATEWAY_API_KEY)
 

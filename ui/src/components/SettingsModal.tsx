@@ -1,11 +1,14 @@
 import { useState } from "react";
 import { useSettings } from "../stores/settings";
+import { useProjects } from "../stores/projects";
 
 interface Props {
   onClose: () => void;
 }
 
-const PROVIDERS = [
+type ProviderId = "openai" | "anthropic" | "gemini";
+
+const PROVIDERS: Array<{ id: ProviderId; name: string }> = [
   { id: "openai", name: "OpenAI" },
   { id: "anthropic", name: "Anthropic" },
   { id: "gemini", name: "Google Gemini" },
@@ -14,6 +17,7 @@ const PROVIDERS = [
 export function SettingsModal({ onClose }: Props) {
   const apiKeys = useSettings((s) => s.apiKeys);
   const setApiKey = useSettings((s) => s.setApiKey);
+  const client = useProjects((s) => s.client);
   const [drafts, setDrafts] = useState<Record<string, string>>(() =>
     Object.fromEntries(PROVIDERS.map((p) => [p.id, apiKeys[p.id] ?? ""])),
   );
@@ -24,7 +28,18 @@ export function SettingsModal({ onClose }: Props) {
     try {
       for (const p of PROVIDERS) {
         if (drafts[p.id] !== (apiKeys[p.id] ?? "")) {
+          // 1. Persist to Keychain so the value survives app restarts.
           await setApiKey(p.id, drafts[p.id]);
+          // 2. Push into the running gateway's env so the next chat turn
+          //    picks it up without an app restart.
+          if (client) {
+            try {
+              await client.setApiKey(p.id, drafts[p.id]);
+            } catch {
+              // Best-effort. Keychain write already succeeded; user can
+              // restart the app if the live update path fails.
+            }
+          }
         }
       }
       onClose();
