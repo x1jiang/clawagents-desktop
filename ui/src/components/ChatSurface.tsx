@@ -1,6 +1,7 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { useChats } from "../stores/chats";
 import { useProjects } from "../stores/projects";
+import { streamMessages } from "../lib/stream";
 import { Composer } from "./Composer";
 import { UserMessage } from "./Message/UserMessage";
 import { AssistantMessage } from "./Message/AssistantMessage";
@@ -15,7 +16,10 @@ export function ChatSurface({ projectId, chatId }: Props) {
   const messages = useChats((s) => s.messages[chatId] ?? []);
   const streaming = useChats((s) => s.streaming[chatId] ?? false);
   const setMessages = useChats((s) => s.setMessages);
+  const appendEvent = useChats((s) => s.appendEvent);
+  const setStreaming = useChats((s) => s.setStreaming);
   const client = useProjects((s) => s.client);
+  const abortRef = useRef<AbortController | null>(null);
 
   // Load existing messages on mount.
   useEffect(() => {
@@ -33,9 +37,34 @@ export function ChatSurface({ projectId, chatId }: Props) {
     })();
   }, [client, chatId, setMessages]);
 
-  // Send wiring lands in Task 9.
-  function handleSend(_content: string) {
-    // Implemented in Task 9.
+  async function handleSend(content: string) {
+    if (!client) return;
+    setStreaming(chatId, true);
+
+    // Optimistic user-message bubble. The gateway also emits user_message
+    // via the agent; we filter that echo out below to avoid duplicates.
+    appendEvent(chatId, { kind: "user_message", content });
+
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+    try {
+      await streamMessages(
+        `${client.baseUrl}/chats/${chatId}/messages`,
+        client.bearerToken,
+        { content },
+        ctrl.signal,
+        (ev) => {
+          // Skip the gateway's user_message echo since we already rendered it.
+          if (ev.kind === "user_message") return;
+          appendEvent(chatId, ev);
+        },
+      );
+    } catch (e) {
+      appendEvent(chatId, { kind: "error", message: (e as Error).message });
+    } finally {
+      setStreaming(chatId, false);
+      abortRef.current = null;
+    }
   }
 
   return (

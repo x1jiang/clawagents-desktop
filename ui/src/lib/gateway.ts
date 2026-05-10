@@ -20,6 +20,14 @@ export interface CreateProjectBody {
 export class GatewayClient {
   constructor(private url: string, private token: string) {}
 
+  get baseUrl(): string {
+    return this.url;
+  }
+
+  get bearerToken(): string {
+    return this.token;
+  }
+
   private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
     const response = await fetch(`${this.url}${path}`, {
       ...init,
