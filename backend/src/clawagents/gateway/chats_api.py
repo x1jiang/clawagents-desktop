@@ -247,7 +247,17 @@ async def run_chat_turn(
 
     on_event("user_message", {"content": content})
 
-    sessions_dir = Path(project_root) / ".clawagents" / "sessions"
+    # Projectless chats live under app-support, not under the scratch dir.
+    # _resolve_chat tells us which case this is.
+    try:
+        _, project_id_for_chat = _resolve_chat(chat_id)
+    except HTTPException:
+        # Chat not yet persisted (e.g. unit-test scenario); treat as project-scoped.
+        project_id_for_chat = "unknown"
+    if project_id_for_chat is None:
+        sessions_dir = projectless_chats_dir()
+    else:
+        sessions_dir = Path(project_root) / ".clawagents" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
     with _chdir(project_root):
