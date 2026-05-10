@@ -1,13 +1,16 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useChats } from "../stores/chats";
 import { useProjects } from "../stores/projects";
 import { streamMessages } from "../lib/stream";
 import { Composer } from "./Composer";
+import { ModeChip } from "./ModeChip";
+import { ModelPicker } from "./ModelPicker";
 import { UserMessage } from "./Message/UserMessage";
 import { AssistantMessage } from "./Message/AssistantMessage";
 import { ErrorMessage } from "./Message/ErrorMessage";
 import { ToolCall } from "./Message/ToolCall";
 import { PermissionPrompt } from "./Message/PermissionPrompt";
+import type { ExecMode } from "../stores/settings";
 
 interface Props {
   projectId: string | null;
@@ -15,6 +18,8 @@ interface Props {
 }
 
 export function ChatSurface({ projectId, chatId }: Props) {
+  const [mode, setMode] = useState<ExecMode>("auto");
+  const [model, setModel] = useState<string>("");
   const messages = useChats((s) => s.messages[chatId] ?? []);
   const streaming = useChats((s) => s.streaming[chatId] ?? false);
   const setMessages = useChats((s) => s.setMessages);
@@ -53,7 +58,7 @@ export function ChatSurface({ projectId, chatId }: Props) {
       await streamMessages(
         `${client.baseUrl}/chats/${chatId}/messages`,
         client.bearerToken,
-        { content },
+        { content, model_override: model || undefined, mode_override: mode },
         ctrl.signal,
         (ev) => {
           // Skip the gateway's user_message echo since we already rendered it.
@@ -71,9 +76,12 @@ export function ChatSurface({ projectId, chatId }: Props) {
 
   return (
     <div className="flex flex-col h-full">
-      <div className="border-b border-gray-200 px-4 py-2 text-sm text-gray-700">
-        Chat <span className="font-mono text-xs text-gray-500">({chatId})</span>
-        {projectId && <span className="text-xs text-gray-400 ml-2">in project {projectId}</span>}
+      <div className="border-b border-gray-200 px-4 py-2 flex items-center justify-between">
+        <div className="text-sm text-gray-700">
+          Chat <span className="font-mono text-xs text-gray-500">({chatId})</span>
+          {projectId && <span className="text-xs text-gray-400 ml-2">in project {projectId}</span>}
+        </div>
+        <ModelPicker value={model} onChange={setModel} />
       </div>
       <div className="flex-1 overflow-y-auto px-6 py-4">
         {messages.map((m, i) => {
@@ -116,7 +124,11 @@ export function ChatSurface({ projectId, chatId }: Props) {
           <p className="text-sm text-gray-400">No messages yet.</p>
         )}
       </div>
-      <Composer onSend={handleSend} disabled={streaming} />
+      <Composer
+        onSend={handleSend}
+        disabled={streaming}
+        leftSlot={<ModeChip mode={mode} onChange={setMode} />}
+      />
     </div>
   );
 }

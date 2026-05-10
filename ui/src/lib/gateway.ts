@@ -100,4 +100,8 @@ export class GatewayClient {
       body: JSON.stringify({ decision }),
     });
   }
+
+  listProviders(): Promise<Array<{ id: string; name: string; available: boolean; models: Array<{ id: string; label: string; available: boolean }> }>> {
+    return this.request("/providers");
+  }
 }

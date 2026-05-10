@@ -1,11 +1,12 @@
-import { useState, type KeyboardEvent } from "react";
+import { useState, type KeyboardEvent, type ReactNode } from "react";
 
 interface Props {
   onSend: (content: string) => void;
   disabled?: boolean;
+  leftSlot?: ReactNode;
 }
 
-export function Composer({ onSend, disabled }: Props) {
+export function Composer({ onSend, disabled, leftSlot }: Props) {
   const [text, setText] = useState("");
 
   function send() {
@@ -24,6 +25,7 @@ export function Composer({ onSend, disabled }: Props) {
 
   return (
     <div className="border-t border-gray-200 p-3">
+      {leftSlot && <div className="mb-2 flex items-center gap-2">{leftSlot}</div>}
       <div className="flex items-end gap-2 bg-white border border-gray-300 rounded-lg p-2">
         <textarea
           className="flex-1 resize-none outline-none text-sm leading-snug min-h-[36px] max-h-[200px]"
