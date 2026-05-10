@@ -87,7 +87,25 @@ export function ChatSurface({ projectId, chatId }: Props) {
           {title || "Chat"}
           {projectId && <span className="text-xs text-gray-400 ml-2">· in project</span>}
         </div>
-        <ModelPicker value={model} onChange={setModel} />
+        <div className="flex items-center gap-2">
+          {streaming && (
+            <button
+              onClick={async () => {
+                if (!client) return;
+                abortRef.current?.abort();
+                try {
+                  await client.cancelChat(chatId);
+                } catch {
+                  // best-effort; the abort already stopped the SSE stream
+                }
+              }}
+              className="text-xs px-2 py-1 border border-red-300 bg-red-50 text-red-700 rounded hover:bg-red-100"
+            >
+              Cancel
+            </button>
+          )}
+          <ModelPicker value={model} onChange={setModel} />
+        </div>
       </div>
       <div className="flex-1 overflow-y-auto px-6 py-4">
         {messages.map((m, i) => {
