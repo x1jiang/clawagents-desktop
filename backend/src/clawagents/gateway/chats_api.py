@@ -195,6 +195,7 @@ def delete_chat(chat_id: str) -> Response:
         if scratch.exists():
             shutil.rmtree(scratch)
     _cancel_events.pop(chat_id, None)
+    _chat_locks.pop(chat_id, None)
     return Response(status_code=204)
 
 
@@ -217,6 +218,21 @@ class MessageBody(_BM):
 # Per-chat cancellation events. A `POST /chats/:id/cancel` flips the event;
 # the running turn checks it at every safe point and aborts cleanly.
 _cancel_events: dict[str, asyncio.Event] = {}
+
+# Process-wide lock: serializes all chdir-protected sections so concurrent
+# turns from different chats can't see each other's cwd.
+_chdir_lock = asyncio.Lock()
+
+# Per-chat locks: a chat shouldn't run two turns at once.
+_chat_locks: dict[str, asyncio.Lock] = {}
+
+
+def _chat_lock(chat_id: str) -> asyncio.Lock:
+    lock = _chat_locks.get(chat_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _chat_locks[chat_id] = lock
+    return lock
 
 
 def _scratch_for(chat_id: str) -> str:
@@ -261,18 +277,20 @@ async def run_chat_turn(
         sessions_dir = Path(project_root) / ".clawagents" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    with _chdir(project_root):
-        agent = create_claw_agent(model=model) if model else create_claw_agent()
-        try:
-            result = await agent.invoke(
-                content,
-                on_event=on_event,
-                session_id=chat_id,
-                session_dir=sessions_dir,
-            )
-        except Exception as exc:  # noqa: BLE001
-            on_event("error", {"message": str(exc)})
-            return
+    async with _chat_lock(chat_id):
+        async with _chdir_lock:
+            with _chdir(project_root):
+                agent = create_claw_agent(model=model) if model else create_claw_agent()
+                try:
+                    result = await agent.invoke(
+                        content,
+                        on_event=on_event,
+                        session_id=chat_id,
+                        session_dir=sessions_dir,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    on_event("error", {"message": str(exc)})
+                    return
 
     status = getattr(result, "status", "unknown")
     iterations = getattr(result, "iterations", 0)
