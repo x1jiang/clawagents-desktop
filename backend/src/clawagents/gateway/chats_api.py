@@ -341,6 +341,15 @@ async def run_chat_turn(
     from clawagents.gateway.permissions_api import get_registry
     from clawagents.desktop_stores.permission_grant_store import PermissionGrantStore
 
+    def _on_stream_event(event):
+        delta = None
+        if isinstance(event, dict):
+            delta = event.get("delta") or event.get("text") or event.get("content")
+        elif hasattr(event, "delta"):
+            delta = getattr(event, "delta", None)
+        if delta:
+            on_event("assistant_delta", {"delta": delta})
+
     async def _permission_cb(payload: dict) -> str:
         # Short-circuit: existing grant?
         if project_id_for_chat is not None:
@@ -381,6 +390,7 @@ async def run_chat_turn(
                         session_id=chat_id,
                         session_dir=sessions_dir,
                         permission_callback=_permission_cb,
+                        on_stream_event=_on_stream_event,
                     )
                 except Exception as exc:  # noqa: BLE001
                     on_event("error", {"message": str(exc)})
