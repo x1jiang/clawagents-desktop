@@ -92,7 +92,7 @@ export function ChatSurface({ projectId, chatId }: Props) {
       <div className="flex-1 overflow-y-auto px-6 py-4">
         {messages.map((m, i) => {
           if (m.kind === "user_message") return <UserMessage key={i} content={m.content} />;
-          if (m.kind === "assistant_message") return <AssistantMessage key={i} content={m.content} />;
+          if (m.kind === "assistant_message") return <AssistantMessage key={i} content={m.content} thinking={m.thinking} />;
           if (m.kind === "error") return <ErrorMessage key={i} message={m.message} />;
           if (m.kind === "tool_call") {
             return (
