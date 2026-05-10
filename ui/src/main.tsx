@@ -1,26 +1,42 @@
 import React, { useEffect, useState } from "react";
 import ReactDOM from "react-dom/client";
+import { RouterProvider, createRouter } from "@tanstack/react-router";
 import "./style.css";
 
 import { GatewayClient } from "./lib/gateway";
 import { tauriApi } from "./lib/tauri";
 import { useProjects } from "./stores/projects";
-import { ProjectList } from "./components/ProjectList";
+import { useSettings } from "./stores/settings";
+import { Route as RootRoute } from "./routes/__root";
+import { Route as IndexRoute } from "./routes/index";
 
-function App() {
+const routeTree = RootRoute.addChildren([IndexRoute]);
+const router = createRouter({ routeTree });
+
+declare module "@tanstack/react-router" {
+  interface Register {
+    router: typeof router;
+  }
+}
+
+function Bootstrap() {
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const setClient = useProjects((s) => s.setClient);
+  const loadSettings = useSettings((s) => s.load);
 
   useEffect(() => {
-    tauriApi
-      .getGatewayInfo()
-      .then((info) => {
+    (async () => {
+      try {
+        const info = await tauriApi.getGatewayInfo();
         setClient(new GatewayClient(info.url, info.token));
+        await loadSettings();
         setReady(true);
-      })
-      .catch((e) => setError((e as Error).message));
-  }, [setClient]);
+      } catch (e) {
+        setError((e as Error).message);
+      }
+    })();
+  }, [setClient, loadSettings]);
 
   if (error) {
     return (
@@ -36,11 +52,11 @@ function App() {
       </div>
     );
   }
-  return <ProjectList />;
+  return <RouterProvider router={router} />;
 }
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    <App />
+    <Bootstrap />
   </React.StrictMode>,
 );
