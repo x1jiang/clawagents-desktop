@@ -15,7 +15,13 @@ export function NewProjectModal({ onClose }: Props) {
 
   async function pickFolder() {
     const picked = await tauriApi.pickFolder();
-    if (picked) setRootPath(picked);
+    if (!picked) return;
+    setRootPath(picked);
+    // Auto-fill name from folder basename if the user hasn't typed one yet.
+    if (name.trim() === "") {
+      const basename = picked.replace(/\/+$/, "").split("/").pop() ?? "";
+      if (basename) setName(basename);
+    }
   }
 
   async function submit(e: FormEvent) {
