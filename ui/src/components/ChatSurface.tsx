@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { useChats } from "../stores/chats";
+import { useChats, type Message } from "../stores/chats";
 import { useProjects } from "../stores/projects";
 import { streamMessages } from "../lib/stream";
 import { Composer } from "./Composer";
@@ -17,6 +17,56 @@ interface Props {
   chatId: string;
 }
 
+interface ReplayedMessage {
+  role: string;
+  content: string;
+  tool_call_id?: string | null;
+  tool_calls?: Array<{ id: string; name: string; args?: unknown }> | null;
+  thinking?: string | null;
+}
+
+/**
+ * Reconstruct the full message tree from the JSONL replay including
+ * tool_calls and tool_results. The reducer in the store already merges
+ * streaming events; this is the cold-load equivalent.
+ */
+function rebuildMessages(replayed: ReplayedMessage[]): Message[] {
+  const out: Message[] = [];
+  const toolIdxById: Record<string, number> = {};
+
+  for (const m of replayed) {
+    if (m.role === "user") {
+      out.push({ kind: "user_message", content: m.content });
+    } else if (m.role === "assistant") {
+      out.push({
+        kind: "assistant_message",
+        content: m.content,
+        thinking: m.thinking ?? undefined,
+      });
+      if (m.tool_calls && Array.isArray(m.tool_calls)) {
+        for (const tc of m.tool_calls) {
+          out.push({
+            kind: "tool_call",
+            id: tc.id,
+            name: tc.name,
+            args: tc.args ?? {},
+            running: false,
+          });
+          toolIdxById[tc.id] = out.length - 1;
+        }
+      }
+    } else if (m.role === "tool" && m.tool_call_id) {
+      const idx = toolIdxById[m.tool_call_id];
+      if (idx !== undefined) {
+        const t = out[idx] as Extract<Message, { kind: "tool_call" }>;
+        out[idx] = { ...t, success: true, result: m.content };
+      }
+    }
+  }
+
+  return out;
+}
+
 export function ChatSurface({ projectId, chatId }: Props) {
   const [mode, setMode] = useState<ExecMode>("auto");
   const [model, setModel] = useState<string>("");
@@ -28,6 +78,7 @@ export function ChatSurface({ projectId, chatId }: Props) {
   const setStreaming = useChats((s) => s.setStreaming);
   const client = useProjects((s) => s.client);
   const abortRef = useRef<AbortController | null>(null);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
 
   // Load existing messages on mount.
   useEffect(() => {
@@ -39,16 +90,21 @@ export function ChatSurface({ projectId, chatId }: Props) {
       if (meta.mode) setMode(meta.mode as ExecMode);
 
       const replayed = await client.getChatMessages(chatId);
-      const initial = replayed
-        .filter((m) => m.role === "user" || m.role === "assistant")
-        .map((m) =>
-          m.role === "user"
-            ? { kind: "user_message" as const, content: m.content }
-            : { kind: "assistant_message" as const, content: m.content, thinking: m.thinking ?? undefined },
-        );
-      setMessages(chatId, initial);
+      setMessages(chatId, rebuildMessages(replayed as ReplayedMessage[]));
     })();
   }, [client, chatId, setMessages]);
+
+  // Auto-scroll to bottom whenever messages change (new tokens, tool results,
+  // permission prompts). Skipped while the user has scrolled up — pinning the
+  // viewport to the bottom only when they were already there.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    if (distanceFromBottom < 200) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [messages]);
 
   async function handleSend(content: string) {
     if (!client) return;
@@ -107,7 +163,7 @@ export function ChatSurface({ projectId, chatId }: Props) {
           <ModelPicker value={model} onChange={setModel} />
         </div>
       </div>
-      <div className="flex-1 overflow-y-auto px-6 py-4">
+      <div ref={scrollRef} className="flex-1 overflow-y-auto px-6 py-4">
         {messages.map((m, i) => {
           if (m.kind === "user_message") return <UserMessage key={i} content={m.content} />;
           if (m.kind === "assistant_message") return <AssistantMessage key={i} content={m.content} thinking={m.thinking} />;

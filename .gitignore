@@ -15,3 +15,8 @@ ui/dist/
 ui/src-tauri/target/
 ui/src-tauri/Cargo.lock
 ui/src-tauri/gen/
+ui/*.tsbuildinfo
+ui/vite.config.d.ts
+ui/vite.config.js
+ui/.npmrc
+ui/pnpm-workspace.yaml
