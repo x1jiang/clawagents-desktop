@@ -194,6 +194,7 @@ def delete_chat(chat_id: str) -> Response:
         scratch = projectless_scratch_dir() / chat_id
         if scratch.exists():
             shutil.rmtree(scratch)
+    _cancel_events.pop(chat_id, None)
     return Response(status_code=204)
 
 
