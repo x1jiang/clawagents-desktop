@@ -110,6 +110,21 @@ export function ChatSurface({ projectId, chatId }: Props) {
     if (!client) return;
     setStreaming(chatId, true);
 
+    // Auto-title the chat from the first user message. The "New chat"
+    // default is unhelpful in the sidebar once you have several chats —
+    // grab the first 60 chars of the user's first message instead.
+    const isFirstSend = messages.length === 0 && (title === "" || title === "New chat");
+    if (isFirstSend) {
+      const derived = content.trim().split(/\s+/).slice(0, 12).join(" ").slice(0, 60);
+      if (derived) {
+        setTitle(derived);
+        client.patchChat(chatId, { title: derived }).catch(() => {
+          // Best-effort. The chat still works; only the title fails to
+          // persist if the gateway hiccups here.
+        });
+      }
+    }
+
     // Optimistic user-message bubble. The gateway also emits user_message
     // via the agent; we filter that echo out below to avoid duplicates.
     appendEvent(chatId, { kind: "user_message", content });

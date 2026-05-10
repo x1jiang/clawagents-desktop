@@ -71,8 +71,10 @@ def _read_chat_meta(jsonl_path: Path) -> dict:
                     continue
                 ev = json.loads(line)
                 if ev.get("type") == "chat_meta":
+                    # Latest chat_meta wins. PATCH /chats/:id appends new
+                    # chat_meta events to update title/model/mode without
+                    # mutating the append-only JSONL.
                     meta.update({k: ev.get(k, meta[k]) for k in ("title", "model", "mode")})
-                    break
     except (OSError, json.JSONDecodeError):
         pass
     return meta
@@ -167,6 +169,32 @@ def create_projectless_chat(body: ChatCreateBody) -> dict:
 @router.get("/chats/{chat_id}")
 def get_chat(chat_id: str) -> dict:
     path, project_id = _resolve_chat(chat_id)
+    return _chat_record(path, project_id)
+
+
+class ChatPatchBody(BaseModel):
+    title: str | None = None
+    model: str | None = None
+    mode: str | None = None
+
+
+@router.patch("/chats/{chat_id}")
+def patch_chat(chat_id: str, body: ChatPatchBody) -> dict:
+    """Update chat title/model/mode by appending a new chat_meta event.
+
+    JSONL is append-only by design; `_read_chat_meta` resolves to the
+    latest entry, so a new chat_meta event takes precedence. Fields not
+    provided in the body inherit the current value.
+    """
+    path, project_id = _resolve_chat(chat_id)
+    current = _read_chat_meta(path)
+    sessions_dir = path.parent
+    writer = SessionWriter(session_id=chat_id, session_dir=sessions_dir)
+    writer.write_chat_meta(
+        title=body.title if body.title is not None else current["title"],
+        model=body.model if body.model is not None else current["model"],
+        mode=body.mode if body.mode is not None else current["mode"],
+    )
     return _chat_record(path, project_id)
 
 

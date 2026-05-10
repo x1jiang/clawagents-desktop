@@ -109,6 +109,13 @@ export class GatewayClient {
     return this.request("/providers");
   }
 
+  patchChat(chatId: string, body: { title?: string; model?: string; mode?: string }): Promise<{ id: string; title: string; model: string; mode: string }> {
+    return this.request(`/chats/${chatId}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    });
+  }
+
   setApiKey(provider: "openai" | "anthropic" | "gemini", apiKey: string): Promise<{ ok: boolean; env: string; set: boolean }> {
     return this.request("/settings/api-keys", {
       method: "POST",
