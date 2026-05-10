@@ -129,6 +129,24 @@ async fn pick_folder(app: tauri::AppHandle) -> Result<Option<String>, String> {
     rx.recv().map_err(|e| e.to_string())
 }
 
+fn collect_keychain_env() -> Vec<(String, String)> {
+    let providers = [
+        ("openai", "OPENAI_API_KEY"),
+        ("anthropic", "ANTHROPIC_API_KEY"),
+        ("gemini", "GEMINI_API_KEY"),
+    ];
+    let mut out = Vec::new();
+    for (account, env_name) in providers {
+        match keyring_cmd::get("com.clawagents.desktop", account) {
+            Ok(Some(value)) if !value.is_empty() => {
+                out.push((env_name.to_string(), value));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(AppState::default())
@@ -151,6 +169,7 @@ fn main() {
                 log_path: resolve_log_path(),
                 app_support_override: None,
                 env_file: resolve_env_file(),
+                extra_env: collect_keychain_env(),
             };
             let sidecar = Sidecar::spawn(&cfg).map_err(|e| format!("spawn sidecar: {e}"))?;
 

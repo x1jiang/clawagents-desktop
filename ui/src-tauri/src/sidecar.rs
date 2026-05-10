@@ -24,6 +24,8 @@ pub struct SpawnConfig {
     /// Path to a `.env` file to load before constructing providers.
     /// Translated into the `CLAWAGENTS_ENV_FILE` env var for the subprocess.
     pub env_file: Option<PathBuf>,
+    /// Additional env vars merged into the subprocess (e.g., API keys from Keychain).
+    pub extra_env: Vec<(String, String)>,
 }
 
 impl Sidecar {
@@ -49,6 +51,9 @@ impl Sidecar {
         }
         if let Some(env_file) = &cfg.env_file {
             cmd.env("CLAWAGENTS_ENV_FILE", env_file);
+        }
+        for (k, v) in &cfg.extra_env {
+            cmd.env(k, v);
         }
         cmd.stdout(Stdio::from(log_file));
         cmd.stderr(Stdio::from(log_dup));
