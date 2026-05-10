@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Any, Generic, TypeVar
+from typing import Any, Awaitable, Callable, Generic, Optional, TypeVar
 
 from clawagents.iteration_budget import IterationBudget
 from clawagents.permissions.mode import PermissionMode
@@ -82,6 +82,14 @@ class RunContext(Generic[TContext]):
     depth: int = 0
     skip_memory: bool = False
     iteration_budget: IterationBudget | None = None
+    # Optional callback invoked when a tool requires user confirmation.
+    # Signature: async (payload: dict) -> str  where the return value is one of
+    # "allow_once", "allow_always", or "deny".  None means no callback — the
+    # existing requires_confirmation fall-through behaviour is preserved for
+    # backward compatibility with non-desktop callers.
+    permission_callback: Optional[Callable[[dict], Awaitable[str]]] = field(
+        default=None, repr=False, compare=False,
+    )
     _approvals: dict[str, ApprovalRecord] = field(default_factory=dict)
     _always_approvals: dict[str, ApprovalRecord] = field(default_factory=dict)
     _metadata: dict[str, Any] = field(default_factory=dict)

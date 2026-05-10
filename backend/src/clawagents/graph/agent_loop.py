@@ -1504,6 +1504,11 @@ async def run_agent_graph(
         run_context = RunContext(context=user_context)
     elif user_context is not None and run_context.context is None:
         run_context.context = user_context
+    # Wire the permission_callback into run_context so that execute_tool
+    # can consult it at the decision site (registry.py) without needing
+    # an extra parameter threaded through every intermediate call.
+    if permission_callback is not None:
+        run_context.permission_callback = permission_callback
     usage = run_context.usage
 
     # Per-agent iteration budget (Hermes parity). If the caller has not

@@ -395,6 +395,31 @@ class ToolRegistry:
                         "to read-only tools while planning."
                     ),
                 )
+            # ── permission_callback invocation ────────────────────────────
+            # When the decision requires user confirmation (DEFAULT mode for
+            # write-class tools, or ACCEPT_EDITS for out-of-root paths),
+            # consult the permission_callback if one was provided.  Without a
+            # callback, the legacy fall-through behaviour is preserved so that
+            # non-desktop callers are unaffected.
+            if decision.requires_confirmation:
+                from clawagents.permissions.mode import PermissionDecision as _PD
+                _callback = getattr(run_context, "permission_callback", None)
+                if _callback is not None:
+                    _user_decision = await _callback({
+                        "tool": tool_name,
+                        "file_path": file_path if isinstance(file_path, str) else None,
+                        "command": args.get("command") if isinstance(args.get("command"), str) else None,
+                        "reason": decision.reason,
+                    })
+                    if _user_decision in ("allow_once", "allow_always"):
+                        decision = _PD(allowed=True, reason=f"user-{_user_decision}")
+                    else:
+                        decision = _PD(allowed=False, reason="user-denied")
+                    if not decision.allowed:
+                        return ToolResult(
+                            success=False, output="",
+                            error=f"Refused: '{tool_name}' was denied by the user.",
+                        )
 
         # Parameter validation with lenient coercion
         effective_args = args
