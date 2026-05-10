@@ -277,6 +277,18 @@ async def run_chat_turn(
         sessions_dir = Path(project_root) / ".clawagents" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
+    from clawagents.gateway.permissions_api import get_registry
+
+    async def _permission_cb(payload: dict) -> str:
+        registry = get_registry()
+        request_id = registry.create()
+        on_event("permission_required", {"request_id": request_id, **payload})
+        try:
+            return await registry.wait(request_id, timeout=600.0)
+        except asyncio.TimeoutError:
+            registry.resolve(request_id, "deny")
+            return "deny"
+
     async with _chat_lock(chat_id):
         async with _chdir_lock:
             with _chdir(project_root):
@@ -287,6 +299,7 @@ async def run_chat_turn(
                         on_event=on_event,
                         session_id=chat_id,
                         session_dir=sessions_dir,
+                        permission_callback=_permission_cb,
                     )
                 except Exception as exc:  # noqa: BLE001
                     on_event("error", {"message": str(exc)})

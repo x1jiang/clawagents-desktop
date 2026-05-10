@@ -1449,6 +1449,7 @@ async def run_agent_graph(
     agent_name: Optional[str] = None,
     session_id: Optional[str] = None,
     session_dir: Optional[Path] = None,
+    permission_callback: Optional[Callable[[dict], Any]] = None,
 ) -> AgentState:
     """Single ReAct loop: LLM → tools → LLM → tools → ... → final answer."""
     if features is not None:

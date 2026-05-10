@@ -167,6 +167,7 @@ class ClawAgent:
         handoffs: Optional[list[Handoff]] = None,
         session_id: Optional[str] = None,
         session_dir: Optional[Path] = None,
+        permission_callback: Optional[Callable[[dict], Any]] = None,
     ) -> AgentState:
         """Start the ReAct agent loop for ``task``.
 
@@ -220,6 +221,7 @@ class ClawAgent:
             agent_name=self.name,
             session_id=session_id,
             session_dir=session_dir,
+            permission_callback=permission_callback,
         )
 
     # ── Convenience hook methods ──────────────────────────────────────
