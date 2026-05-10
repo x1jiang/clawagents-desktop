@@ -62,6 +62,21 @@ fn resolve_python_path() -> PathBuf {
     PathBuf::from("python3")
 }
 
+fn resolve_env_file() -> Option<PathBuf> {
+    // Walk up from cwd looking for clawagents_desktop/.env (project-native)
+    // before falling back to the parent ~/Dropbox/.../.env. Same heuristic
+    // as resolve_python_path so it works whether tauri dev is launched
+    // from ui/, ui/src-tauri/, or clawagents_desktop/.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    for ancestor in cwd.ancestors() {
+        let candidate = ancestor.join(".env");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 fn resolve_log_path() -> PathBuf {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -135,6 +150,7 @@ fn main() {
                 api_key: token.clone(),
                 log_path: resolve_log_path(),
                 app_support_override: None,
+                env_file: resolve_env_file(),
             };
             let sidecar = Sidecar::spawn(&cfg).map_err(|e| format!("spawn sidecar: {e}"))?;
 

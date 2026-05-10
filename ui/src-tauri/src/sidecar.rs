@@ -21,6 +21,9 @@ pub struct SpawnConfig {
     pub log_path: PathBuf,
     /// Optional override for `CLAWAGENTS_DESKTOP_APP_SUPPORT` (used by tests).
     pub app_support_override: Option<PathBuf>,
+    /// Path to a `.env` file to load before constructing providers.
+    /// Translated into the `CLAWAGENTS_ENV_FILE` env var for the subprocess.
+    pub env_file: Option<PathBuf>,
 }
 
 impl Sidecar {
@@ -43,6 +46,9 @@ impl Sidecar {
         cmd.env("GATEWAY_API_KEY", &cfg.api_key);
         if let Some(override_path) = &cfg.app_support_override {
             cmd.env("CLAWAGENTS_DESKTOP_APP_SUPPORT", override_path);
+        }
+        if let Some(env_file) = &cfg.env_file {
+            cmd.env("CLAWAGENTS_ENV_FILE", env_file);
         }
         cmd.stdout(Stdio::from(log_file));
         cmd.stderr(Stdio::from(log_dup));
