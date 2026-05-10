@@ -7,6 +7,7 @@ import { UserMessage } from "./Message/UserMessage";
 import { AssistantMessage } from "./Message/AssistantMessage";
 import { ErrorMessage } from "./Message/ErrorMessage";
 import { ToolCall } from "./Message/ToolCall";
+import { PermissionPrompt } from "./Message/PermissionPrompt";
 
 interface Props {
   projectId: string | null;
@@ -91,7 +92,25 @@ export function ChatSurface({ projectId, chatId }: Props) {
               />
             );
           }
-          return null;  // permission_required handled in Task 12
+          if (m.kind === "permission_required") {
+            return (
+              <PermissionPrompt
+                key={i}
+                request_id={m.request_id}
+                tool={m.tool}
+                file_path={m.file_path}
+                reason={m.reason}
+                projectId={projectId}
+                resolved={m.resolved}
+                onResolve={async (decision) => {
+                  if (!client) return;
+                  await client.resolvePermission(m.request_id, decision);
+                  useChats.getState().resolvePermission(chatId, m.request_id, decision);
+                }}
+              />
+            );
+          }
+          return null;
         })}
         {messages.length === 0 && (
           <p className="text-sm text-gray-400">No messages yet.</p>
