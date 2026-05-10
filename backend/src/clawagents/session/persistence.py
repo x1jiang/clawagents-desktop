@@ -151,6 +151,11 @@ class SessionReader:
             if ev_type == "system_prompt":
                 messages.append(LLMMessage(role="system", content=ev["content"]))
 
+            elif ev_type == "user_message":
+                # Desktop chats write user_message events from the gateway
+                # before each turn so replay includes the user's prompts.
+                messages.append(LLMMessage(role="user", content=ev.get("content", "")))
+
             elif ev_type == "assistant_message":
                 tool_calls_meta = None
                 if ev.get("tool_calls"):

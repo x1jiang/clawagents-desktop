@@ -366,6 +366,13 @@ async def run_chat_turn(
         sessions_dir = Path(project_root) / ".clawagents" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
+    # Persist the user's prompt to the JSONL so GET /chats/:id/messages
+    # can replay it. The agent's SessionWriter only emits agent-side events
+    # (system_prompt, assistant_message, tool_result) — user input arrives
+    # as the `task` argument, never written by the agent itself.
+    _user_writer = SessionWriter(session_id=chat_id, session_dir=sessions_dir)
+    _user_writer.append("user_message", {"content": content})
+
     from clawagents.gateway.permissions_api import get_registry
     from clawagents.desktop_stores.permission_grant_store import PermissionGrantStore
 
@@ -419,6 +426,10 @@ async def run_chat_turn(
                         session_dir=sessions_dir,
                         permission_callback=_permission_cb,
                         on_stream_event=_on_stream_event,
+                        # Desktop chats need persisted JSONL so GET
+                        # /chats/:id/messages can replay history. The
+                        # framework's default is off — opt in per turn.
+                        features={"session_persistence": True},
                     )
                 except Exception as exc:  # noqa: BLE001
                     on_event("error", {"message": str(exc)})
