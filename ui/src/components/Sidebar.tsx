@@ -18,7 +18,10 @@ export function Sidebar() {
 
   useEffect(() => {
     refreshProjects();
-  }, [refreshProjects]);
+    if (client) {
+      client.listProjectlessChats().then((chats) => setChatList(null, chats));
+    }
+  }, [refreshProjects, client, setChatList]);
 
   async function toggleProject(projectId: string) {
     setExpanded((e) => ({ ...e, [projectId]: !e[projectId] }));
@@ -26,6 +29,14 @@ export function Sidebar() {
       const chats = await client.listProjectChats(projectId);
       setChatList(projectId, chats);
     }
+  }
+
+  async function newProjectlessChat() {
+    if (!client) return;
+    const created = await client.createProjectlessChat({ title: "New chat" });
+    const chats = await client.listProjectlessChats();
+    setChatList(null, chats);
+    router.navigate({ to: "/chat/$cid", params: { cid: created.chat_id } });
   }
 
   async function newChat(projectId: string) {
@@ -86,6 +97,12 @@ export function Sidebar() {
         })}
 
         <div className="text-xs uppercase tracking-wide text-gray-500 px-2 py-1 mt-3">Chats</div>
+        <button
+          className="w-full text-left px-2 py-1 text-xs text-gray-500 hover:text-gray-800"
+          onClick={newProjectlessChat}
+        >
+          + new chat
+        </button>
         {projectless.map((c) => (
           <Link
             key={c.id}
