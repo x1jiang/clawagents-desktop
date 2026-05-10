@@ -339,16 +339,36 @@ async def run_chat_turn(
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
     from clawagents.gateway.permissions_api import get_registry
+    from clawagents.desktop_stores.permission_grant_store import PermissionGrantStore
 
     async def _permission_cb(payload: dict) -> str:
+        # Short-circuit: existing grant?
+        if project_id_for_chat is not None:
+            file_path = payload.get("file_path")
+            if file_path and PermissionGrantStore().match(
+                project_id_for_chat, file_path, scope="write"
+            ):
+                return "allow_once"
+
         registry = get_registry()
         request_id = registry.create()
         on_event("permission_required", {"request_id": request_id, **payload})
         try:
-            return await registry.wait(request_id, timeout=600.0)
+            decision = await registry.wait(request_id, timeout=600.0)
         except asyncio.TimeoutError:
             registry.resolve(request_id, "deny")
             return "deny"
+
+        # Persist allow_always for project chats
+        if decision == "allow_always" and project_id_for_chat is not None:
+            file_path = payload.get("file_path")
+            if file_path:
+                PermissionGrantStore().add(
+                    project_id=project_id_for_chat,
+                    path_pattern=file_path,
+                    scope="write",
+                )
+        return decision
 
     async with _chat_lock(chat_id):
         async with _chdir_lock:
