@@ -2006,6 +2006,15 @@ async def run_agent_graph(
                 state.iterations += 1
                 emit("final_content", {"content": state.result})
                 messages.append(LLMMessage(role="assistant", content=response.content, thinking=_thinking_content))
+                # Persist the final answer to the session JSONL. The tool-call
+                # branch (~line 2247) already writes assistant_message when the
+                # response includes tool_calls; this mirror handles the plain-
+                # text final-answer path so desktop replay can see it too.
+                if session_writer:
+                    session_writer.write_assistant_message(
+                        response.content or "",
+                        thinking=_thinking_content,
+                    )
                 break
 
             # ── Handoff dispatch (v6.4) ──────────────────────────────
