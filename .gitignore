@@ -28,3 +28,10 @@ ui/pnpm-workspace.yaml
 # Release staging (DMGs uploaded via GitHub Releases, not git)
 /dist-release/
 *.dmg
+
+# Apple signing materials — never commit private keys / CSRs / .cer
+/certs/
+*.p8
+*.p12
+*.cer
+*.certSigningRequest

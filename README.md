@@ -6,13 +6,37 @@ macOS desktop app for ClawAgents: project-scoped chats, file tree, remote SSH pr
 
 1. Download the latest **`.dmg`** from [Releases](https://github.com/x1jiang/clawagents-desktop/releases).
 2. Open the DMG and drag **ClawAgents Desktop** into **Applications**.
-3. First launch: if macOS blocks it, right-click → **Open**, or allow it under **System Settings → Privacy & Security**.
+3. Open the app. Developer ID–signed builds are trusted by macOS once notarized; until notarization is configured, first launch may still need right-click → **Open**.
 4. Add API keys in **Settings** (stored in macOS Keychain — not in the app bundle).
 
 > The release DMG includes the embedded Python gateway. Thin Tauri-only builds without `Resources/backend` will not run.
 
-## Features (0.2.3)
+## Code signing & notarization (maintainers)
 
+Release builds need a **Developer ID Application** certificate (not *Apple Development*) for Team `SK58FV375Z`, then Apple notarization.
+
+```bash
+# One-time: create Developer ID Application in Xcode
+#   Xcode → Settings → Accounts → Manage Certificates → + → Developer ID Application
+# Or generate a CSR and upload at developer.apple.com:
+./scripts/create_developer_id_csr.sh
+
+# One-time: store notary credentials (app-specific password from appleid.apple.com)
+xcrun notarytool store-credentials clawagents-notary \
+  --apple-id "YOUR_APPLE_ID" \
+  --team-id SK58FV375Z \
+  --password "app-specific-password"
+
+# Production build: embeds Python → signs → notarizes DMG
+./build.sh
+
+# Sign only (skip Apple notarization wait):
+SKIP_NOTARIZE=1 ./build.sh
+```
+
+## Features (0.2.4)
+
+- **Developer ID signed** release builds (`./build.sh` signs after embedding Python)
 - Local projects and **SSH remote** projects (`~/.ssh/config`, including `ProxyJump`)
 - Chat UI with Export (Markdown) and Fork
 - File tree + **right-side file editor** (edit + autosave)
