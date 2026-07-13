@@ -798,6 +798,59 @@ async def _invoke_or_cancel(invoke_coro, cancel_event, on_event):
     return _CANCELLED
 
 
+def _bedrock_api_key() -> str:
+    """Gateway token for BAG / LiteLLM — never reuse OPENAI_API_KEY here."""
+    return (os.environ.get("BEDROCK_API_KEY") or "").strip() or "bedrock"
+
+
+def _apply_aws_settings(settings) -> None:
+    region = (getattr(settings, "aws_region", None) or "").strip()
+    if region:
+        os.environ["AWS_REGION"] = region
+        os.environ.setdefault("AWS_DEFAULT_REGION", region)
+    profile = (getattr(settings, "aws_profile", None) or "").strip()
+    if profile:
+        os.environ["AWS_PROFILE"] = profile
+
+
+def _resolve_model_kwargs(model: str | None, settings) -> dict:
+    """Translate app settings into create_claw_agent model/provider kwargs."""
+    from clawagents.desktop_stores.url_trust import is_trusted_base_url
+
+    kwargs: dict = {}
+    effective_model = (model or getattr(settings, "default_model", None) or "").strip() or None
+    if effective_model:
+        kwargs["model"] = effective_model
+
+    base_url = (getattr(settings, "base_url", None) or "").strip() or None
+    if base_url and (
+        is_trusted_base_url(base_url) or getattr(settings, "trust_custom_base_url", False)
+    ):
+        kwargs["base_url"] = base_url
+
+    provider = str(getattr(settings, "provider", None) or "auto")
+    if provider == "bedrock":
+        _apply_aws_settings(settings)
+        if not effective_model:
+            kwargs["model"] = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+        if kwargs.get("base_url"):
+            kwargs["api_key"] = _bedrock_api_key()
+    elif provider == "ollama":
+        if not kwargs.get("base_url"):
+            kwargs["base_url"] = "http://localhost:11434/v1"
+        if not effective_model:
+            kwargs["model"] = "llama3.1"
+        kwargs["api_key"] = (os.environ.get("OPENAI_API_KEY") or "").strip() or "ollama"
+    elif provider == "openai" and kwargs.get("base_url"):
+        kwargs["api_key"] = (os.environ.get("OPENAI_API_KEY") or "").strip() or "openai"
+    elif provider in {"openai", "anthropic", "gemini"} and not effective_model:
+        kwargs["profile"] = provider
+    elif not effective_model and provider == "auto":
+        # Leave model unset — create_claw_agent auto-detects from env.
+        pass
+    return kwargs
+
+
 async def run_chat_turn(
     *,
     chat_id: str,
@@ -1008,7 +1061,19 @@ async def run_chat_turn(
         if kind == "assistant_message":
             if content:
                 # Replaces the accumulated streamed tokens with the clean text.
-                on_event("assistant_final", {"content": content})
+                thinking = None
+                if isinstance(event, dict):
+                    thinking = event.get("thinking")
+                    if thinking is None:
+                        thinking = data.get("thinking")
+                else:
+                    thinking = getattr(event, "thinking", None)
+                    if thinking is None:
+                        thinking = data.get("thinking")
+                payload: dict = {"content": content}
+                if thinking:
+                    payload["thinking"] = thinking
+                on_event("assistant_final", payload)
             return
         if delta:
             on_event("assistant_delta", {"delta": delta})
@@ -1142,8 +1207,7 @@ async def run_chat_turn(
 
     # Build create_claw_agent kwargs from settings (VS Code parity).
     agent_kwargs: dict = {}
-    if model:
-        agent_kwargs["model"] = model
+    agent_kwargs.update(_resolve_model_kwargs(model, settings))
     instructions: list[str] = []
     if mode == "ask":
         instructions.append(

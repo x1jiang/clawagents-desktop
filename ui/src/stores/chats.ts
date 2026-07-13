@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import type { ChatAttachment } from "../lib/gateway";
+import { splitThinking } from "../lib/thinking";
 
 export interface Chat {
   id: string;
@@ -16,7 +17,7 @@ export interface Chat {
 
 export type Message =
   | { kind: "user_message"; content: string; attachments?: ChatAttachment[] }
-  | { kind: "assistant_message"; content: string; thinking?: string }
+  | { kind: "assistant_message"; content: string; thinking?: string; streamRaw?: string }
   | { kind: "tool_call"; id: string; name: string; args: unknown; result?: string; success?: boolean; running: boolean; startedAt?: number; elapsedMs?: number }
   | { kind: "permission_required"; request_id: string; tool: string; file_path?: string; reason: string; resolved?: "allow_once" | "allow_always" | "deny" }
   | { kind: "ask_user_required"; request_id: string; question: string; resolved?: boolean; answer?: string | null }
@@ -30,7 +31,7 @@ export type StreamEvent =
   | { kind: "turn_started"; chat_id?: string }
   | { kind: "user_message"; content: string; attachments?: ChatAttachment[] }
   | { kind: "assistant_token"; text: string }
-  | { kind: "assistant_final"; content: string }
+  | { kind: "assistant_final"; content: string; thinking?: string }
   | { kind: "tool_use"; id: string; name: string; args: unknown }
   | { kind: "tool_result"; tool_call_id: string; success: boolean; output: string }
   | { kind: "permission_required"; request_id: string; tool: string; file_path?: string; reason: string }
@@ -119,10 +120,22 @@ export const useChats = create<ChatsState>((set) => ({
           break;
         case "assistant_token": {
           const last = current[current.length - 1];
+          const prevRaw =
+            last && last.kind === "assistant_message"
+              ? (last.streamRaw ?? last.content)
+              : "";
+          const raw = prevRaw + ev.text;
+          const { content, thinking } = splitThinking(raw);
+          const next: Message = {
+            kind: "assistant_message",
+            content,
+            thinking,
+            streamRaw: raw,
+          };
           if (last && last.kind === "assistant_message") {
-            current[current.length - 1] = { ...last, content: last.content + ev.text };
+            current[current.length - 1] = next;
           } else {
-            current.push({ kind: "assistant_message", content: ev.text });
+            current.push(next);
           }
           break;
         }
@@ -131,10 +144,19 @@ export const useChats = create<ChatsState>((set) => ({
           // (which may still hold raw <think> text or pre-sanitization
           // artifacts). Push a fresh message if none was streamed.
           const last = current[current.length - 1];
+          const thinking = ev.thinking || undefined;
           if (last && last.kind === "assistant_message") {
-            current[current.length - 1] = { ...last, content: ev.content };
+            current[current.length - 1] = {
+              kind: "assistant_message",
+              content: ev.content,
+              thinking: thinking ?? last.thinking,
+            };
           } else if (ev.content) {
-            current.push({ kind: "assistant_message", content: ev.content });
+            current.push({
+              kind: "assistant_message",
+              content: ev.content,
+              thinking,
+            });
           }
           break;
         }

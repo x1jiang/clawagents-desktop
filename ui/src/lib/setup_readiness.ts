@@ -47,7 +47,7 @@ export function buildSetupReadiness(
       status: hasProviderKey ? "ready" : "needs-action",
       detail: hasProviderKey
         ? `${plural(models, "available model")} from ${plural(providers.length, "provider")}.`
-        : "No API key detected in keychain or environment.",
+        : "No API key or AWS credentials detected. Open Settings → Providers.",
     },
     {
       id: "project",

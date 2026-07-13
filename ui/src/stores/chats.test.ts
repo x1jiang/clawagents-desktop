@@ -54,11 +54,32 @@ describe("chats store", () => {
     s.appendEvent("c1", { kind: "assistant_token", text: "<think>x</think>" });
     s.appendEvent("c1", { kind: "assistant_token", text: "Answer: 42" });
     // Sanitized complete message arrives — must REPLACE, not append.
-    s.appendEvent("c1", { kind: "assistant_final", content: "Answer: 42" });
+    s.appendEvent("c1", { kind: "assistant_final", content: "Answer: 42", thinking: "x" });
     const msgs = useChats.getState().messages["c1"] ?? [];
     const assistants = msgs.filter((m) => m.kind === "assistant_message");
     expect(assistants).toHaveLength(1);
     expect((assistants[0] as { content: string }).content).toBe("Answer: 42");
+    expect((assistants[0] as { thinking?: string }).thinking).toBe("x");
+    expect((assistants[0] as { streamRaw?: string }).streamRaw).toBeUndefined();
+  });
+
+  test("assistant_token hides live <think> flash and accumulates thinking", () => {
+    const s = useChats.getState();
+    s.appendEvent("c1", { kind: "assistant_token", text: "<think>rea" });
+    let msg = useChats.getState().messages["c1"]?.[0] as {
+      content: string;
+      thinking?: string;
+    };
+    expect(msg.content).toBe("");
+    expect(msg.thinking).toBeUndefined();
+
+    s.appendEvent("c1", { kind: "assistant_token", text: "son</think>Hi" });
+    msg = useChats.getState().messages["c1"]?.[0] as {
+      content: string;
+      thinking?: string;
+    };
+    expect(msg.content).toBe("Hi");
+    expect(msg.thinking).toBe("reason");
   });
 
   test("assistant_final pushes a message when nothing streamed", () => {

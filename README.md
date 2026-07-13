@@ -11,12 +11,13 @@ macOS desktop app for ClawAgents: project-scoped chats, file tree, remote SSH pr
 
 > The release DMG includes the embedded Python gateway. Thin Tauri-only builds without `Resources/backend` will not run.
 
-## Features (0.2.2)
+## Features (0.2.3)
 
 - Local projects and **SSH remote** projects (`~/.ssh/config`, including `ProxyJump`)
 - Chat UI with Export (Markdown) and Fork
 - File tree + **right-side file editor** (edit + autosave)
-- Provider keys via Keychain (OpenAI / Anthropic / Gemini)
+- Providers: OpenAI / Anthropic / Gemini / **AWS Bedrock** (native IAM or gateway) / Ollama
+- Settings UI: sectioned Providers · Defaults · Agent · Data cards
 
 ## Develop
 

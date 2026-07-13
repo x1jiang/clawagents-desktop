@@ -18,6 +18,15 @@ class AppSettings:
     default_mode: str = "auto"  # ExecMode wire value
     theme: str = "system"       # "light" | "dark" | "system"
     workspace_system_prompt: str = ""  # Prepended to every chat's first turn
+    # Preferred provider for default-model routing / Settings UI focus.
+    # "auto" | "openai" | "anthropic" | "gemini" | "bedrock" | "ollama"
+    provider: str = "auto"
+    # OpenAI-compatible base URL (Azure, Ollama, BAG/LiteLLM). Empty = native.
+    base_url: str = ""
+    trust_custom_base_url: bool = False
+    # Native Amazon Bedrock (IAM). Used when provider=bedrock and base_url empty.
+    aws_region: str = ""
+    aws_profile: str = ""
     # Agent-power toggles (VS Code parity). Defaults match VS Code: off / safe.
     mcp_enabled: bool = False
     mcp_trust_workspace: bool = False

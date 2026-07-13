@@ -2632,7 +2632,10 @@ async def run_agent_graph(
                             state.result = obs
                             state.status = "done"
                             emit("final_content", {"content": state.result})
-                            _emit_typed("assistant_message", {"content": state.result})
+                            _emit_typed("assistant_message", {
+                                "content": state.result,
+                                "thinking": _thinking_content,
+                            })
                             break
                         messages.append(LLMMessage(
                             role="user",
@@ -2664,7 +2667,10 @@ async def run_agent_graph(
                 state.result = _sanitize_assistant_text(response.content)
                 state.status = "done"
                 emit("final_content", {"content": state.result})
-                _emit_typed("assistant_message", {"content": state.result})
+                _emit_typed("assistant_message", {
+                    "content": state.result,
+                    "thinking": _thinking_content,
+                })
                 if not _final_assistant_appended:
                     messages.append(LLMMessage(role="assistant", content=response.content, thinking=_thinking_content))
                 # Persist the final answer to the session JSONL. The tool-call
@@ -2922,7 +2928,10 @@ async def run_agent_graph(
             # calls) on the typed stream. Skipped in text-tool mode where
             # ``response.content`` is the raw JSON tool call itself.
             if use_native_tools and response.content and response.content.strip():
-                _emit_typed("assistant_message", {"content": response.content})
+                _emit_typed("assistant_message", {
+                    "content": response.content,
+                    "thinking": _thinking_content,
+                })
 
             # Session: write assistant message with tool calls
             if session_writer:

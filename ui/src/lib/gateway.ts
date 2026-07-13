@@ -58,6 +58,7 @@ export interface ProviderCatalogEntry {
   id: string;
   name: string;
   available: boolean;
+  base_url?: string | null;
   models: Array<{ id: string; label: string; available: boolean }>;
 }
 
@@ -84,6 +85,11 @@ export interface AppSettings {
   default_mode: string;
   theme: string;
   workspace_system_prompt: string;
+  provider: string;
+  base_url: string;
+  trust_custom_base_url: boolean;
+  aws_region: string;
+  aws_profile: string;
   mcp_enabled: boolean;
   mcp_trust_workspace: boolean;
   context_mode: boolean;
@@ -93,6 +99,7 @@ export interface AppSettings {
   action_mode: string;
   agent_mode: string;
   allow_full_access: boolean;
+  has_aws_credentials?: boolean;
 }
 
 export interface AutoApprove {
@@ -283,7 +290,10 @@ export class GatewayClient {
     return response.blob();
   }
 
-  setApiKey(provider: "openai" | "anthropic" | "gemini", apiKey: string): Promise<{ ok: boolean; env: string; set: boolean }> {
+  setApiKey(
+    provider: "openai" | "anthropic" | "gemini" | "bedrock",
+    apiKey: string,
+  ): Promise<{ ok: boolean; env: string; set: boolean }> {
     return this.request("/settings/api-keys", {
       method: "POST",
       body: JSON.stringify({ provider, api_key: apiKey }),
@@ -536,7 +546,10 @@ export class GatewayClient {
    * Hit the provider's models endpoint to confirm a key actually authenticates.
    * Returns shape: { ok, status, message, model_count }. Used by Settings "Test".
    */
-  verifyApiKey(provider: "openai" | "anthropic" | "gemini", apiKey: string): Promise<{
+  verifyApiKey(
+    provider: "openai" | "anthropic" | "gemini" | "bedrock",
+    apiKey: string = "",
+  ): Promise<{
     ok: boolean;
     status: number;
     message: string;

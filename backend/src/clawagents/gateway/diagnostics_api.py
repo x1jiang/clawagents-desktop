@@ -77,8 +77,22 @@ def diagnostics() -> dict:
                 ("openai", "OPENAI_API_KEY"),
                 ("anthropic", "ANTHROPIC_API_KEY"),
                 ("gemini", "GEMINI_API_KEY"),
+                ("bedrock", "BEDROCK_API_KEY"),
             ) if os.environ.get(env)
-        ],
+        ] + (
+            ["bedrock"]
+            if (
+                not os.environ.get("BEDROCK_API_KEY")
+                and (
+                    (os.environ.get("AWS_ACCESS_KEY_ID") and os.environ.get("AWS_SECRET_ACCESS_KEY"))
+                    or os.environ.get("AWS_PROFILE")
+                    or os.environ.get("AWS_REGION")
+                    or os.environ.get("AWS_DEFAULT_REGION")
+                    or os.path.isfile(os.path.expanduser("~/.aws/credentials"))
+                )
+            )
+            else []
+        ),
         # Whether common external binaries the bundled skills shell out to
         # are present. Useful for diagnosing "agent reinvented a slow Python
         # parser" symptoms when pandoc is missing.

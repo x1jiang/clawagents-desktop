@@ -11,7 +11,7 @@ use keyring::Entry;
 use serde_json::{json, Value};
 
 const BUNDLE_ACCOUNT: &str = "api_keys_v1";
-const PROVIDERS: &[&str] = &["openai", "anthropic", "gemini"];
+const PROVIDERS: &[&str] = &["openai", "anthropic", "gemini", "bedrock"];
 
 static CACHE: OnceLock<Mutex<HashMap<(String, String), Option<String>>>> = OnceLock::new();
 static BUNDLE_LOADED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
