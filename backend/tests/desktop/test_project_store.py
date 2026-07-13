@@ -77,3 +77,59 @@ def test_get_missing_raises(app_support_dir: Path) -> None:
 def test_create_rejects_nonexistent_root_path(app_support_dir: Path) -> None:
     with pytest.raises(FileNotFoundError):
         ProjectStore().create(name="x", root_path="/this/does/not/exist")
+
+
+def test_create_ssh_skips_local_exists(app_support_dir: Path) -> None:
+    store = ProjectStore()
+    p = store.create(
+        name="remote",
+        root_path="/home/me/code/app",
+        kind="ssh",
+        ssh_host="jumpbox",
+        remote_path="/home/me/code/app",
+    )
+    assert p.kind == "ssh"
+    assert p.ssh_host == "jumpbox"
+    assert p.remote_path == "/home/me/code/app"
+    assert p.root_path == "/home/me/code/app"
+    reloaded = ProjectStore().get(p.id)
+    assert reloaded.kind == "ssh"
+    assert reloaded.ssh_host == "jumpbox"
+
+
+def test_create_ssh_requires_host(app_support_dir: Path) -> None:
+    with pytest.raises(ValueError, match="ssh_host"):
+        ProjectStore().create(
+            name="x",
+            root_path="/remote/path",
+            kind="ssh",
+            remote_path="/remote/path",
+        )
+
+
+def test_upsert_preserves_id(app_support_dir: Path, tmp_path: Path) -> None:
+    root = tmp_path / "p"
+    root.mkdir()
+    store = ProjectStore()
+    fixed = "11111111-2222-3333-4444-555555555555"
+    p = store.upsert(id=fixed, name="seeded", root_path=str(root))
+    assert p.id == fixed
+    again = store.upsert(id=fixed, name="renamed", root_path=str(root))
+    assert again.id == fixed
+    assert again.name == "renamed"
+    assert len(store.list()) == 1
+
+
+def test_update_preserves_ssh_fields(app_support_dir: Path) -> None:
+    store = ProjectStore()
+    p = store.create(
+        name="remote",
+        root_path="/r/path",
+        kind="ssh",
+        ssh_host="host1",
+        remote_path="/r/path",
+    )
+    updated = store.update(p.id, name="remote2")
+    assert updated.kind == "ssh"
+    assert updated.ssh_host == "host1"
+    assert updated.remote_path == "/r/path"

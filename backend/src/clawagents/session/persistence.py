@@ -68,9 +68,26 @@ class SessionWriter:
             pass
         atomic_write_text(self.path, existing + json.dumps(event, default=str) + "\n")
 
-    def write_chat_meta(self, *, title: str, model: str, mode: str) -> None:
+    def write_chat_meta(
+        self,
+        *,
+        title: str,
+        model: str,
+        mode: str,
+        pinned: bool = False,
+        note: str = "",
+    ) -> None:
         """Record desktop chat metadata. Ignored by message reconstruction."""
-        self.append("chat_meta", {"title": title, "model": model, "mode": mode})
+        self.append(
+            "chat_meta",
+            {
+                "title": title,
+                "model": model,
+                "mode": mode,
+                "pinned": bool(pinned),
+                "note": note or "",
+            },
+        )
 
     def write_system_prompt(self, content: str) -> None:
         self.append("system_prompt", {"content": content})

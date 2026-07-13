@@ -51,9 +51,10 @@ def test_messages_stream_emits_turn_started_and_completed(
     pid = client.post("/projects", json={"name": "p", "root_path": str(tmp_path / "p")}).json()["id"]
     cid = client.post(f"/projects/{pid}/chats", json={"title": "t", "model": "x", "mode": "auto"}).json()["chat_id"]
 
-    async def fake_turn(*, chat_id, content, project_root, mode, model, on_event):
+    async def fake_turn(**kwargs):
+        on_event = kwargs["on_event"]
         on_event("assistant_token", {"text": "hello"})
-        on_event("turn_completed", {"chat_id": chat_id, "status": "ok"})
+        on_event("turn_completed", {"chat_id": kwargs["chat_id"], "status": "ok"})
 
     monkeypatch.setattr(chats_api, "run_chat_turn", fake_turn)
 

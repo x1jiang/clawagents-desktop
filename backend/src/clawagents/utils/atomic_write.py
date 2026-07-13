@@ -12,7 +12,7 @@ def atomic_write_text(path: "Path | str", content: str, encoding: str = "utf-8")
         with os.fdopen(fd, "w", encoding=encoding) as f:
             f.write(content)
         os.replace(tmp, str(path))
-    except:
+    except BaseException:
         try:
             os.unlink(tmp)
         except OSError:
@@ -28,7 +28,7 @@ def atomic_write_bytes(path: "Path | str", data: bytes) -> None:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
         os.replace(tmp, str(path))
-    except:
+    except BaseException:
         try:
             os.unlink(tmp)
         except OSError:

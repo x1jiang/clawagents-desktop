@@ -34,3 +34,28 @@ def projectless_chats_dir() -> Path:
 
 def projectless_scratch_dir() -> Path:
     return app_support_dir() / "scratch"
+
+
+def user_commands_dir() -> Path:
+    """Where user-defined slash commands live as `.md` files.
+
+    Each `foo.md` becomes a `/foo` command whose body is sent verbatim to
+    the agent. Like Claude Code's custom commands, but discoverable from the
+    composer's slash-autocomplete popup.
+    """
+    return app_support_dir() / "commands"
+
+
+def user_templates_dir() -> Path:
+    """Where chat templates live as `.md` files.
+
+    Each `foo.md` is a seed for a new chat — title + initial message —
+    instead of an inline slash command. Useful for starters like
+    "Review my recent diff" or "Plan a refactor."
+    """
+    return app_support_dir() / "templates"
+
+
+def uploads_dir() -> Path:
+    """Where chat-scoped uploaded attachments are stored."""
+    return app_support_dir() / "uploads"

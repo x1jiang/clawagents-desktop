@@ -7,6 +7,10 @@ from typing import Any
 
 # Conservative defaults. Users can override via the provider's own model
 # routing — this catalog drives the desktop's model picker UI only.
+# Trimmed to the current top of each provider's lineup as of July 2026.
+# Model IDs verified against the provider documentation; if a workflow needs
+# something older or more obscure, pass it via /model — the underlying LLM
+# provider accepts whatever the user supplies.
 _CATALOG: list[dict[str, Any]] = [
     {
         "id": "anthropic",
@@ -23,27 +27,31 @@ _CATALOG: list[dict[str, Any]] = [
         "name": "OpenAI",
         "env_key": "OPENAI_API_KEY",
         "models": [
-            {"id": "gpt-4o", "label": "GPT-4o"},
-            {"id": "gpt-4o-mini", "label": "GPT-4o mini"},
-            {"id": "o1", "label": "o1"},
+            # GPT-5.6 family (Sol / Terra / Luna)
+            {"id": "gpt-5.6-sol", "label": "GPT-5.6 Sol"},
+            {"id": "gpt-5.6-terra", "label": "GPT-5.6 Terra"},
+            {"id": "gpt-5.6-luna", "label": "GPT-5.6 Luna"},
+            {"id": "gpt-5.6", "label": "GPT-5.6 (alias → Sol)"},
+            # GPT-5.5
+            {"id": "gpt-5.5", "label": "GPT-5.5"},
+            # GPT-5.4
+            {"id": "gpt-5.4", "label": "GPT-5.4"},
+            {"id": "gpt-5.4-mini", "label": "GPT-5.4 mini"},
+            {"id": "gpt-5.4-nano", "label": "GPT-5.4 nano"},
         ],
     },
     {
         "id": "gemini",
         "name": "Google Gemini",
         "env_key": "GEMINI_API_KEY",
+        # Chat-oriented generateContent models from the Gemini API docs.
         "models": [
-            {"id": "gemini-2.0-flash", "label": "Gemini 2.0 Flash"},
-            {"id": "gemini-1.5-pro", "label": "Gemini 1.5 Pro"},
-        ],
-    },
-    {
-        "id": "ollama",
-        "name": "Ollama (local)",
-        "env_key": None,  # always available if the local server is running
-        "models": [
-            {"id": "ollama/llama3.2", "label": "llama3.2 (local)"},
-            {"id": "ollama/qwen2.5-coder", "label": "qwen2.5-coder (local)"},
+            {"id": "gemini-3.5-flash", "label": "Gemini 3.5 Flash"},
+            {"id": "gemini-3.1-pro-preview", "label": "Gemini 3.1 Pro (preview)"},
+            {"id": "gemini-3.1-flash-lite", "label": "Gemini 3.1 Flash-Lite"},
+            {"id": "gemini-3-flash-preview", "label": "Gemini 3 Flash (preview)"},
+            {"id": "gemini-2.5-pro", "label": "Gemini 2.5 Pro"},
+            {"id": "gemini-2.5-flash", "label": "Gemini 2.5 Flash"},
         ],
     },
 ]

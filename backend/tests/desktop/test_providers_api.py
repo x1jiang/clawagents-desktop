@@ -24,9 +24,12 @@ def test_returns_catalog(client: TestClient) -> None:
     r = client.get("/providers")
     assert r.status_code == 200
     by_id = {p["id"]: p for p in r.json()}
-    assert {"openai", "anthropic", "gemini", "ollama"} <= set(by_id)
-    assert by_id["ollama"]["available"] is True
+    assert {"openai", "anthropic", "gemini"} <= set(by_id)
     assert by_id["openai"]["available"] is False
+    openai_ids = {m["id"] for m in by_id["openai"]["models"]}
+    assert {"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.6"} <= openai_ids
+    gemini_ids = {m["id"] for m in by_id["gemini"]["models"]}
+    assert {"gemini-3.5-flash", "gemini-3.1-pro-preview"} <= gemini_ids
 
 
 def test_marks_available_when_key_set(monkeypatch: pytest.MonkeyPatch, client: TestClient) -> None:

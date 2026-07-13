@@ -113,6 +113,34 @@ def test_final_content_emits_assistant_token_with_full_text(
     assert assistant["data"]["text"] == "Done."
 
 
+def test_usage_event_passes_through(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The frontend renders token usage. The translator must forward `usage`
+    events emitted by the agent without dropping them."""
+    (tmp_path / "p").mkdir()
+    pid = client.post("/projects", json={"name": "p", "root_path": str(tmp_path / "p")}).json()["id"]
+    cid = client.post(f"/projects/{pid}/chats", json={"title": "t"}).json()["chat_id"]
+
+    async def fake_turn(*, on_event, **kwargs):
+        on_event("usage", {
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "total_tokens": 150,
+            "cached_input_tokens": 10,
+            "cache_creation_tokens": 5,
+            "model": "gpt-4o-mini",
+        })
+
+    monkeypatch.setattr(chats_api, "run_chat_turn", fake_turn)
+    r = client.post(f"/chats/{cid}/messages", json={"content": "hi"})
+    events = _parse_sse(r.text)
+    usage_events = [e for e in events if e["event"] == "usage"]
+    assert len(usage_events) == 1
+    assert usage_events[0]["data"]["total_tokens"] == 150
+    assert usage_events[0]["data"]["model"] == "gpt-4o-mini"
+
+
 def test_unknown_event_is_dropped(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

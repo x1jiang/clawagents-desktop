@@ -80,7 +80,7 @@ _NEVER_PARALLEL_TOOLS: frozenset[str] = frozenset({
 # excluded — they run sequentially via the snapshot path.
 _DEFAULT_PARALLEL_SAFE: frozenset[str] = frozenset({
     "read_file", "list_dir", "glob", "search_files", "grep",
-    "web_fetch", "shell",  # stateless reads
+    "web_fetch", "web_search", "shell",  # stateless reads
 })
 
 # Default declarations for path-scoped tools. Tools may override by setting
@@ -122,8 +122,8 @@ def _path_scope_of(tool: "Tool", args: Dict[str, Any]) -> Optional[str]:
 # Before write tools modify a file, snapshot it for undo/rollback capability.
 
 _WRITE_TOOLS: frozenset[str] = frozenset({
-    "write_file", "edit_file", "create_file", "replace_in_file",
-    "insert_in_file", "patch_file",
+    "write_file", "edit_file", "apply_patch", "create_file", "replace_in_file",
+    "insert_in_file", "insert_lines", "patch_file",
 })
 
 
@@ -148,12 +148,40 @@ def _snapshot_before_write(tool_name: str, args: Dict[str, Any]) -> None:
     if not file_path.exists() or not file_path.is_file():
         return
 
+    # Confine to the workspace root: this snapshot runs *before* the write
+    # tool's own ``safe_path`` check, so without this guard an LLM-supplied
+    # absolute/``..`` path (``/etc/passwd``) would be copied into the readable
+    # in-workspace snapshot dir — an arbitrary host-file exfiltration channel.
     try:
-        snap_dir = Path.cwd() / ".clawagents" / "snapshots" / str(int(time.time()))
-        snap_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(str(file_path), str(snap_dir / file_path.name))
+        root = Path.cwd().resolve()
+        resolved = file_path.resolve()
+    except OSError:
+        return
+    if resolved != root and root not in resolved.parents:
+        return
+
+    try:
+        rel = resolved.relative_to(root)
+        snap_dir = root / ".clawagents" / "snapshots" / str(int(time.time()))
+        dest = snap_dir / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(resolved), str(dest))
     except Exception:
         pass  # Snapshot failure should never block tool execution
+
+    # Cline-style: pre-mutation whole-workspace shadow checkpoint
+    try:
+        from clawagents.config.features import is_enabled as _feat
+        if _feat("shadow_checkpoints"):
+            from clawagents.memory.shadow_checkpoint import create_checkpoint
+
+            create_checkpoint(
+                label=f"pre:{tool_name}",
+                tool=tool_name,
+                phase="pre",
+            )
+    except Exception:
+        pass
 
 
 def truncate_tool_output(output: str | list[dict[str, Any]], max_chars: int = MAX_TOOL_OUTPUT_CHARS) -> str | list[dict[str, Any]]:
@@ -254,7 +282,9 @@ class ToolRegistry:
         return self.tools.get(name)
 
     def list(self) -> List[Tool]:
-        return list(self.tools.values())
+        # Alphabetical order keeps native schemas / text descriptions stable
+        # for provider prompt-prefix caching across registration churn.
+        return sorted(self.tools.values(), key=lambda t: (t.name or "").lower())
 
     def inspect_tools(self) -> List[Dict[str, Any]]:
         return [

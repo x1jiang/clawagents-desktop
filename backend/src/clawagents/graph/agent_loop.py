@@ -25,14 +25,13 @@ import asyncio
 import inspect
 import json
 import logging
-import math
 import re
 import signal
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Literal, Optional
+from typing import TYPE_CHECKING, Any, Callable, Literal, Optional
 
 from clawagents.providers.llm import LLMProvider, LLMMessage, LLMResponse, NativeToolSchema, NativeToolCall, strip_thinking_tokens
 from clawagents.tools.registry import ToolRegistry, ParsedToolCall, ToolResult
@@ -74,24 +73,46 @@ def _sanitize_assistant_text(text: str) -> str:
 # When native function calling is used and the agent loop is interrupted mid-execution,
 # the next LLM call sees tool_calls without matching tool results — most APIs reject this.
 # This pass inserts synthetic "cancelled" responses for any dangling tool calls.
+# It also drops orphan role="tool" messages whose tool_call_id was never declared
+# by a preceding assistant tool_calls_meta (common after session preload limit
+# cuts mid-pair → OpenAI 400: "messages with role 'tool' must be a response to
+# a preceding message with 'tool_calls'").
 
 def _patch_dangling_tool_calls(messages: list[LLMMessage]) -> list[LLMMessage]:
     if not messages:
         return messages
 
+    # Ids declared by assistant messages in this transcript.
+    declared_ids: set[str] = set()
+    for msg in messages:
+        if msg.role == "assistant" and msg.tool_calls_meta:
+            for tc in msg.tool_calls_meta:
+                tc_id = tc.get("id") if isinstance(tc, dict) else None
+                if tc_id:
+                    declared_ids.add(str(tc_id))
+
+    # Drop orphan tool results first (no matching assistant tool_calls).
+    filtered: list[LLMMessage] = []
+    for msg in messages:
+        if msg.role == "tool":
+            tc_id = str(msg.tool_call_id) if msg.tool_call_id else ""
+            if not tc_id or tc_id not in declared_ids:
+                continue
+        filtered.append(msg)
+
     # Build set of all tool_call_ids that have a matching role="tool" response
     responded_ids: set[str] = set()
-    for msg in messages:
+    for msg in filtered:
         if msg.role == "tool" and msg.tool_call_id:
-            responded_ids.add(msg.tool_call_id)
+            responded_ids.add(str(msg.tool_call_id))
 
     patched: list[LLMMessage] = []
-    for i, msg in enumerate(messages):
+    for i, msg in enumerate(filtered):
         patched.append(msg)
 
         # Text-mode: look for assistant messages with JSON tool calls without a following [Tool Result]
         if msg.role == "assistant" and isinstance(msg.content, str) and msg.content.startswith('{"tool":'):
-            _next_msg = messages[i + 1] if i + 1 < len(messages) else None
+            _next_msg = filtered[i + 1] if i + 1 < len(filtered) else None
             _next_content = _next_msg.content if _next_msg is not None else None
             has_result = (
                 _next_msg is not None
@@ -108,16 +129,26 @@ def _patch_dangling_tool_calls(messages: list[LLMMessage]) -> list[LLMMessage]:
         # Native tool calls: inject synthetic role="tool" for any missing responses
         elif msg.role == "assistant" and msg.tool_calls_meta:
             for tc in msg.tool_calls_meta:
-                tc_id = tc.get("id")
-                if tc_id and tc_id not in responded_ids:
+                tc_id = tc.get("id") if isinstance(tc, dict) else None
+                if tc_id and str(tc_id) not in responded_ids:
                     patched.append(LLMMessage(
                         role="tool",
                         content="Tool call was cancelled — the agent was interrupted before it could complete.",
-                        tool_call_id=tc_id,
+                        tool_call_id=str(tc_id),
                     ))
-                    responded_ids.add(tc_id)
+                    responded_ids.add(str(tc_id))
 
     return patched
+
+
+def _drop_leading_orphan_tools(messages: list[LLMMessage]) -> list[LLMMessage]:
+    """If a limited session preload starts mid tool-pair, drop leading orphans."""
+    if not messages:
+        return messages
+    i = 0
+    while i < len(messages) and messages[i].role == "tool":
+        i += 1
+    return messages[i:] if i else messages
 
 
 # ─── Tool Result Eviction (learned from deepagents) ───────────────────────
@@ -193,7 +224,13 @@ def _tool_observation(result: ToolResult) -> str | list[dict[str, Any]]:
 # keys first so e.g. "gpt-5.4-medium" resolves to the "gpt-5.4" profile
 # rather than falling back to "gpt-5".
 _MODEL_PROFILES: dict[str, dict[str, int | float]] = {
-    # ── OpenAI — GPT-5 family (400K context) ───────────────────────────
+    # ── OpenAI — GPT-5.6 (~1.05M context) ──────────────────────────────
+    "gpt-5.6-sol": {"max_input_tokens": 1_050_000, "budget_ratio": 0.85},
+    "gpt-5.6-terra": {"max_input_tokens": 1_050_000, "budget_ratio": 0.85},
+    "gpt-5.6-luna": {"max_input_tokens": 1_050_000, "budget_ratio": 0.85},
+    "gpt-5.6": {"max_input_tokens": 1_050_000, "budget_ratio": 0.85},
+    # ── OpenAI — GPT-5.5 / 5.4 family (400K context) ───────────────────
+    "gpt-5.5": {"max_input_tokens": 400_000, "budget_ratio": 0.85},
     "gpt-5.4-mini": {"max_input_tokens": 400_000, "budget_ratio": 0.85},
     "gpt-5.4-nano": {"max_input_tokens": 400_000, "budget_ratio": 0.85},
     "gpt-5.4": {"max_input_tokens": 400_000, "budget_ratio": 0.85},
@@ -224,6 +261,8 @@ _MODEL_PROFILES: dict[str, dict[str, int | float]] = {
     "o1-mini": {"max_input_tokens": 128_000, "budget_ratio": 0.80},
     "o1": {"max_input_tokens": 200_000, "budget_ratio": 0.80},
     # ── Google — Gemini 3.x (1M–2M context) ────────────────────────────
+    "gemini-3.5-flash": {"max_input_tokens": 1_000_000, "budget_ratio": 0.90},
+    "gemini-3.5": {"max_input_tokens": 1_000_000, "budget_ratio": 0.90},
     "gemini-3.1-pro": {"max_input_tokens": 2_000_000, "budget_ratio": 0.90},
     "gemini-3.1-flash": {"max_input_tokens": 1_000_000, "budget_ratio": 0.90},
     "gemini-3.1": {"max_input_tokens": 1_000_000, "budget_ratio": 0.90},
@@ -549,7 +588,7 @@ Keep working until the task is fully complete.
 # ─── Adaptive Token Estimation (learned from deepagents) ──────────────────
 # Now uses tiktoken for accurate BPE counting (with fallback to heuristic).
 
-from clawagents.tokenizer import count_tokens, count_tokens_content, count_messages_tokens as _count_messages_tokens
+from clawagents.tokenizer import count_tokens_content, count_messages_tokens as _count_messages_tokens
 
 # Keep _CHARS_PER_TOKEN for the Tier-3 preflight char-budget calculation only
 _CHARS_PER_TOKEN = 4
@@ -603,6 +642,10 @@ def _truncate_old_tool_args(
 # ─── Tool Loop Detection ──────────────────────────────────────────────────
 
 
+if TYPE_CHECKING:
+    from clawagents.loop_detection import LoopDetectionConfig
+
+
 class _ToolCallTracker:
     def __init__(
         self,
@@ -610,15 +653,21 @@ class _ToolCallTracker:
         soft_limit: int = 3,
         hard_limit: int = 6,
         circuit_breaker_limit: int = 30,
+        loop_config: "LoopDetectionConfig | None" = None,
     ):
+        from clawagents.loop_detection import resolve_loop_detection_config
+
         self._history: list[str] = []
+        self._poll_history: list[tuple[str, str, str | None]] = []
         self._window_size = window_size
         self._soft_limit = soft_limit
         self._hard_limit = hard_limit
         self._circuit_breaker_limit = circuit_breaker_limit
+        self._loop_config = resolve_loop_detection_config(loop_config)
         self._result_hashes: dict[str, str] = {}
         self._no_progress_count = 0
         self._soft_warnings = 0
+        self._poll_warnings: set[str] = set()
 
     def _key(self, tool_name: str, args: dict) -> str:
         try:
@@ -641,6 +690,8 @@ class _ToolCallTracker:
 
     def record_result(self, tool_name: str, args: dict, output: str) -> None:
         """Record the result of a tool call for no-progress detection."""
+        from clawagents.loop_detection import hash_tool_call
+
         key = self._key(tool_name, args)
         result_hash = self._hash_result(output)
         prev_hash = self._result_hashes.get(key)
@@ -649,6 +700,10 @@ class _ToolCallTracker:
         else:
             self._no_progress_count = max(0, self._no_progress_count - 1)
         self._result_hashes[key] = result_hash
+        call_hash = hash_tool_call(tool_name, args)
+        self._poll_history.append((tool_name, call_hash, result_hash))
+        if len(self._poll_history) > self._window_size:
+            self._poll_history.pop(0)
 
     def is_ping_ponging(self) -> bool:
         """Detect A->B->A->B ping-pong oscillation (last 6 entries)."""
@@ -692,6 +747,22 @@ class _ToolCallTracker:
     def bump_soft_warning(self) -> int:
         self._soft_warnings += 1
         return self._soft_warnings
+
+    def check_known_poll_no_progress(self, tool_name: str, args: dict):
+        from clawagents.loop_detection import detect_known_poll_no_progress
+
+        result = detect_known_poll_no_progress(
+            tool_name=tool_name,
+            params=args,
+            history=self._poll_history,
+            config=self._loop_config,
+        )
+        if result and result.stuck and result.warning_key in self._poll_warnings:
+            if result.level == "warning":
+                return None
+        if result and result.stuck and result.warning_key:
+            self._poll_warnings.add(result.warning_key)
+        return result
 
 
 # ─── Consecutive Failure Detection ────────────────────────────────────────
@@ -896,6 +967,174 @@ _COMPACTABLE_TOOLS: frozenset[str] = frozenset({
 })
 
 _MICRO_COMPACT_KEEP_RECENT = 3  # keep last N compactable tool results intact
+# Only micro-compact once the transcript actually uses a meaningful share of
+# the context window. Running it unconditionally blanked all but the last 3
+# read/grep/exec results every round, degrading multi-file tasks at low usage.
+_MICRO_COMPACT_MIN_USAGE_RATIO = 0.4
+_ARTIFACT_ID_RE = re.compile(
+    r"(?:Artifact id:\s*|id=)([A-Za-z0-9._-]{4,80})",
+    re.IGNORECASE,
+)
+
+
+def _extract_artifact_id(content: str) -> str | None:
+    if not content:
+        return None
+    m = _ARTIFACT_ID_RE.search(content)
+    return m.group(1) if m else None
+
+
+async def _wait_for_tool_approval(
+    run_context: RunContext,
+    call_id: str,
+    tool_name: str,
+    args: dict[str, Any],
+    *,
+    approval_handler: Any,
+    emit: OnEvent,
+    timeout_s: float = 300.0,
+) -> bool:
+    """Block until RunContext has an approval decision, or handler returns one.
+
+    ``approval_handler`` may be:
+      - ``"event"``: poll ``is_tool_approved`` until decided (host must call
+        ``approve_tool`` / ``reject_tool``)
+      - callable ``(tool_name, args, call_id) -> bool | Awaitable[bool]``
+    """
+    if callable(approval_handler):
+        try:
+            result = approval_handler(tool_name, args, call_id)
+            if hasattr(result, "__await__"):
+                result = await result  # type: ignore[misc]
+            return bool(result)
+        except Exception as exc:
+            emit("warn", {"message": f"approval_handler error: {exc}"})
+            return False
+
+    # "event" (or any other truthy non-callable): poll RunContext
+    deadline = asyncio.get_event_loop().time() + max(1.0, timeout_s)
+    while asyncio.get_event_loop().time() < deadline:
+        state = run_context.is_tool_approved(call_id, tool_name=tool_name)
+        if state is not None:
+            return bool(state)
+        await asyncio.sleep(0.05)
+    emit("warn", {"message": f"approval timed out for {tool_name}"})
+    return False
+
+
+def _post_tool_side_effects(
+    tool_name: str,
+    args: dict[str, Any],
+    success: bool,
+    tool_output: str | list[dict[str, Any]],
+    *,
+    emit: OnEvent,
+) -> str | list[dict[str, Any]]:
+    """Ledger / shadow-checkpoint / auto-verify after a tool completes."""
+    from clawagents.config.features import is_enabled
+
+    out = tool_output
+    try:
+        if success and is_enabled("context_ledger"):
+            from clawagents.memory.context_ledger import maybe_record_from_tool_result
+
+            text = out if isinstance(out, str) else str(out)
+            entry = maybe_record_from_tool_result(tool_name, args, text)
+            if entry is not None:
+                emit("context", {"message": f"context ledger recorded {entry.sha[:12]}"})
+                emit("checkpoint", {"kind": "ledger", "sha": entry.sha})
+    except Exception:
+        logger.debug("ledger record failed", exc_info=True)
+
+    try:
+        if success and is_enabled("shadow_checkpoints"):
+            from clawagents.permissions.mode import is_write_class_tool
+            from clawagents.memory.shadow_checkpoint import create_checkpoint
+
+            # Post-success for execute/git_commit (pre-mutation already covers writes).
+            if tool_name in {"execute", "git_commit"} or (
+                is_write_class_tool(tool_name)
+                and tool_name not in {
+                    "write_file", "edit_file", "apply_patch", "create_file",
+                    "replace_in_file", "insert_in_file", "insert_lines", "patch_file",
+                }
+            ):
+                info = create_checkpoint(label=tool_name, tool=tool_name, phase="post")
+                if info.get("ok") and info.get("sha"):
+                    emit(
+                        "checkpoint",
+                        {
+                            "kind": "shadow",
+                            "sha": info["sha"],
+                            "tool": tool_name,
+                            "phase": "post",
+                            "label": tool_name,
+                            "ts": info.get("ts"),
+                        },
+                    )
+                    if isinstance(out, str):
+                        out = out + f"\n[checkpoint {info['sha'][:12]}]"
+            elif is_write_class_tool(tool_name) or tool_name in {
+                "write_file", "edit_file", "apply_patch",
+            }:
+                # Pre-mutation checkpoint already created in registry; emit latest HEAD for UI.
+                from clawagents.memory.shadow_checkpoint import list_checkpoints
+
+                rows = list_checkpoints(limit=1)
+                if rows:
+                    row = rows[0]
+                    emit(
+                        "checkpoint",
+                        {
+                            "kind": "shadow",
+                            "sha": row.get("sha"),
+                            "tool": tool_name,
+                            "phase": "pre",
+                            "label": row.get("label") or tool_name,
+                            "ts": row.get("ts"),
+                        },
+                    )
+                    if isinstance(out, str) and row.get("sha"):
+                        out = out + f"\n[checkpoint {str(row['sha'])[:12]}]"
+    except Exception:
+        logger.debug("shadow checkpoint failed", exc_info=True)
+
+    try:
+        if is_enabled("auto_verify") and isinstance(out, str):
+            from clawagents.tools.auto_verify import maybe_verify_after_edit
+
+            extra = maybe_verify_after_edit(tool_name, success)
+            if extra:
+                out = out + "\n\n" + extra
+    except Exception:
+        logger.debug("auto_verify failed", exc_info=True)
+
+    return out
+
+
+def _micro_compact_stub(content: str, *, tool_call_id: str | None = None) -> str:
+    """Replace old tool bodies with a stub that still points at a recoverable artifact."""
+    aid = _extract_artifact_id(content)
+    if aid is None and isinstance(content, str) and len(content) > 500:
+        try:
+            from clawagents.tool_output_artifacts import store_tool_artifact
+
+            aid, _ = store_tool_artifact(
+                tool_name="micro_compact",
+                tool_use_id=tool_call_id or f"micro-{abs(hash(content[:200])) % 10_000_000}",
+                output=content,
+                kind="prose",
+                extra_meta={"source": "micro_compact"},
+            )
+        except Exception:
+            logger.debug("micro-compact artifact store failed", exc_info=True)
+            aid = None
+    if aid:
+        return (
+            f"[Old tool result cleared to save context — artifact id={aid}. "
+            f"Call retrieve_tool_result(id=\"{aid}\") to restore.]"
+        )
+    return "[Old tool result cleared to save context]"
 
 
 def _micro_compact_tool_results(
@@ -906,7 +1145,8 @@ def _micro_compact_tool_results(
 
     The model still sees the tool_use → tool_result pairs, just not the raw
     50KB grep/file output. This preserves the agent's sense of *what* it did
-    while freeing massive amounts of context.
+    while freeing massive amounts of context. Stubs retain artifact ids when
+    available so content remains recoverable via retrieve_tool_result.
     """
     from clawagents.config.features import is_enabled
     if not is_enabled("micro_compact"):
@@ -948,9 +1188,10 @@ def _micro_compact_tool_results(
         # Native tool results
         if msg.role == "tool" and msg.tool_call_id:
             if msg.tool_call_id in compactable_ids and msg.tool_call_id not in keep_ids:
+                body = msg.content if isinstance(msg.content, str) else str(msg.content)
                 result.append(LLMMessage(
                     role="tool",
-                    content="[Old tool result cleared to save context]",
+                    content=_micro_compact_stub(body, tool_call_id=msg.tool_call_id),
                     tool_call_id=msg.tool_call_id,
                 ))
                 cleared += 1
@@ -958,9 +1199,10 @@ def _micro_compact_tool_results(
         # Text-based tool results (user message following assistant tool call)
         elif msg.role == "user" and isinstance(msg.content, str) and msg.content.startswith("[Tool Result]"):
             if i > 0 and (i - 1) in compactable_text_indices and (i - 1) not in keep_text_indices:
+                stub = _micro_compact_stub(msg.content)
                 result.append(LLMMessage(
                     role="user",
-                    content="[Tool Result] [Old tool result cleared to save context]",
+                    content=f"[Tool Result] {stub}",
                 ))
                 cleared += 1
                 continue
@@ -1088,7 +1330,10 @@ def _find_safe_split_index(non_system: list[LLMMessage], desired_recent: int) ->
     that doesn't land between an assistant tool_call and its tool result.
     """
     split = max(0, len(non_system) - desired_recent)
-    while split < len(non_system) - 1:
+    # Bound is < len(non_system), NOT len - 1: with the tighter bound a tail
+    # run of ≥N tool messages left the last orphan tool result in `recent`
+    # while its paired assistant tool_call got summarized away → provider 400.
+    while split < len(non_system):
         msg = non_system[split]
         if msg.role == "tool" and msg.tool_call_id:
             split += 1
@@ -1140,8 +1385,33 @@ async def _compact_if_needed(
     token_multiplier: float = 1.0,
     model_name: Optional[str] = None,
     run_context: Optional[RunContext] = None,
+    fire_hook: Optional[Callable[..., Any]] = None,
+    savings_history: list[float] | None = None,
 ) -> list[LLMMessage]:
     messages = _truncate_old_tool_args(messages)
+
+    # Soft-cap verbose assistant/user turns before heavier compaction.
+    try:
+        from clawagents.memory.output_trim import trim_verbose_messages
+
+        messages, trimmed_n = trim_verbose_messages(messages)
+        if trimmed_n:
+            emit("context", {"message": f"trimmed {trimmed_n} verbose turn(s)"})
+    except Exception:
+        logger.debug("output trim failed", exc_info=True)
+
+    # If recent compressions are thrashing, prefer artifact eviction only.
+    if savings_history:
+        try:
+            from clawagents.memory.compaction import is_compression_thrashing
+
+            if is_compression_thrashing(savings_history):
+                emit("context", {
+                    "message": "compaction thrashing detected — skipping LLM summarize; soft-trim only",
+                })
+                return messages
+        except Exception:
+            logger.debug("thrash check failed", exc_info=True)
 
     effective_window, ratio = (
         _resolve_context_budget(model_name, context_window)
@@ -1149,6 +1419,24 @@ async def _compact_if_needed(
         else (context_window, _CONTEXT_BUDGET_RATIO)
     )
     budget = int(effective_window * ratio)
+    from clawagents.memory.compact_tool_results import compact_tool_results
+    from clawagents.harness_profiles import resolve_harness_profile
+
+    profile = resolve_harness_profile(model_name)
+    headroom = (
+        float(profile.compaction_headroom_ratio)
+        if profile and profile.compaction_headroom_ratio is not None
+        else 0.7
+    )
+
+    messages, compacted = compact_tool_results(
+        messages,
+        max_input_tokens=budget,
+        token_multiplier=token_multiplier,
+        headroom_ratio=headroom,
+    )
+    if compacted:
+        emit("context", {"message": "compacted oversized tool results before summarization"})
     current_tokens = _estimate_messages_tokens(messages, token_multiplier)
 
     if current_tokens <= budget:
@@ -1163,6 +1451,12 @@ async def _compact_if_needed(
         "message_count": len(messages),
     })
 
+    if fire_hook is not None:
+        try:
+            await fire_hook("on_pre_compact", len(messages), current_tokens)
+        except Exception:
+            logger.debug("on_pre_compact hook failed", exc_info=True)
+
     system_msgs: list[LLMMessage] = []
     non_system: list[LLMMessage] = []
     for m in messages:
@@ -1170,6 +1464,138 @@ async def _compact_if_needed(
 
     if len(non_system) <= _RECENT_MESSAGES_TO_KEEP:
         return messages
+
+    # Prefer hardened compress_messages_safe when it yields meaningful savings.
+    try:
+        from clawagents.memory.compaction import AgentMessage, compress_messages_safe
+
+        agent_msgs = [
+            AgentMessage(
+                role=m.role,
+                content=m.content if isinstance(m.content, str) else str(m.content),
+            )
+            for m in ([*system_msgs, *non_system])
+        ]
+        safe = await compress_messages_safe(
+            llm,
+            agent_msgs,
+            context_window=effective_window,
+            protect_first_n=max(1, len(system_msgs)),
+            protect_last_n=_RECENT_MESSAGES_TO_KEEP,
+        )
+        if safe.get("effective"):
+            # Rebuilding from AgentMessage would mint new objects for every
+            # turn — breaking the identity-based session-persistence tracker
+            # (unpersisted turns silently vanish) and stripping tool-call
+            # metadata (tool_calls_meta / tool_call_id) that providers need
+            # for transcript linkage. Reuse the original LLMMessage object
+            # whenever (role, content) survived compression unchanged.
+            _originals_by_key: dict[tuple[str, str], list[LLMMessage]] = {}
+            for _om in (*system_msgs, *non_system):
+                _okey = (
+                    _om.role,
+                    _om.content if isinstance(_om.content, str) else str(_om.content),
+                )
+                _originals_by_key.setdefault(_okey, []).append(_om)
+
+            def _reuse_original(role: str, content: str) -> LLMMessage:
+                bucket = _originals_by_key.get((role, content))
+                if bucket:
+                    return bucket.pop()  # prefer the most recent original
+                return LLMMessage(role=role, content=content)
+
+            compact_out = [
+                _reuse_original(m.role, m.content or "")
+                for m in safe["messages"]
+            ]
+            summary_text = str(safe.get("summary") or "")
+            if savings_history is not None:
+                savings_history.append(float(safe.get("compression_savings_pct") or 0.0))
+            # Preserve carryover, then normalize to user+assistant compaction pair.
+            try:
+                task_context = ""
+                for m in non_system:
+                    if m.role == "user" and not (
+                        isinstance(m.content, str) and m.content.startswith("[Tool Result]")
+                    ):
+                        task_context = m.content[:500] if isinstance(m.content, str) else ""
+                        break
+                carryover = get_compaction_carryover(run_context, task_context=task_context)
+                carryover_text = carryover.to_markdown()
+            except Exception:
+                logger.debug("carryover enrich after compress_messages_safe failed", exc_info=True)
+                carryover_text = ""
+
+            handoff = f"[System — Compacted History]\n{summary_text}"
+            if carryover_text and summary_text:
+                handoff = (
+                    f"[System — Compacted History]\n{carryover_text}\n\n"
+                    f"## Conversation Summary\n{summary_text}"
+                )
+            replaced = False
+            for i, m in enumerate(compact_out):
+                if m.role != "system" and (m.content or "") == summary_text:
+                    compact_out[i] = LLMMessage(role="user", content=handoff)
+                    replaced = True
+                    break
+            if not replaced and summary_text:
+                insert_at = len([m for m in compact_out if m.role == "system"])
+                compact_out.insert(insert_at, LLMMessage(role="user", content=handoff))
+            # Assistant ack keeps providers that expect alternating roles happy.
+            if summary_text and not any(
+                m.role == "assistant"
+                and isinstance(m.content, str)
+                and "compacted handoff" in m.content.lower()
+                for m in compact_out
+            ):
+                # Insert immediately after the handoff user message.
+                for i, m in enumerate(compact_out):
+                    if m.role == "user" and isinstance(m.content, str) and "Compacted History" in m.content:
+                        compact_out.insert(
+                            i + 1,
+                            LLMMessage(
+                                role="assistant",
+                                content="Understood — continuing from the compacted handoff summary.",
+                            ),
+                        )
+                        break
+            compacted_tokens = _estimate_messages_tokens(compact_out, token_multiplier)
+            if compacted_tokens <= budget:
+                emit("context", {
+                    "message": (
+                        f"compress_messages_safe saved "
+                        f"{safe.get('compression_savings_pct', 0):.1f}%"
+                    ),
+                })
+                emit("compact_progress", {
+                    "phase": "end",
+                    "message": "compaction completed via compress_messages_safe",
+                    "older_messages": len(safe.get("dropped_messages_list") or []),
+                    "recent_messages": _RECENT_MESSAGES_TO_KEEP,
+                })
+                if fire_hook is not None:
+                    try:
+                        await fire_hook("on_post_compact", len(compact_out), summary_text or None)
+                    except Exception:
+                        logger.debug("on_post_compact hook failed", exc_info=True)
+                return compact_out
+            # "Effective" savings alone are not enough: the transcript is
+            # still over budget, and returning here would hand the next LLM
+            # call an oversized context. Keep the lossless savings and
+            # escalate to the summarization tier below.
+            emit("context", {
+                "message": (
+                    f"compress_messages_safe saved "
+                    f"{safe.get('compression_savings_pct', 0):.1f}% but "
+                    f"~{compacted_tokens} tokens still exceeds budget {budget} "
+                    "— escalating to summarization"
+                ),
+            })
+            messages = compact_out
+            system_msgs = [m for m in compact_out if m.role == "system"]
+            non_system = [m for m in compact_out if m.role != "system"]
+    except Exception:
+        logger.debug("compress_messages_safe path failed; falling back", exc_info=True)
 
     split_idx = _find_safe_split_index(non_system, _RECENT_MESSAGES_TO_KEEP)
     if split_idx <= 0:
@@ -1257,7 +1683,13 @@ async def _compact_if_needed(
                 "recent_messages": len(recent),
                 "carryover": carryover.to_dict(),
             })
-            return [*system_msgs, *recent]
+            out = [*system_msgs, *recent]
+            if fire_hook is not None:
+                try:
+                    await fire_hook("on_post_compact", len(out), None)
+                except Exception:
+                    logger.debug("on_post_compact hook failed", exc_info=True)
+            return out
 
         carryover_text = carryover.to_markdown()
         content = f"[System — Compacted History]\n{summary_text}"
@@ -1275,7 +1707,13 @@ async def _compact_if_needed(
             "recent_messages": len(recent),
             "carryover": carryover.to_dict(),
         })
-        return [*system_msgs, summary, *recent]
+        out = [*system_msgs, summary, *recent]
+        if fire_hook is not None:
+            try:
+                await fire_hook("on_post_compact", len(out), summary_text)
+            except Exception:
+                logger.debug("on_post_compact hook failed", exc_info=True)
+        return out
     except Exception:
         logger.debug("Compaction LLM call failed", exc_info=True)
         emit("context", {"message": "compaction failed — dropping oldest messages"})
@@ -1286,7 +1724,13 @@ async def _compact_if_needed(
             "recent_messages": len(recent),
             "carryover": carryover.to_dict(),
         })
-        return [*system_msgs, *recent]
+        out = [*system_msgs, *recent]
+        if fire_hook is not None:
+            try:
+                await fire_hook("on_post_compact", len(out), None)
+            except Exception:
+                logger.debug("on_post_compact hook failed", exc_info=True)
+        return out
 
 
 # ─── History Offloading ───────────────────────────────────────────────────
@@ -1323,12 +1767,20 @@ def _archive_pre_compact_transcript(older_messages: list[LLMMessage], task_conte
 
 
 def _offload_history(messages: list[LLMMessage]) -> str | None:
-    """Save older messages to a JSON file before compaction."""
+    """Save older messages to a JSON file before compaction.
+
+    Content is passed through :func:`redact_obj` first — the offload file
+    is a plain-text artifact on disk, so secrets the agent saw mid-run
+    (bearer tokens, ``.env`` contents, …) must not be persisted verbatim,
+    matching the redaction applied by every other persistence surface.
+    """
     try:
+        from clawagents.redact import redact_obj
+
         _get_history_dir().mkdir(parents=True, exist_ok=True)
         ts = int(time.time())
         path = _get_history_dir() / f"compacted_{ts}_{len(messages)}msgs.json"
-        data = [{"role": m.role, "content": m.content} for m in messages]
+        data = redact_obj([{"role": m.role, "content": m.content} for m in messages])
         path.write_text(json.dumps(data, indent=2), "utf-8")
         return str(path)
     except Exception:
@@ -1447,6 +1899,9 @@ async def run_agent_graph(
     session_preload_limit: int | None = 200,
     handoffs: Optional[list[Handoff]] = None,
     agent_name: Optional[str] = None,
+    action_mode: str = "tools",
+    approval_handler: Any = None,
+    require_approval_tools: Optional[list[str]] = None,
     session_id: Optional[str] = None,
     session_dir: Optional[Path] = None,
     permission_callback: Optional[Callable[[dict], Any]] = None,
@@ -1457,6 +1912,15 @@ async def run_agent_graph(
         set_overrides(features)
 
     registry = tools or ToolRegistry()
+    action_mode_norm = action_mode if action_mode in ("tools", "code") else "tools"
+    require_approval_set = {
+        n for n in (require_approval_tools or []) if n
+    }
+    # When approval_handler is set, write-class tools require approval by default.
+    if approval_handler is not None:
+        from clawagents.permissions.mode import WRITE_CLASS_TOOLS
+
+        require_approval_set |= set(WRITE_CLASS_TOOLS)
     native_schemas: list[NativeToolSchema] | None = (
         registry.to_native_schemas() if use_native_tools and tools else None
     )
@@ -1584,6 +2048,7 @@ async def run_agent_graph(
     else:
         adaptive_threshold = _RETHINK_THRESHOLD
     failure_tracker = _FailureTracker(threshold=adaptive_threshold) if rethink else None
+    _compaction_savings: list[float] = []
 
     # Trajectory recorder (opt-in; learn implies trajectory)
     recorder = None
@@ -1636,14 +2101,59 @@ async def run_agent_graph(
 
     prompt_to_use = system_prompt or BASE_SYSTEM_PROMPT
     lesson_preamble = ""
+    dynamic_parts: list[str] = []
 
     # PTRL Layer 1: Pre-run lesson injection (skipped for isolated subagents).
     if learn and not getattr(run_context, "skip_memory", False):
         from clawagents.trajectory.lessons import build_lesson_preamble
         preamble = build_lesson_preamble()
         if preamble:
-            lesson_preamble = preamble
+            dynamic_parts.append(preamble)
             emit("context", {"message": "PTRL: injected lessons from past runs"})
+
+    # Dynamic context packs (after cache boundary) — local only.
+    if not getattr(run_context, "skip_memory", False):
+        from clawagents.config.features import is_enabled
+        try:
+            if is_enabled("core_memory"):
+                from clawagents.memory.core_memory import load_core_memory
+                cm = load_core_memory()
+                if cm:
+                    dynamic_parts.append(cm)
+            if is_enabled("context_ledger"):
+                from clawagents.memory.context_ledger import load_ledger_preamble
+                led = load_ledger_preamble()
+                if led:
+                    dynamic_parts.append(led)
+            if is_enabled("memory_bank"):
+                from clawagents.memory.core_memory import (
+                    ensure_memory_bank_stubs,
+                    load_memory_bank_preamble,
+                )
+                ensure_memory_bank_stubs()
+                mb = load_memory_bank_preamble()
+                if mb:
+                    dynamic_parts.append(mb)
+            if is_enabled("fact_store"):
+                from clawagents.memory.facts import live_facts_preamble
+                facts = live_facts_preamble()
+                if facts:
+                    dynamic_parts.append(facts)
+            from clawagents.tools.context_tools import load_plan_preamble
+            plan = load_plan_preamble()
+            if plan:
+                dynamic_parts.append(plan)
+            if is_enabled("repo_map_inject"):
+                from clawagents.memory.repo_map import build_repo_map
+                rm = build_repo_map(max_chars=3_500)
+                if rm:
+                    dynamic_parts.append(rm)
+                    emit("context", {"message": "injected ranked repo map"})
+        except Exception:
+            logger.debug("dynamic context pack failed", exc_info=True)
+
+    if dynamic_parts:
+        lesson_preamble = "\n\n".join(dynamic_parts)
 
     # Insert __CACHE_BOUNDARY__ between static (instructions + tools) and dynamic content.
     # The Anthropic provider splits on this marker to enable prompt caching.
@@ -1685,19 +2195,54 @@ async def run_agent_graph(
 
     # Session protocol — hydrate history before first LLM call (non-destructive).
     _session_preloaded_count = 0
+    # The current task message is part of the durable conversation and must
+    # be persisted alongside run-appended messages (assistant/tool turns).
+    _session_task_msg = next((m for m in messages if m.role == "user"), None)
     if session is not None:
         try:
             prior = await _session_get_items(session, limit=session_preload_limit)
             if prior:
-                # Keep original system + user (task), append replayed history after.
-                messages = messages + prior
+                # Limited preload can start mid tool-pair (tool result without
+                # its assistant tool_calls) → provider 400. Drop leading orphans
+                # here; full pair sanitization still runs before each LLM call.
+                prior = _drop_leading_orphan_tools(prior)
+                prior = _patch_dangling_tool_calls(prior)
+                # Replay history between the system prompt and the current
+                # task so the transcript reads in true conversational order.
+                insert_at = next(
+                    (i for i, m in enumerate(messages) if m.role == "user"),
+                    len(messages),
+                )
+                messages = [*messages[:insert_at], *prior, *messages[insert_at:]]
                 state.messages = messages
                 _session_preloaded_count = len(prior)
         except Exception as err:
             emit("warn", {"message": f"session load failed: {err}"})
-    # Snapshot of messages we brought in before the loop runs; anything
-    # appended after this cursor is what we'll persist back.
-    _session_start_cursor = len(messages)
+    # Identity-based tracking of preloaded vs. run-appended messages.
+    # A numeric cursor breaks when compaction rebuilds ``messages`` or
+    # dangling-tool-call patching inserts items mid-list, silently losing
+    # (or duplicating) turns at persist time. Instead we track message
+    # *objects*: anything unseen at the top of a round was appended by the
+    # run and gets persisted; anything synthesized by the pre-LLM transform
+    # pipeline (compaction summaries, patch inserts, prompt injections) is
+    # marked seen without being persisted. The dict keeps strong refs so
+    # CPython can't recycle an id() for a new message.
+    _session_initial_ids = frozenset(id(m) for m in messages)
+    _session_seen: dict[int, LLMMessage] = {id(m): m for m in messages}
+    _session_new_msgs: list[LLMMessage] = []
+    # Persist the task itself: without it, replayed history contains answers
+    # with no questions and multi-turn recall silently degrades.
+    if session is not None and _session_task_msg is not None:
+        _session_new_msgs.append(_session_task_msg)
+
+    def _session_note_messages(track: bool) -> None:
+        for _m in messages:
+            _mid = id(_m)
+            if _mid in _session_seen:
+                continue
+            _session_seen[_mid] = _m
+            if track:
+                _session_new_msgs.append(_m)
 
     # RunHooks: on_run_start
     if active_hooks:
@@ -1739,6 +2284,9 @@ async def run_agent_graph(
             })
 
     overflow_retries = 0
+    # Set when a handoff installs the combined parent+child transcript on
+    # ``state.messages`` — the post-loop assignment must not overwrite it.
+    _handoff_transcript_set = False
     cancel_event = asyncio.Event()
     loop = asyncio.get_running_loop()
 
@@ -1748,7 +2296,10 @@ async def run_agent_graph(
 
     try:
         loop.add_signal_handler(signal.SIGINT, _on_sigint)
-    except (NotImplementedError, OSError, RuntimeError):
+    except (NotImplementedError, OSError, RuntimeError, ValueError):
+        # ValueError: uvloop (and RuntimeError: vanilla asyncio) refuse signal
+        # handlers off the main thread — e.g. when embedded in a server that
+        # runs agent turns in worker threads. Ctrl-C handling is best-effort.
         pass
 
     effective_max_rounds = min(
@@ -1787,6 +2338,11 @@ async def run_agent_graph(
                 state.result = state.result or "[iteration budget exhausted]"
                 break
 
+            # One increment per loop round, unconditionally — previously only
+            # a handful of exit paths bumped this, so normal multi-round runs
+            # reported "1 iteration" in events and the session writer.
+            state.iterations += 1
+
             # Session: mark turn start
             if session_writer:
                 session_writer.write_turn_started(round_idx)
@@ -1806,13 +2362,39 @@ async def run_agent_graph(
             # Write-ahead log: persist last message before API call (Claude Code pattern)
             _wal_write(messages)
 
+            # Capture messages appended by the previous round *before* the
+            # transform pipeline below can compact/rebuild the list.
+            _session_note_messages(track=True)
+
             # Patch dangling tool calls before sending to LLM
             messages = _patch_dangling_tool_calls(messages)
-            messages = _micro_compact_tool_results(messages)  # Claude Code pattern: clear old tool results
+            # Claude Code pattern: clear old tool results — but only when the
+            # transcript is actually filling up (see _MICRO_COMPACT_MIN_USAGE_RATIO).
+            from clawagents.harness_profiles import resolve_harness_profile as _rhp
+            _mc_profile = _rhp(resolved_model_name)
+            _mc_keep = (
+                int(_mc_profile.clear_tool_keep)
+                if _mc_profile and _mc_profile.clear_tool_keep is not None
+                else _MICRO_COMPACT_KEEP_RECENT
+            )
+            _mc_ratio = (
+                float(_mc_profile.clear_tool_trigger_ratio)
+                if _mc_profile and _mc_profile.clear_tool_trigger_ratio is not None
+                else _MICRO_COMPACT_MIN_USAGE_RATIO
+            )
+            if (
+                _estimate_messages_tokens(messages, token_multiplier)
+                > context_window * _mc_ratio
+            ):
+                messages = _micro_compact_tool_results(messages, keep_recent=_mc_keep)
             messages = _soft_trim_messages(messages, context_window, token_multiplier, emit, resolved_model_name)
             messages = await _compact_if_needed(
                 messages, context_window, llm, emit, token_multiplier, resolved_model_name, run_context,
+                fire_hook=_fire_hook,
+                savings_history=_compaction_savings,
             )
+            # Compaction / trim can still leave pairs inconsistent — sanitize again.
+            messages = _patch_dangling_tool_calls(messages)
 
             # External pre_llm hook (runs before programmatic hook)
             if ext_hook_runner:
@@ -1852,7 +2434,17 @@ async def run_agent_graph(
                 except Exception as hook_err:
                     emit("warn", {"message": f"before_llm hook error: {hook_err}"})
 
-            buf, on_chunk = _make_buffer()
+            # Framework-synthesized messages (compaction summaries, dangling
+            # tool-call patches, hook/prompt injections) are regenerated per
+            # run — mark them seen so they are never persisted to the session.
+            _session_note_messages(track=False)
+
+            buf, _buffer_chunk = _make_buffer()
+
+            def on_chunk(chunk: str) -> None:
+                _buffer_chunk(chunk)
+                _emit_typed("assistant_delta", {"delta": chunk})
+
             if active_hooks:
                 await _fire_hook("on_llm_start", resolved_model_name or "", messages)
             try:
@@ -1927,13 +2519,27 @@ async def run_agent_graph(
                         _estimate_messages_tokens(messages, 1.0), 1,
                     )
                     token_multiplier = min(observed_ratio * 1.1, 3.0)
+                    # Also shrink the effective window: the multiplier is
+                    # capped at 3.0, so with a wildly overstated
+                    # CONTEXT_WINDOW (e.g. 1M configured on a 128K model)
+                    # compaction below would never fire and every retry
+                    # would overflow again.
+                    context_window = max(int(context_window * 0.5), 16_000)
                     emit("context", {
-                        "message": f"token overflow — calibrated multiplier to {token_multiplier:.2f} (retry {overflow_retries}/{_MAX_OVERFLOW_RETRIES})",
+                        "message": (
+                            f"token overflow — calibrated multiplier to {token_multiplier:.2f}, "
+                            f"shrunk effective window to {context_window} "
+                            f"(retry {overflow_retries}/{_MAX_OVERFLOW_RETRIES})"
+                        ),
                     })
                     messages = _soft_trim_messages(messages, context_window, token_multiplier, emit, resolved_model_name)
                     messages = await _compact_if_needed(
                         messages, context_window, llm, emit, token_multiplier, resolved_model_name, run_context,
+                        fire_hook=_fire_hook,
+                        savings_history=_compaction_savings,
                     )
+                    # Don't persist recovery-compaction artifacts to the session.
+                    _session_note_messages(track=False)
                     continue
 
                 logger.exception("LLM call failed at round %d: [%s] %s", round_idx, descriptor.error_class.value, err)
@@ -1985,9 +2591,63 @@ async def run_agent_graph(
                     ))
                     continue
 
+                # ── CodeAct: execute Python action when no native tool calls ──
+                if action_mode_norm == "code":
+                    from clawagents.graph.codeact import extract_code_action, run_code_action
+
+                    code = extract_code_action(response.content or "")
+                    if code:
+                        messages.append(LLMMessage(
+                            role="assistant",
+                            content=response.content,
+                            thinking=_thinking_content,
+                        ))
+                        emit("tool_call", {"name": "codeact", "args": {"code": code[:500]}})
+
+                        def _run_async(coro: Any) -> Any:
+                            try:
+                                loop = asyncio.get_running_loop()
+                            except RuntimeError:
+                                return asyncio.run(coro)
+                            import concurrent.futures
+
+                            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                                return pool.submit(asyncio.run, coro).result()
+
+                        result = run_code_action(
+                            code,
+                            registry,
+                            before_tool=before_tool,
+                            run_context=run_context,
+                            run_async=_run_async,
+                        )
+                        state.tool_calls += len(result.get("tool_calls") or []) or 1
+                        obs = str(result.get("observation") or "")
+                        emit("tool_result", {
+                            "name": "codeact",
+                            "success": not result.get("error"),
+                            "output": obs[:2000],
+                        })
+                        if result.get("done"):
+                            state.result = obs
+                            state.status = "done"
+                            emit("final_content", {"content": state.result})
+                            _emit_typed("assistant_message", {"content": state.result})
+                            break
+                        messages.append(LLMMessage(
+                            role="user",
+                            content=f"[CodeAct Observation]\n{obs}",
+                        ))
+                        continue
+
                 # ── Advisor: final check before declaring done ──
+                # Track whether the final-check path already appended the
+                # assistant message: when the advisor errored or returned
+                # nothing, the fall-through below appended it a second time.
+                _final_assistant_appended = False
                 if advisor_llm and _advisor_call_count > 0 and _advisor_call_count < advisor_max_calls and state.tool_calls > 0:
                     messages.append(LLMMessage(role="assistant", content=response.content, thinking=_thinking_content))
+                    _final_assistant_appended = True
                     await _consult_advisor(messages, "final-check")
                     # If advisor injected guidance, let the LLM process it
                     last_msg = messages[-1] if messages else None
@@ -2003,13 +2663,14 @@ async def run_agent_graph(
                     )
                 state.result = _sanitize_assistant_text(response.content)
                 state.status = "done"
-                state.iterations += 1
                 emit("final_content", {"content": state.result})
-                messages.append(LLMMessage(role="assistant", content=response.content, thinking=_thinking_content))
+                _emit_typed("assistant_message", {"content": state.result})
+                if not _final_assistant_appended:
+                    messages.append(LLMMessage(role="assistant", content=response.content, thinking=_thinking_content))
                 # Persist the final answer to the session JSONL. The tool-call
-                # branch (~line 2247) already writes assistant_message when the
-                # response includes tool_calls; this mirror handles the plain-
-                # text final-answer path so desktop replay can see it too.
+                # branch already writes assistant_message when the response
+                # includes tool_calls; this mirror handles the plain-text
+                # final-answer path so desktop replay can see it too.
                 if session_writer:
                     session_writer.write_assistant_message(
                         response.content or "",
@@ -2045,7 +2706,6 @@ async def run_agent_graph(
                             role="user",
                             content=f"[Handoff Error] Could not resolve target agent: {resolve_err}",
                         ))
-                        state.iterations += 1
                         continue
 
                     target_name = getattr(target_agent, "name", None) or _handoff_call.tool_name
@@ -2089,8 +2749,12 @@ async def run_agent_graph(
                     # user task as new_items.
                     handoff_payload = HandoffInputData(
                         input_history=list(messages),
-                        pre_handoff_items=list(messages[:_session_start_cursor]),
-                        new_items=list(messages[_session_start_cursor:]),
+                        pre_handoff_items=[
+                            m for m in messages if id(m) in _session_initial_ids
+                        ],
+                        new_items=[
+                            m for m in messages if id(m) not in _session_initial_ids
+                        ],
                         run_context=run_context,
                     )
                     if h_obj.input_filter is not None:
@@ -2177,7 +2841,6 @@ async def run_agent_graph(
                                 role="user",
                                 content=f"[Handoff Error] Target agent failed: {run_err}",
                             ))
-                            state.iterations += 1
                             continue
 
                     state.result = child_state.result
@@ -2188,15 +2851,25 @@ async def run_agent_graph(
                         else child_state.result
                     )
                     state.tool_calls += child_state.tool_calls
-                    state.iterations += 1
                     state.messages = messages + child_state.messages
+                    _handoff_transcript_set = True
                     break
 
             if loop_tracker.is_circuit_broken():
                 emit("warn", {"message": f"circuit breaker tripped ({loop_tracker._no_progress_count} no-progress calls) — breaking"})
                 state.status = "done"
                 state.result = "Circuit breaker: too many tool calls with no progress. Stopping."
-                state.iterations += 1
+                break
+
+            poll_hit = None
+            for call in tool_calls:
+                poll_hit = loop_tracker.check_known_poll_no_progress(call.tool_name, call.args)
+                if poll_hit and poll_hit.level == "critical":
+                    break
+            if poll_hit and poll_hit.stuck and poll_hit.level == "critical":
+                emit("warn", {"message": poll_hit.message})
+                state.status = "done"
+                state.result = poll_hit.message
                 break
 
             if loop_tracker.is_hard_looping_batch(tool_calls):
@@ -2204,7 +2877,6 @@ async def run_agent_graph(
                 emit("warn", {"message": f"tool loop detected ({names}) — breaking"})
                 state.status = "done"
                 state.result = f"Tool loop detected ({names}). Stopping."
-                state.iterations += 1
                 break
 
             if loop_tracker.is_ping_ponging():
@@ -2212,7 +2884,6 @@ async def run_agent_graph(
                 emit("warn", {"message": f"ping-pong oscillation detected ({' ↔ '.join(recent_unique)}) — breaking"})
                 state.status = "done"
                 state.result = "Ping-pong loop detected between tools. Stopping."
-                state.iterations += 1
                 break
 
             if loop_tracker.is_soft_looping_batch(tool_calls):
@@ -2245,8 +2916,13 @@ async def run_agent_graph(
                     role="user",
                     content=hint,
                 ))
-                state.iterations += 1
                 continue
+
+            # Surface intermediate assistant commentary (text alongside tool
+            # calls) on the typed stream. Skipped in text-tool mode where
+            # ``response.content`` is the raw JSON tool call itself.
+            if use_native_tools and response.content and response.content.strip():
+                _emit_typed("assistant_message", {"content": response.content})
 
             # Session: write assistant message with tool calls
             if session_writer:
@@ -2270,7 +2946,28 @@ async def run_agent_graph(
                         ext_allowed, ext_args = await ext_hook_runner.pre_tool_use(call.tool_name, call.args)
                         if not ext_allowed:
                             emit("tool_skipped", {"name": call.tool_name, "reason": "blocked by external hook"})
-                            messages.append(LLMMessage(role="user", content=f"[Tool Skipped] {call.tool_name} was blocked by external hook."))
+                            if use_native_tools and native_tc and native_tc.tool_call_id:
+                                messages.append(LLMMessage(
+                                    role="assistant",
+                                    content=response.content or "",
+                                    tool_calls_meta=[{
+                                        "id": native_tc.tool_call_id,
+                                        "name": call.tool_name,
+                                        "args": call.args,
+                                    }],
+                                    gemini_parts=getattr(response, "gemini_parts", None),
+                                    thinking=_thinking_content,
+                                ))
+                                messages.append(LLMMessage(
+                                    role="tool",
+                                    content=f"[Tool Skipped] {call.tool_name} was blocked by external hook.",
+                                    tool_call_id=native_tc.tool_call_id,
+                                ))
+                            else:
+                                messages.append(LLMMessage(
+                                    role="user",
+                                    content=f"[Tool Skipped] {call.tool_name} was blocked by external hook.",
+                                ))
                             continue
                         call = ParsedToolCall(tool_name=call.tool_name, args=ext_args)
                     except Exception as hook_err:
@@ -2296,7 +2993,31 @@ async def run_agent_graph(
                         hook_approved = False
                     if not hook_approved:
                         emit("tool_skipped", {"name": call.tool_name, "reason": hook_reason})
-                        messages.append(LLMMessage(role="user", content=f"[Tool Skipped] {call.tool_name} was not approved: {hook_reason}"))
+                        # Close the native tool pair so Gemini sees
+                        # model(function_call) → user(function_response), not a bare
+                        # "[Tool Skipped]" user turn that breaks turn alternation.
+                        if use_native_tools and native_tc and native_tc.tool_call_id:
+                            messages.append(LLMMessage(
+                                role="assistant",
+                                content=response.content or "",
+                                tool_calls_meta=[{
+                                    "id": native_tc.tool_call_id,
+                                    "name": call.tool_name,
+                                    "args": call.args,
+                                }],
+                                gemini_parts=getattr(response, "gemini_parts", None),
+                                thinking=_thinking_content,
+                            ))
+                            messages.append(LLMMessage(
+                                role="tool",
+                                content=f"[Tool Skipped] {call.tool_name} was not approved: {hook_reason}",
+                                tool_call_id=native_tc.tool_call_id,
+                            ))
+                        else:
+                            messages.append(LLMMessage(
+                                role="user",
+                                content=f"[Tool Skipped] {call.tool_name} was not approved: {hook_reason}",
+                            ))
                         continue
 
                 loop_tracker.record(call.tool_name, call.args)
@@ -2311,18 +3032,79 @@ async def run_agent_graph(
                     rec = run_context.get_approval(native_tc_id, tool_name=call.tool_name)
                     reason = (rec.reason if rec else None) or "rejected via RunContext"
                     emit("tool_skipped", {"name": call.tool_name, "reason": reason})
-                    messages.append(LLMMessage(
-                        role="user",
-                        content=f"[Tool Skipped] {call.tool_name} was rejected: {reason}",
-                    ))
+                    if use_native_tools and native_tc and native_tc.tool_call_id:
+                        messages.append(LLMMessage(
+                            role="assistant",
+                            content=response.content or "",
+                            tool_calls_meta=[{
+                                "id": native_tc.tool_call_id,
+                                "name": call.tool_name,
+                                "args": call.args,
+                            }],
+                            gemini_parts=getattr(response, "gemini_parts", None),
+                            thinking=_thinking_content,
+                        ))
+                        messages.append(LLMMessage(
+                            role="tool",
+                            content=f"[Tool Skipped] {call.tool_name} was rejected: {reason}",
+                            tool_call_id=native_tc.tool_call_id,
+                        ))
+                    else:
+                        messages.append(LLMMessage(
+                            role="user",
+                            content=f"[Tool Skipped] {call.tool_name} was rejected: {reason}",
+                        ))
                     continue
                 if approval_state is None:
+                    tool_obj = registry.tools.get(call.tool_name)
+                    needs_approval = (
+                        call.tool_name in require_approval_set
+                        or bool(getattr(tool_obj, "require_approval", False))
+                    )
                     emit("approval_required", {"name": call.tool_name, "id": native_tc_id})
                     _emit_typed("approval_required", {
                         "tool_name": call.tool_name,
                         "call_id": native_tc_id,
                         "args": call.args,
                     })
+                    if needs_approval and approval_handler is not None:
+                        approved = await _wait_for_tool_approval(
+                            run_context,
+                            native_tc_id,
+                            call.tool_name,
+                            call.args if isinstance(call.args, dict) else {},
+                            approval_handler=approval_handler,
+                            emit=emit,
+                        )
+                        if not approved:
+                            emit("tool_skipped", {
+                                "name": call.tool_name,
+                                "reason": "approval denied or timed out",
+                            })
+                            if use_native_tools and native_tc and native_tc.tool_call_id:
+                                messages.append(LLMMessage(
+                                    role="assistant",
+                                    content=response.content or "",
+                                    tool_calls_meta=[{
+                                        "id": native_tc.tool_call_id,
+                                        "name": call.tool_name,
+                                        "args": call.args,
+                                    }],
+                                    gemini_parts=getattr(response, "gemini_parts", None),
+                                    thinking=_thinking_content,
+                                ))
+                                messages.append(LLMMessage(
+                                    role="tool",
+                                    content=f"[Tool Skipped] {call.tool_name} was not approved",
+                                    tool_call_id=native_tc.tool_call_id,
+                                ))
+                            else:
+                                messages.append(LLMMessage(
+                                    role="user",
+                                    content=f"[Tool Skipped] {call.tool_name} was not approved",
+                                ))
+                            continue
+                        run_context.approve_tool(native_tc_id, tool_name=call.tool_name)
 
                 _emit_typed("tool_started", {
                     "tool_name": call.tool_name,
@@ -2393,10 +3175,34 @@ async def run_agent_graph(
                 raw_output: str | list[dict[str, Any]] = _tool_observation(tool_result)
                 tool_output: str | list[dict[str, Any]]
                 if isinstance(raw_output, list):
-                    tool_output = raw_output
+                    try:
+                        from clawagents.media.images import sanitize_tool_output
+
+                        tool_output = sanitize_tool_output(raw_output)  # type: ignore[assignment]
+                    except Exception:
+                        logger.debug("sanitize_tool_output failed", exc_info=True)
+                        tool_output = raw_output
                     preview: str = "[Multimodal Array Content]"
                 else:
-                    tool_output = _evict_large_tool_result(call.tool_name, raw_output)
+                    from clawagents.tool_output_artifacts import prepare_tool_output_for_context
+
+                    tool_output, artifact_id = prepare_tool_output_for_context(
+                        tool_name=call.tool_name,
+                        tool_use_id=native_tc.tool_call_id if native_tc else call.tool_name,
+                        output=raw_output,
+                    )
+                    if artifact_id is not None:
+                        emit("context", {"message": f"tool output crushed/stored id={artifact_id}"})
+                    preview = tool_output[:preview_chars]
+
+                tool_output = _post_tool_side_effects(
+                    call.tool_name,
+                    call.args if isinstance(call.args, dict) else {},
+                    tool_result.success,
+                    tool_output,
+                    emit=emit,
+                )
+                if isinstance(tool_output, str):
                     preview = tool_output[:preview_chars]
 
                 emit("tool_result", {
@@ -2507,6 +3313,27 @@ async def run_agent_graph(
                         ))
 
             else:
+                # ── External pre_tool_use hook (parallel) ──
+                # Mirror the single-call path: an external policy gate must not
+                # be bypassable by batching a forbidden call with another one.
+                _candidate_pairs: list[tuple[int, ParsedToolCall]] = list(enumerate(tool_calls))
+                if ext_hook_runner:
+                    _ext_pairs: list[tuple[int, ParsedToolCall]] = []
+                    for _orig_i, _c in _candidate_pairs:
+                        try:
+                            ext_allowed, ext_args = await ext_hook_runner.pre_tool_use(_c.tool_name, _c.args)
+                            if not ext_allowed:
+                                emit("tool_skipped", {"name": _c.tool_name, "reason": "blocked by external hook"})
+                                messages.append(LLMMessage(role="user", content=f"[Tool Skipped] {_c.tool_name} was blocked by external hook."))
+                                continue
+                            _c = ParsedToolCall(tool_name=_c.tool_name, args=ext_args)
+                        except Exception as hook_err:
+                            emit("warn", {"message": f"external pre_tool_use hook error: {hook_err}"})
+                        _ext_pairs.append((_orig_i, _c))
+                    _candidate_pairs = _ext_pairs
+                    if not _candidate_pairs:
+                        continue
+
                 # ── before_tool hook (parallel) — filter out rejected calls ──
                 # Track original tool_calls index alongside each approved call so
                 # native_tool_call_objects[orig_idx] stays correct even when the hook
@@ -2535,7 +3362,7 @@ async def run_agent_graph(
                             emit("warn", {"message": f"before_tool hook error: {hook_err}"})
                             return None, "hook error"
 
-                    for _orig_i, c in enumerate(tool_calls):
+                    for _orig_i, c in _candidate_pairs:
                         result_call, reason = _apply_hook(c)
                         if result_call is None:
                             emit("tool_skipped", {"name": c.tool_name, "reason": reason})
@@ -2546,8 +3373,8 @@ async def run_agent_graph(
                         messages.append(LLMMessage(role="user", content="[Tool Skipped] All tool calls were not approved."))
                         continue
                 else:
-                    approved_calls = list(tool_calls)
-                    _approved_orig_indices = list(range(len(tool_calls)))
+                    approved_calls = [c for _, c in _candidate_pairs]
+                    _approved_orig_indices = [i for i, _ in _candidate_pairs]
 
                 # Resolve a stable call_id per approved call (prefer native tc id).
                 # Index native_tool_call_objects by ORIGINAL tool_calls index, not
@@ -2634,6 +3461,27 @@ async def run_agent_graph(
                             _r.error if not _r.success else None,
                         )
 
+                # External post_tool_use hook (parallel) — parity with the
+                # single-call path so result-rewriting policy hooks apply.
+                if ext_hook_runner:
+                    _ext_results: list[ToolResult] = []
+                    for _c, _r in zip(approved_calls, results):
+                        try:
+                            ext_result = await ext_hook_runner.post_tool_use(
+                                _c.tool_name, _c.args,
+                                {"success": _r.success, "output": str(_r.output)[:1000]},
+                            )
+                            if "success" in ext_result and "output" in ext_result:
+                                _r = ToolResult(
+                                    success=ext_result["success"],
+                                    output=ext_result["output"],
+                                    error=ext_result.get("error"),
+                                )
+                        except Exception as hook_err:
+                            emit("warn", {"message": f"external post_tool_use hook error: {hook_err}"})
+                        _ext_results.append(_r)
+                    results = _ext_results
+
                 if after_tool:
                     safe_results: list[ToolResult] = []
                     for c, r in zip(approved_calls, results):
@@ -2664,18 +3512,42 @@ async def run_agent_graph(
                 for _idx2, (call, result) in enumerate(zip(approved_calls, results)):
                     raw_out: str | list[dict[str, Any]] = _tool_observation(result)
                     output: str | list[dict[str, Any]]
-                    if isinstance(raw_out, list):
-                        output = raw_out
-                        preview = "[Multimodal Array Content]"
-                    else:
-                        output = _evict_large_tool_result(call.tool_name, raw_out)
-                        preview = output[:preview_chars]
-
                     _call_id = (
                         _approved_call_ids[_idx2]
                         if _idx2 < len(_approved_call_ids)
                         else call.tool_name
                     )
+                    if isinstance(raw_out, list):
+                        try:
+                            from clawagents.media.images import sanitize_tool_output
+
+                            output = sanitize_tool_output(raw_out)  # type: ignore[assignment]
+                        except Exception:
+                            logger.debug("sanitize_tool_output failed", exc_info=True)
+                            output = raw_out
+                        preview = "[Multimodal Array Content]"
+                    else:
+                        from clawagents.tool_output_artifacts import prepare_tool_output_for_context
+
+                        output, artifact_id = prepare_tool_output_for_context(
+                            tool_name=call.tool_name,
+                            tool_use_id=_call_id,
+                            output=raw_out,
+                        )
+                        if artifact_id is not None:
+                            emit("context", {"message": f"tool output crushed/stored id={artifact_id}"})
+                        preview = output[:preview_chars]
+
+                    output = _post_tool_side_effects(
+                        call.tool_name,
+                        call.args if isinstance(call.args, dict) else {},
+                        result.success,
+                        output,
+                        emit=emit,
+                    )
+                    if isinstance(output, str):
+                        preview = output[:preview_chars]
+
                     emit("tool_result", {
                         "name": call.tool_name,
                         "success": result.success,
@@ -2688,6 +3560,14 @@ async def run_agent_graph(
                         "output": preview if isinstance(preview, str) else "[multimodal]",
                         "error": result.error if not result.success else None,
                     })
+
+                    # Session: write tool result (parity with single-call path)
+                    if session_writer:
+                        session_writer.write_tool_result(
+                            _call_id, call.tool_name, result.success,
+                            str(result.output)[:2000],
+                            error=result.error if not result.success else None,
+                        )
                     
                     if isinstance(output, str):
                         call_summaries.append(f"{call.tool_name}({json.dumps(call.args)}) => {output}")
@@ -2825,7 +3705,6 @@ async def run_agent_graph(
             emit("warn", {"message": f"reached max {effective_max_rounds} tool rounds"})
             state.status = "done"
             state.result = state.result or f"Reached maximum of {effective_max_rounds} tool rounds."
-            state.iterations += 1
 
     except KeyboardInterrupt:
         emit("warn", {"message": "interrupted"})
@@ -2838,11 +3717,15 @@ async def run_agent_graph(
     finally:
         try:
             loop.remove_signal_handler(signal.SIGINT)
-        except (NotImplementedError, OSError):
+        except (NotImplementedError, OSError, RuntimeError, ValueError):
+            # Mirrors add_signal_handler: uvloop raises ValueError and vanilla
+            # asyncio RuntimeError when running off the main thread.
             pass
 
     elapsed = time.monotonic() - t0
-    state.messages = messages
+    # Don't clobber the combined parent+child transcript a handoff installed.
+    if not _handoff_transcript_set:
+        state.messages = messages
 
     # Session: write final turn_completed
     if session_writer:
@@ -2869,6 +3752,14 @@ async def run_agent_graph(
             judge_result = await judge_run(
                 llm, task, summary_dict, state.result, turn_dicts,
             )
+            # Count the judge's own LLM call into the run's usage totals so
+            # PTRL/trajectory spend is never invisible to callers.
+            judge_resp = judge_result.pop("_llm_response", None)
+            if judge_resp is not None:
+                try:
+                    _accumulate_usage(judge_resp)
+                except Exception:  # noqa: BLE001
+                    pass
             run_summary.judge_score = judge_result.get("judge_score")
             run_summary.judge_justification = judge_result.get("judge_justification", "")
             emit("context", {
@@ -2901,6 +3792,43 @@ async def run_agent_graph(
                         model=run_summary.model,
                     )
                     emit("context", {"message": "PTRL: extracted and saved lessons from this run"})
+                    try:
+                        from clawagents.trajectory.failure_learn import (
+                            append_failure_lessons_to_agents_md,
+                        )
+
+                        promoted = append_failure_lessons_to_agents_md(lessons_text)
+                        if promoted:
+                            emit("context", {
+                                "message": f"PTRL: appended {len(promoted)} failure lesson(s) to AGENTS.md",
+                            })
+                    except Exception:
+                        logger.debug("PTRL: AGENTS.md failure-learn append failed", exc_info=True)
+                    try:
+                        from clawagents.config.features import is_enabled
+                        if is_enabled("fact_store"):
+                            from clawagents.memory.facts import promote_lesson_bullets_to_facts
+
+                            facts = promote_lesson_bullets_to_facts(lessons_text)
+                            if facts:
+                                emit("context", {
+                                    "message": f"PTRL: promoted {len(facts)} live fact(s)",
+                                })
+                    except Exception:
+                        logger.debug("PTRL: fact promotion failed", exc_info=True)
+                    try:
+                        from clawagents.trajectory.lesson_promotion import maybe_promote_recurring_lessons
+
+                        promoted = maybe_promote_recurring_lessons(
+                            lessons_text,
+                            task=run_summary.task,
+                        )
+                        if promoted:
+                            emit("context", {
+                                "message": f"PTRL: promoted {len(promoted)} recurring lesson(s) to skill_workshop",
+                            })
+                    except Exception:
+                        logger.debug("PTRL: lesson promotion failed", exc_info=True)
             else:
                 emit("context", {
                     "message": f"PTRL: skipped lesson extraction (quality={run_summary.quality}, "
@@ -2947,9 +3875,9 @@ async def run_agent_graph(
     # Persist only the messages newly added in this run to the Session backend.
     if session is not None:
         try:
-            new_msgs = messages[_session_start_cursor:]
-            if new_msgs:
-                await _session_add_items(session, new_msgs)
+            _session_note_messages(track=True)
+            if _session_new_msgs:
+                await _session_add_items(session, _session_new_msgs)
         except Exception as err:
             emit("warn", {"message": f"session save failed: {err}"})
 

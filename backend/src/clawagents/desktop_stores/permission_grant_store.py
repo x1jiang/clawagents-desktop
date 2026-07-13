@@ -72,3 +72,21 @@ class PermissionGrantStore:
     def remove_for_project(self, project_id: str) -> None:
         kept = [g for g in self._load() if g.project_id != project_id]
         self._save(kept)
+
+    def remove_one(self, *, project_id: str, path_pattern: str, scope: str) -> bool:
+        """Remove a single grant matching (project_id, path_pattern, scope).
+
+        Returns True if a matching grant was removed, False if no match.
+        Use list() + this method to power revoke-individual UI flows.
+        """
+        grants = self._load()
+        for i, g in enumerate(grants):
+            if (
+                g.project_id == project_id
+                and g.path_pattern == path_pattern
+                and g.scope == scope
+            ):
+                del grants[i]
+                self._save(grants)
+                return True
+        return False

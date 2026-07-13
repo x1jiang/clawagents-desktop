@@ -73,14 +73,21 @@ def test_delete_project_chat(client: TestClient, project_id: str) -> None:
     assert client.get(f"/projects/{project_id}/chats").json() == []
 
 
-def test_delete_projectless_chat_removes_scratch(
+def test_delete_projectless_chat_soft_deletes_to_trash(
     client: TestClient, app_support_dir: Path
 ) -> None:
     cid = client.post("/chats", json={"title": "x"}).json()["chat_id"]
     scratch = app_support_dir / "scratch" / cid
     assert scratch.exists()
     client.delete(f"/chats/{cid}")
-    assert not scratch.exists()
+    # Scratch dir is preserved so a /restore can resume where the chat left off.
+    assert scratch.exists()
+    # The JSONL moved into the .trash sibling, where /chats/:id/restore can
+    # find it within the retention window.
+    chats_dir = app_support_dir / "chats"
+    trash = chats_dir / ".trash"
+    assert trash.exists()
+    assert any(p.name.startswith(f"{cid}-") for p in trash.glob("*.jsonl"))
 
 
 def test_create_chat_falls_back_to_settings_default_mode(

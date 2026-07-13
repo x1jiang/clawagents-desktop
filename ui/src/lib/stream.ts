@@ -45,7 +45,15 @@ export function parseSSE(blob: string): ParsedEvent[] {
 export async function streamMessages(
   url: string,
   token: string,
-  body: { content: string; model_override?: string; mode_override?: string },
+  body: {
+    content: string;
+    model_override?: string;
+    mode_override?: string;
+    attachment_ids?: string[];
+    auto_approve?: { edit?: boolean; execute?: boolean; web?: boolean; browser?: boolean };
+    caveman?: boolean;
+    interaction?: "interactive" | "auto";
+  },
   signal: AbortSignal,
   onEvent: (ev: StreamEvent) => void,
 ): Promise<void> {

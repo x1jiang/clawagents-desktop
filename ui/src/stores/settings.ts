@@ -21,11 +21,7 @@ export const useSettings = create<SettingsState>((set) => ({
   apiKeys: {},
 
   load: async () => {
-    const providers = ["openai", "anthropic", "gemini"];
-    const apiKeys: Record<string, string | null> = {};
-    for (const p of providers) {
-      apiKeys[p] = await tauriApi.keyringGet(KEYRING_SERVICE, p);
-    }
+    const apiKeys = await tauriApi.keyringGetApiKeys();
     set({ apiKeys });
   },
 
@@ -37,10 +33,11 @@ export const useSettings = create<SettingsState>((set) => ({
 
   setApiKey: async (provider, key) => {
     if (key === null || key === "") {
-      await tauriApi.keyringSet(KEYRING_SERVICE, provider, "");
+      await tauriApi.keyringDelete(KEYRING_SERVICE, provider);
+      set((s) => ({ apiKeys: { ...s.apiKeys, [provider]: null } }));
     } else {
       await tauriApi.keyringSet(KEYRING_SERVICE, provider, key);
+      set((s) => ({ apiKeys: { ...s.apiKeys, [provider]: key } }));
     }
-    set((s) => ({ apiKeys: { ...s.apiKeys, [provider]: key } }));
   },
 }));

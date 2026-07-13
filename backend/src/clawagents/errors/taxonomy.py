@@ -10,6 +10,7 @@ Inspired by claw-code-main's error.rs taxonomy.
 from __future__ import annotations
 
 import enum
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -122,11 +123,14 @@ def classify_error(err: BaseException, provider: str = "") -> ErrorDescriptor:
     err_type = type(err).__name__.lower()
 
     # 1. Context window / token overflow
+    # Note: no bare "max_tokens" here — it appears in unrelated validation
+    # errors ("max_tokens must be at least 1"), which would trigger a useless
+    # compact-and-retry loop instead of surfacing the real problem.
     if any(tok in msg for tok in (
         "context_length_exceeded", "context window", "token limit",
         "maximum context length", "too many tokens",
         "prompt is too long", "request too large",
-        "max_tokens", "context_window_exceeded",
+        "context_window_exceeded", "exceeds the maximum number of tokens",
     )):
         recipe = RECOVERY_RECIPES[ErrorClass.CONTEXT_WINDOW]
         return ErrorDescriptor(
@@ -143,6 +147,8 @@ def classify_error(err: BaseException, provider: str = "") -> ErrorDescriptor:
         "unauthorized", "forbidden", "invalid api key", "invalid_api_key",
         "authentication", "invalid x-api-key", "permission denied",
         "incorrect api key", "invalid auth",
+        # google-genai: 400 INVALID_ARGUMENT / API_KEY_INVALID
+        "api key not valid", "api_key_invalid",
     )):
         recipe = RECOVERY_RECIPES[ErrorClass.PROVIDER_AUTH]
         return ErrorDescriptor(
@@ -231,20 +237,43 @@ def get_recovery_recipe(error_class: ErrorClass) -> RecoveryRecipe:
     return RECOVERY_RECIPES.get(error_class, RECOVERY_RECIPES[ErrorClass.UNKNOWN])
 
 
+def _coerce_status(value: object) -> int | None:
+    """Normalize a status attribute to an int HTTP code, if it is one.
+
+    google-genai's ClientError exposes ``status`` as a string enum name
+    ("INVALID_ARGUMENT"); other SDKs use ints or numeric strings.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
 def _extract_status(err: BaseException) -> int | None:
     """Extract HTTP status code from exception (provider-agnostic)."""
     # OpenAI SDK
-    if hasattr(err, "status_code"):
-        return getattr(err, "status_code", None)
-    # Anthropic SDK
-    if hasattr(err, "status"):
-        return getattr(err, "status", None)
+    status = _coerce_status(getattr(err, "status_code", None))
+    if status is not None:
+        return status
+    # google-genai (code) / Anthropic SDK (status)
+    status = _coerce_status(getattr(err, "code", None))
+    if status is not None:
+        return status
+    status = _coerce_status(getattr(err, "status", None))
+    if status is not None:
+        return status
     # Generic HTTP
     if hasattr(err, "response") and hasattr(err.response, "status_code"):
-        return err.response.status_code
-    # String-based fallback
+        status = _coerce_status(err.response.status_code)
+        if status is not None:
+            return status
+    # String-based fallback. Word-boundary match so "429" doesn't fire on
+    # "1429 tokens", "file_429.txt", or a request id containing the digits.
     msg = str(err)
     for code in (401, 403, 429, 500, 502, 503, 504):
-        if str(code) in msg:
+        if re.search(rf"(?<!\d){code}(?!\d)", msg):
             return code
     return None

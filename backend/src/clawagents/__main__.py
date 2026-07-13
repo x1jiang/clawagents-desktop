@@ -318,7 +318,7 @@ def _build_builtin_tool_catalog() -> list[dict[str, Any]]:
         *create_filesystem_tools(sb),
         *create_exec_tools(sb),
         *create_advanced_fs_tools(sb),
-        *[t for t in web_tools if t.name == "web_fetch"],
+        *web_tools,
         *create_background_task_tools(),
     ]:
         registry.register(tool)
@@ -362,10 +362,26 @@ def _build_banner() -> str:
     return f"ClawAgents | provider={provider} model={model} env={env_src} ptrl={flag_str}"
 
 
-async def cmd_task(task: str, timeout_s: int = 0, advisor_model: str | None = None, profile: str | None = None):
+async def cmd_task(
+    task: str,
+    timeout_s: int = 0,
+    advisor_model: str | None = None,
+    profile: str | None = None,
+    output_format: str = "text",
+    mode: str | None = None,
+    auto: bool = False,
+    action_mode: str = "tools",
+):
     """Run a single task and print the result."""
     from clawagents.agent import create_claw_agent
+    from clawagents.output_format import (
+        OutputFormat,
+        make_stream_json_emitter,
+        parse_output_format,
+        print_agent_output,
+    )
 
+    fmt = parse_output_format(output_format)
     banner = _build_banner()
     # Annotate as Any-valued so mypy doesn't infer dict[str, str] from the
     # single advisor_model entry — create_claw_agent's kwargs include several
@@ -375,14 +391,23 @@ async def cmd_task(task: str, timeout_s: int = 0, advisor_model: str | None = No
         kwargs["advisor_model"] = advisor_model
     if profile:
         kwargs["profile"] = profile
+    resolved_mode = mode or ("ci" if auto else None)
+    if resolved_mode:
+        kwargs["mode"] = resolved_mode
+    if action_mode and action_mode != "tools":
+        kwargs["action_mode"] = action_mode
     agent = create_claw_agent(**kwargs)
     tool_count = len(agent.tools.list())
     advisor_info = f" advisor={advisor_model}" if agent.advisor_llm else ""
-    sys.stderr.write(f"{banner} | {tool_count} tools{advisor_info}\n")
+    if fmt != OutputFormat.JSON and fmt != OutputFormat.STREAM_JSON:
+        sys.stderr.write(f"{banner} | {tool_count} tools{advisor_info}\n")
 
-    result = await agent.invoke(task, timeout_s=timeout_s)
-    if result.result:
-        print(result.result)
+    on_event = None
+    if fmt == OutputFormat.STREAM_JSON:
+        on_event = make_stream_json_emitter()
+
+    result = await agent.invoke(task, timeout_s=timeout_s, on_event=on_event)
+    print_agent_output(result, fmt)
 
 
 def cmd_dry_run(task: str = "", profile: str | None = None, json_output: bool = False):
@@ -533,11 +558,11 @@ def cmd_sessions():
         print("No saved sessions found.")
         print("Enable session persistence: CLAW_FEATURE_SESSION_PERSISTENCE=1")
         return
-    print(f"{'Session ID':<35} {'Turns':>5}  {'Status':<10}  Task")
-    print("-" * 90)
+    print(f"{'Session ID':<35} {'Created':<17} {'Turns':>5}  {'Status':<10}  Task")
+    print("-" * 100)
     for s in sessions:
         ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(s.created_ts))
-        print(f"{s.session_id:<35} {s.turn_count:>5}  {s.status:<10}  {s.task[:40]}")
+        print(f"{s.session_id:<35} {ts:<17} {s.turn_count:>5}  {s.status:<10}  {s.task[:40]}")
 
 
 async def cmd_resume(session_id: str, timeout_s: int = 0):
@@ -619,7 +644,44 @@ def main():
     parser.add_argument("--sessions", action="store_true", help="List saved sessions")
     parser.add_argument("--resume", type=str, nargs="?", const="latest", metavar="SESSION_ID", help="Resume a saved session (default: latest)")
     parser.add_argument("--advisor", type=str, metavar="MODEL", help="Stronger model for strategic guidance (e.g. gpt-5.4, claude-opus-4-6)")
+    parser.add_argument(
+        "--output-format",
+        type=str,
+        default="text",
+        choices=["text", "json", "stream-json"],
+        help="Output format for --task (text, json, stream-json)",
+    )
+    parser.add_argument("--mode", type=str, help="Named agent mode from modes.json / builtins")
+    parser.add_argument(
+        "--auto",
+        action="store_true",
+        help="CI/headless: use mode=ci (bypass permissions) unless --mode is set",
+    )
+    parser.add_argument(
+        "--action-mode",
+        type=str,
+        choices=["tools", "code"],
+        default="tools",
+        help="tools (default) or code (CodeAct)",
+    )
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default=None,
+        help="Subcommand: evals",
+    )
+    parser.add_argument("suite", nargs="?", default=None, help="For evals: suite path")
+    parser.add_argument("--judge", action="store_true", help="For evals: also run LLM judge")
+    parser.add_argument("--baseline", type=str, help="For evals: baseline report JSON")
+    parser.add_argument("-o", "--output", type=str, help="For evals: write report JSON")
     args = parser.parse_args()
+
+    if args.command == "evals":
+        if not args.suite:
+            parser.error("evals requires a suite path")
+        from clawagents.evals_cli import main_evals
+
+        sys.exit(main_evals(args))
 
     if args.prune_trajectories is not None:
         cmd_prune_trajectories(args.prune_trajectories)
@@ -649,7 +711,16 @@ def main():
         cmd_trajectory(args.trajectory)
     elif args.task:
         try:
-            asyncio.run(cmd_task(args.task, timeout_s=args.timeout, advisor_model=args.advisor, profile=args.profile))
+            asyncio.run(cmd_task(
+                args.task,
+                timeout_s=args.timeout,
+                advisor_model=args.advisor,
+                profile=args.profile,
+                output_format=args.output_format,
+                mode=args.mode,
+                auto=args.auto,
+                action_mode=args.action_mode,
+            ))
         except KeyboardInterrupt:
             sys.stderr.write("\nInterrupted.\n")
             sys.exit(1)

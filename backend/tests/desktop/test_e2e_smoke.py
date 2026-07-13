@@ -22,8 +22,14 @@ def _free_port() -> int:
 @pytest.mark.timeout(30)
 def test_gateway_smoke(app_support_dir: Path, tmp_path: Path) -> None:
     port = _free_port()
+    # The subprocess bypasses pytest's ``pythonpath=["src"]`` config, so it
+    # would otherwise import whatever ``clawagents`` is pip-installed (a stale
+    # wheel from a sibling project, without the desktop routers). Force it to
+    # load THIS backend's src so the smoke test is hermetic.
+    backend_src = str(Path(__file__).resolve().parents[2] / "src")
     env = {
         **os.environ,
+        "PYTHONPATH": backend_src + os.pathsep + os.environ.get("PYTHONPATH", ""),
         "GATEWAY_HOST": "127.0.0.1",
         "GATEWAY_API_KEY": "",  # no auth for the smoke test
         "CLAWAGENTS_DESKTOP_APP_SUPPORT": str(app_support_dir),
@@ -72,7 +78,7 @@ def test_gateway_smoke(app_support_dir: Path, tmp_path: Path) -> None:
             assert client.get(f"/chats/{cid}").json()["title"] == "first"
 
             providers = client.get("/providers").json()
-            assert any(p["id"] == "ollama" for p in providers)
+            assert any(p["id"] == "openai" for p in providers)
 
             assert client.delete(f"/chats/{cid}").status_code == 204
             assert client.delete(f"/projects/{pid}").status_code == 204

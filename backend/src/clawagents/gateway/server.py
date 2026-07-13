@@ -178,17 +178,36 @@ def create_app() -> tuple:
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
 
-    from clawagents.gateway.projects_api import router as _projects_router
+    from clawagents.gateway.projects_api import router as _projects_router, img_router as _projects_img_router
     from clawagents.gateway.chats_api import router as _chats_router
     from clawagents.gateway.providers_api import router as _providers_router
     from clawagents.gateway.permissions_api import router as _permissions_router
     from clawagents.gateway.settings_api import router as _settings_router
+    from clawagents.gateway.stats_api import router as _stats_router
+    from clawagents.gateway.commands_api import router as _commands_router
+    from clawagents.gateway.backup_api import router as _backup_router
+    from clawagents.gateway.templates_api import router as _templates_router
+    from clawagents.gateway.diagnostics_api import router as _diagnostics_router
+    from clawagents.gateway.system_api import router as _system_router
+    from clawagents.gateway.skills_api import router as _skills_router
+    from clawagents.gateway.attachments_api import router as _attachments_router
+    from clawagents.gateway.agent_power_api import router as _agent_power_router
 
     app.include_router(_projects_router)
+    app.include_router(_projects_img_router)
     app.include_router(_chats_router)
     app.include_router(_providers_router)
     app.include_router(_permissions_router)
     app.include_router(_settings_router)
+    app.include_router(_stats_router)
+    app.include_router(_commands_router)
+    app.include_router(_backup_router)
+    app.include_router(_templates_router)
+    app.include_router(_diagnostics_router)
+    app.include_router(_system_router)
+    app.include_router(_skills_router)
+    app.include_router(_attachments_router)
+    app.include_router(_agent_power_router)
 
     attach_websocket(app, llm, _GATEWAY_API_KEY)
 

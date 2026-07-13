@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "clawagents-desktop-backend"
-version = "6.8.1"
+version = "6.11.2"
 description = "Lean, full-stack agentic AI framework with PTRL (Prompt-Time Reinforcement Learning)"
 readme = "README.md"
 license = "MIT"
@@ -83,6 +83,10 @@ packages = ["src/clawagents"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Pin the async-fixture loop scope explicitly. pytest-asyncio warns on every
+# run while this is unset and will change its default in a future release;
+# "function" matches the current implicit behavior (a fresh loop per test).
+asyncio_default_fixture_loop_scope = "function"
 markers = ["benchmark: performance benchmark tests (deselect with -m 'not benchmark')"]
 # Make the in-tree `src/clawagents` win over any globally-installed `clawagents`
 # package. Without this, `pytest` may import a stale wheel from site-packages and

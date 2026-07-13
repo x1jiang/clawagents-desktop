@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { Project, GatewayClient } from "../lib/gateway";
+import type { CreateProjectBody, Project, GatewayClient } from "../lib/gateway";
 
 interface ProjectsState {
   projects: Project[];
@@ -9,7 +9,7 @@ interface ProjectsState {
 
   setClient: (client: GatewayClient) => void;
   refresh: () => Promise<void>;
-  create: (name: string, rootPath: string) => Promise<Project>;
+  create: (name: string, rootPath: string, extra?: Partial<CreateProjectBody>) => Promise<Project>;
 }
 
 export const useProjects = create<ProjectsState>((set, get) => ({
@@ -32,10 +32,14 @@ export const useProjects = create<ProjectsState>((set, get) => ({
     }
   },
 
-  create: async (name, rootPath) => {
+  create: async (name, rootPath, extra = {}) => {
     const { client } = get();
     if (!client) throw new Error("gateway client not initialised");
-    const created = await client.createProject({ name, root_path: rootPath });
+    const created = await client.createProject({
+      name,
+      root_path: rootPath,
+      ...extra,
+    });
     await get().refresh();
     return created;
   },

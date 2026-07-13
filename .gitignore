@@ -20,3 +20,11 @@ ui/vite.config.d.ts
 ui/vite.config.js
 ui/.npmrc
 ui/pnpm-workspace.yaml
+
+# Local agent / session state — never publish
+.clawagents/
+.omx/
+
+# Release staging (DMGs uploaded via GitHub Releases, not git)
+/dist-release/
+*.dmg

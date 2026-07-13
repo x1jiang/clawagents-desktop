@@ -41,6 +41,44 @@ def test_create_rejects_missing_root(client: TestClient) -> None:
     assert r.status_code == 400
 
 
+def test_create_ssh_project(client: TestClient) -> None:
+    r = client.post(
+        "/projects",
+        json={
+            "name": "remote-app",
+            "root_path": "/home/me/app",
+            "kind": "ssh",
+            "ssh_host": "bastion",
+            "remote_path": "/home/me/app",
+        },
+    )
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["kind"] == "ssh"
+    assert body["ssh_host"] == "bastion"
+    assert body["remote_path"] == "/home/me/app"
+    assert body["root_path"] == "/home/me/app"
+
+
+def test_upsert_with_fixed_id(client: TestClient, tmp_path: Path) -> None:
+    root = tmp_path / "p"
+    root.mkdir()
+    fixed = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    r = client.post(
+        "/projects",
+        json={"id": fixed, "name": "seed", "root_path": str(root)},
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["id"] == fixed
+    r2 = client.post(
+        "/projects",
+        json={"id": fixed, "name": "seed2", "root_path": str(root)},
+    )
+    assert r2.status_code == 201
+    assert r2.json()["name"] == "seed2"
+    assert len(client.get("/projects").json()) == 1
+
+
 def test_patch_rename(client: TestClient, tmp_path: Path) -> None:
     (tmp_path / "p").mkdir()
     pid = client.post("/projects", json={"name": "old", "root_path": str(tmp_path / "p")}).json()["id"]

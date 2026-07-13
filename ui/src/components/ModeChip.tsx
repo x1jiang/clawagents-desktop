@@ -8,10 +8,10 @@ const LABELS: Record<ExecMode, string> = {
 };
 
 const COLORS: Record<ExecMode, string> = {
-  read_only: "bg-blue-50 text-blue-700 border-blue-200",
-  ask: "bg-yellow-50 text-yellow-700 border-yellow-200",
-  auto: "bg-gray-100 text-gray-700 border-gray-300",
-  full_access: "bg-red-50 text-red-700 border-red-200",
+  read_only:   "bg-blue-50 text-blue-700 border-blue-200 dark:bg-blue-900/40 dark:text-blue-200 dark:border-blue-800",
+  ask:         "bg-yellow-50 text-yellow-700 border-yellow-200 dark:bg-yellow-900/40 dark:text-yellow-200 dark:border-yellow-800",
+  auto:        "bg-gray-100 text-gray-700 border-gray-300 dark:bg-gray-800 dark:text-gray-200 dark:border-gray-700",
+  full_access: "bg-red-50 text-red-700 border-red-200 dark:bg-red-900/40 dark:text-red-200 dark:border-red-800",
 };
 
 interface Props {

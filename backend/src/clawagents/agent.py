@@ -95,6 +95,9 @@ class ClawAgent:
         # ── v6.4: Handoffs + Agent.as_tool ──
         handoffs: Optional[list[Handoff]] = None,
         name: Optional[str] = None,
+        action_mode: str = "tools",
+        approval_handler: Any = None,
+        require_approval_tools: Optional[List[str]] = None,
     ):
         """
         Initialize a ClawAgent.
@@ -115,6 +118,9 @@ class ClawAgent:
             features: Dictionary to override global architectural variables (e.g. {"micro_compact": False, "wal": True})
             advisor_llm: Optional stronger model for strategic guidance (consulted 2-3 times per task)
             advisor_max_calls: Maximum advisor consultations per task (default: 3)
+            action_mode: ``tools`` (default) or ``code`` (CodeAct Python actions)
+            approval_handler: ``None`` | ``"event"`` | callable — block tools that require approval
+            require_approval_tools: tool names that always require approval when handler is set
         """
         self.llm = llm
         self.tools = tools
@@ -145,6 +151,9 @@ class ClawAgent:
         self.on_stream_event = on_stream_event
         self.handoffs: list[Handoff] = list(handoffs) if handoffs else []
         self.name = name
+        self.action_mode = action_mode if action_mode in ("tools", "code") else "tools"
+        self.approval_handler = approval_handler
+        self.require_approval_tools = list(require_approval_tools or [])
 
     async def invoke(
         self,
@@ -175,6 +184,14 @@ class ClawAgent:
         ``output_type``, ``session``, ``on_stream_event`` …) override the
         values supplied to ``ClawAgent.__init__`` for just this invocation.
         """
+        if run_context is None:
+            run_context = RunContext(context=user_context)
+        elif user_context is not None and run_context.context is None:
+            run_context.context = user_context
+        default_pm = getattr(self, "_default_permission_mode", None)
+        if default_pm is not None:
+            run_context.permission_mode = default_pm
+
         return await run_agent_graph(
             task=task,
             llm=self.llm,
@@ -219,6 +236,9 @@ class ClawAgent:
             ),
             handoffs=handoffs if handoffs is not None else self.handoffs,
             agent_name=self.name,
+            action_mode=self.action_mode,
+            approval_handler=self.approval_handler,
+            require_approval_tools=self.require_approval_tools,
             session_id=session_id,
             session_dir=session_dir,
             permission_callback=permission_callback,
@@ -250,10 +270,16 @@ class ClawAgent:
         from clawagents.providers.llm import LLMMessage
         existing = self.before_llm
 
+        marker = f"[Context] {text}"
+
         def hook(messages):
             if existing:
                 messages = existing(messages)
-            return [*messages, LLMMessage(role="user", content=f"[Context] {text}")]
+            # Idempotent: before_llm runs every loop round; without this
+            # check the context message accumulated one copy per round.
+            if any(getattr(m, "content", None) == marker for m in messages):
+                return messages
+            return [*messages, LLMMessage(role="user", content=marker)]
 
         self.before_llm = hook
 
@@ -428,7 +454,11 @@ class _AgentAsTool:
                 )
 
         try:
-            child_state = await self._agent.invoke(task)
+            # Forward the parent's run context so the child inherits its
+            # permission_mode (and approvals). Without this the child ran with a
+            # fresh DEFAULT context, letting an agent-as-tool execute write/exec
+            # tools while the parent was in plan mode — a plan-mode escape.
+            child_state = await self._agent.invoke(task, run_context=run_context)
         except Exception as e:
             return ToolResult(
                 success=False, output="", error=f"{self.name} raised: {e}"
@@ -457,6 +487,7 @@ def create_claw_agent(
     instruction: Optional[str] = None,
     tools: Optional[List] = None,
     skills: Union[str, List[Union[str, os.PathLike]], None] = None,
+    skills_exclude: Optional[List[str]] = None,
     fallback_models: Optional[List[str]] = None,
     memory: Union[str, List[Union[str, os.PathLike]], None] = None,
     sandbox: Any = None,
@@ -481,6 +512,10 @@ def create_claw_agent(
     tool_discovery: bool = True,
     tool_discovery_max_results: int = 25,
     tool_discovery_max_profile: str = "full",
+    mode: Optional[str] = None,
+    action_mode: str = "tools",
+    approval_handler: Any = None,
+    require_approval_tools: Optional[List[str]] = None,
 ) -> ClawAgent:
     """
     Create a ClawAgent with full-stack capabilities.
@@ -499,7 +534,7 @@ def create_claw_agent(
                         Default: from OPENAI_API_VERSION env / None.
         instruction:    What the agent should do / how it should behave.
         tools:          Additional tools. Built-in tools always included.
-        skills:         Skill directories (default: auto-discovers ./skills). The built-in ByteRover skill is always included when present.
+        skills:         Skill directories (default: auto-discovers ./skills). Bundled skills (e.g. OpenViking) are included when present.
         memory:         AGENTS.md paths (default: auto-discovers ./AGENTS.md, ./CLAWAGENTS.md).
         streaming:      Enable streaming output (default: True).
         context_window:  Max context window in tokens (default: from CONTEXT_WINDOW env / 1000000).
@@ -699,17 +734,24 @@ def create_claw_agent(
             keywords=getattr(spec, "keywords", []),
         ))
 
-    class _LazyWebFetch(LazyTool):
-        def __init__(self):
-            from clawagents.tools.web import web_tools as _wt
-            spec = next(t for t in _wt if t.name == "web_fetch")
-            super().__init__(spec.name, spec.description, spec.parameters, "clawagents.tools.web", "", getattr(spec, "keywords", []))
-        async def execute(self, args):
-            if self._resolved is None:
+    def _make_lazy_web_tool(tool_name: str):
+        class _LazyWebTool(LazyTool):
+            def __init__(self):
                 from clawagents.tools.web import web_tools as _wt
-                self._resolved = next(t for t in _wt if t.name == "web_fetch")
-            return await self._resolved.execute(args)
-    registry.register(_LazyWebFetch())
+                spec = next(t for t in _wt if t.name == tool_name)
+                super().__init__(
+                    spec.name, spec.description, spec.parameters,
+                    "clawagents.tools.web", "", getattr(spec, "keywords", []),
+                )
+            async def execute(self, args):
+                if self._resolved is None:
+                    from clawagents.tools.web import web_tools as _wt
+                    self._resolved = next(t for t in _wt if t.name == tool_name)
+                return await self._resolved.execute(args)
+        return _LazyWebTool()
+
+    for _web_name in ("web_fetch", "web_search"):
+        registry.register(_make_lazy_web_tool(_web_name))
 
     # ── Adapt and register user-provided tools ─────────────────────────
     if tools:
@@ -742,6 +784,11 @@ def create_claw_agent(
         except RuntimeError:
             asyncio.run(skill_store.load_all())
 
+        if skills_exclude:
+            for _name in skills_exclude:
+                if _name:
+                    skill_store.skills.pop(str(_name), None)
+
         loaded_skills = skill_store.list()
         if loaded_skills:
             lines = [f"- **{s.name}**: {s.description or '(no description)'}" for s in loaded_skills]
@@ -766,6 +813,39 @@ def create_claw_agent(
             if skill_tool.name == "use_skill":
                 registry.register(skill_tool)
 
+    from clawagents.tools.skill_workshop import create_skill_workshop_tool
+
+    registry.register(create_skill_workshop_tool(workspace=os.getcwd()))
+
+    from clawagents.tools.search_history import create_search_history_tool
+
+    registry.register(create_search_history_tool(workspace=os.getcwd()))
+
+    from clawagents.tools.retrieve_tool_result import create_retrieve_tool_result_tool
+
+    registry.register(create_retrieve_tool_result_tool(workspace=os.getcwd()))
+
+    from clawagents.tools.context_tools import create_context_tools
+
+    for t in create_context_tools(workspace=os.getcwd()):
+        registry.register(t)
+
+    from clawagents.tools.git_tools import create_git_tools
+
+    for t in create_git_tools(workspace=os.getcwd()):
+        registry.register(t)
+
+    from clawagents.tools.plan_mode import create_plan_mode_tools
+
+    for t in create_plan_mode_tools():
+        if registry.get(t.name) is None:
+            registry.register(t)
+
+    from clawagents.tools.worktree_tools import create_worktree_tools
+
+    for t in create_worktree_tools(workspace=os.getcwd()):
+        registry.register(t)
+
     # ── Auto-discover memory from default locations ────────────────────
     memory_paths = _to_list(memory) if memory is not None else _auto_discover_memory()
     composed_before_llm = _compose_before_llm(
@@ -773,8 +853,43 @@ def create_claw_agent(
         skill_summaries=skill_summaries,
     )
 
+    # ── Custom mode (instruction + tool gate + permission) ────────────
+    mode_before: Optional[BeforeToolHook] = None
+    resolved_instruction = instruction
+    permission_mode_override = None
+    if mode:
+        from clawagents.modes import (
+            compose_before_tool,
+            get_mode,
+            make_mode_before_tool,
+            resolve_permission_mode,
+        )
+
+        agent_mode = get_mode(mode)
+        if agent_mode is None:
+            raise ValueError(f"Unknown agent mode: {mode!r}")
+        if agent_mode.instruction:
+            if resolved_instruction:
+                resolved_instruction = (
+                    agent_mode.instruction.rstrip() + "\n\n" + resolved_instruction
+                )
+            else:
+                resolved_instruction = agent_mode.instruction
+        mode_before = make_mode_before_tool(agent_mode)
+        permission_mode_override = resolve_permission_mode(agent_mode)
+        if agent_mode.auto_approve and approval_handler is None:
+            approval_handler = None  # CI mode: no blocking approvals
+
+    action_mode_norm = action_mode if action_mode in ("tools", "code") else "tools"
+    if action_mode_norm == "code":
+        from clawagents.graph.codeact import CODEACT_SYSTEM_ADDENDUM
+
+        resolved_instruction = (
+            (resolved_instruction or "") + "\n\n" + CODEACT_SYSTEM_ADDENDUM
+        ).strip() or CODEACT_SYSTEM_ADDENDUM
+
     agent = ClawAgent(
-        llm=llm, tools=registry, system_prompt=instruction,
+        llm=llm, tools=registry, system_prompt=resolved_instruction,
         streaming=streaming, use_native_tools=use_native_tools,
         context_window=context_window, on_event=on_event,
         before_llm=composed_before_llm, trajectory=trajectory,
@@ -782,7 +897,14 @@ def create_claw_agent(
         preview_chars=preview_chars, response_chars=response_chars,
         advisor_llm=resolved_advisor_llm, advisor_max_calls=resolved_advisor_max_calls,
         handoffs=handoffs, name=name,
+        action_mode=action_mode_norm,
+        approval_handler=approval_handler,
+        require_approval_tools=require_approval_tools,
     )
+    if mode_before is not None:
+        agent.before_tool = mode_before
+    if permission_mode_override is not None:
+        agent._default_permission_mode = permission_mode_override  # type: ignore[attr-defined]
 
     from clawagents.tools.background_task import create_background_task_tools
     for task_tool in create_background_task_tools():
@@ -916,23 +1038,29 @@ def _to_list(value) -> list:
 
 
 def _get_bundled_skills_dir() -> str:
-    """Path to all bundled skills (byterover, openviking, etc.)."""
+    """Path to bundled skills (e.g. openviking)."""
     return str(Path(__file__).resolve().parent / "skills")
 
 
 # Default locations for auto-discovery
-_DEFAULT_MEMORY_FILES = ["AGENTS.md", "CLAWAGENTS.md"]
-_DEFAULT_SKILL_DIRS = ["skills", ".skills", "skill", ".skill", "Skills"]
+_DEFAULT_MEMORY_FILES = ["AGENTS.md", "CLAWAGENTS.md", "CLAUDE.md"]
+_DEFAULT_SKILL_DIRS = [
+    "skills",
+    ".skills",
+    "skill",
+    ".skill",
+    "Skills",
+    ".agents/skills",
+    ".agent/skills",
+    ".cursor/skills",
+]
 
 
 def _auto_discover_memory() -> list:
-    """Auto-discover memory files in common locations."""
-    found = []
-    for name in _DEFAULT_MEMORY_FILES:
-        path = os.path.join(os.getcwd(), name)
-        if os.path.isfile(path):
-            found.append(path)
-    return found
+    """Auto-discover memory + always-on rules files."""
+    from clawagents.memory.rules import discover_rule_paths
+
+    return [str(p) for p in discover_rule_paths()]
 
 
 def _auto_discover_skills() -> list:
@@ -994,19 +1122,29 @@ def _compose_before_llm(
     memory_paths: list,
     skill_summaries: Optional[str],
 ) -> Optional[BeforeLLMHook]:
-    """Compose memory loading + skill injection into one before_llm hook."""
+    """Compose memory/rules + skill injection into one before_llm hook.
+
+    Reloads rule files every LLM round so always-on rules survive compaction.
+    """
     from clawagents.prompts import append_prompt_injection, build_prompt_injection
 
-    memory_content: Optional[str] = None
-    if memory_paths:
-        from clawagents.memory.loader import load_memory_files
-        memory_content = load_memory_files(memory_paths)
-
-    if not memory_content and not skill_summaries:
-        return None
-    injection = build_prompt_injection(memory_content, skill_summaries)
-
     def hook(messages: list) -> list:
+        memory_content: Optional[str] = None
+        if memory_paths:
+            from clawagents.memory.rules import load_rules_text
+
+            # Prefer rules loader (budget + CLAUDE.md / .clawagents/rules)
+            memory_content = load_rules_text(paths=memory_paths)
+            if memory_content is None:
+                from clawagents.memory.loader import load_memory_files
+
+                memory_content = load_memory_files(memory_paths)
+        if not memory_content and not skill_summaries:
+            return messages
+        injection = build_prompt_injection(memory_content, skill_summaries)
         return list(append_prompt_injection(messages, injection))
 
-    return hook
+    # Always return a hook when we have paths or skills so rounds re-read disk.
+    if memory_paths or skill_summaries:
+        return hook
+    return None

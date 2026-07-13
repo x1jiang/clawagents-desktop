@@ -17,6 +17,17 @@ class AppSettings:
     default_model: str = ""
     default_mode: str = "auto"  # ExecMode wire value
     theme: str = "system"       # "light" | "dark" | "system"
+    workspace_system_prompt: str = ""  # Prepended to every chat's first turn
+    # Agent-power toggles (VS Code parity). Defaults match VS Code: off / safe.
+    mcp_enabled: bool = False
+    mcp_trust_workspace: bool = False
+    context_mode: bool = True
+    browser_tools: bool = False
+    trajectory: bool = False
+    learn: bool = False
+    action_mode: str = "tools"  # "tools" | "code"
+    agent_mode: str = ""        # persona from .clawagents/modes.json
+    allow_full_access: bool = False
 
 
 class SettingsStore:
