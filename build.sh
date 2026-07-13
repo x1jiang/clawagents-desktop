@@ -58,7 +58,7 @@ echo "[build] Creating relocatable venv inside the app (non-editable install) â€
 # Non-editable so site-packages are self-contained (editable .pth would point
 # at the source tree and break when the .app is moved to /Applications).
 "$RES_BACKEND/.venv/bin/pip" install \
-  "$ROOT/backend[gemini,anthropic,mcp,accurate-tokens]"
+  "$ROOT/backend[gemini,anthropic,bedrock,mcp,accurate-tokens]"
 
 # Source tree for SSH remote bootstrap (rsync to remote hosts).
 echo "[build] Embedding backend source for remote SSH sync â€¦"
