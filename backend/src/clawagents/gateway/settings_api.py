@@ -10,13 +10,17 @@ restart.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from clawagents.desktop_stores.provider_catalog import _has_aws_credentials
-from clawagents.desktop_stores.settings_store import SettingsStore
+from clawagents.desktop_stores.app_paths import projectless_scratch_dir
+from clawagents.desktop_stores.project_store import ProjectNotFoundError, ProjectStore
+from clawagents.desktop_stores.runtime_trust import RuntimeTrustStore
+from clawagents.desktop_stores.settings_store import SettingsStore, effective_settings
 from clawagents.desktop_stores.url_trust import is_trusted_base_url
 from clawagents.gateway.desktop_router import require_auth
 
@@ -69,6 +73,7 @@ def _settings_payload(s) -> dict:
         "action_mode": s.action_mode,
         "agent_mode": s.agent_mode,
         "allow_full_access": s.allow_full_access,
+        "allow_external_skill_dirs": s.allow_external_skill_dirs,
         "reasoning_effort": s.reasoning_effort,
         "wire_api": s.wire_api,
         "ssl_verify": s.ssl_verify,
@@ -81,10 +86,42 @@ def _settings_payload(s) -> dict:
     }
 
 
+def _scope_root(project_id: str | None, projectless: bool) -> str | None:
+    if project_id and projectless:
+        raise HTTPException(status_code=400, detail="choose project_id or projectless, not both")
+    if project_id:
+        try:
+            project = ProjectStore().get(project_id)
+        except ProjectNotFoundError:
+            raise HTTPException(status_code=404, detail=f"project {project_id} not found")
+        if project.kind == "ssh":
+            raise HTTPException(
+                status_code=400,
+                detail="SSH runtime trust must be configured through the connected remote gateway",
+            )
+        try:
+            return str(Path(project.root_path).expanduser().resolve(strict=True))
+        except OSError:
+            raise HTTPException(status_code=400, detail="project root is unavailable")
+    if projectless:
+        root = projectless_scratch_dir()
+        root.mkdir(parents=True, exist_ok=True)
+        return str(root)
+    return None
+
+
 @router.get("/settings/app")
-def get_app_settings() -> dict:
+def get_app_settings(project_id: str | None = None, projectless: bool = False) -> dict:
     """Return non-secret app settings (everything that lives in settings.json)."""
-    return _settings_payload(SettingsStore().load())
+    root = _scope_root(project_id, projectless)
+    settings = effective_settings(root) if root else SettingsStore().load()
+    if root is None:
+        # Legacy application-wide approvals are never effective.
+        settings.trust_custom_base_url = False
+        settings.mcp_trust_workspace = False
+        settings.allow_full_access = False
+        settings.allow_external_skill_dirs = False
+    return _settings_payload(settings)
 
 
 class AppSettingsPatchBody(BaseModel):
@@ -106,6 +143,7 @@ class AppSettingsPatchBody(BaseModel):
     action_mode: str | None = None
     agent_mode: str | None = None
     allow_full_access: bool | None = None
+    allow_external_skill_dirs: bool | None = None
     reasoning_effort: str | None = None
     wire_api: str | None = None
     ssl_verify: bool | None = None
@@ -117,8 +155,27 @@ class AppSettingsPatchBody(BaseModel):
 
 
 @router.patch("/settings/app")
-def patch_app_settings(body: AppSettingsPatchBody) -> dict:
+def patch_app_settings(
+    body: AppSettingsPatchBody,
+    project_id: str | None = None,
+    projectless: bool = False,
+) -> dict:
     sent = body.model_fields_set
+    root = _scope_root(project_id, projectless)
+    runtime_fields = {
+        "trust_custom_base_url",
+        "mcp_trust_workspace",
+        "allow_full_access",
+        "allow_external_skill_dirs",
+    }
+    requested_runtime = sent & runtime_fields
+    if requested_runtime and root is None:
+        if any(bool(getattr(body, field)) for field in requested_runtime):
+            raise HTTPException(
+                status_code=400,
+                detail="runtime trust requires project_id or projectless scope",
+            )
+        requested_runtime = set()
     store = SettingsStore()
     settings = store.load()
     if "default_model" in sent and body.default_model is not None:
@@ -134,28 +191,21 @@ def patch_app_settings(body: AppSettingsPatchBody) -> dict:
         settings.provider = body.provider if body.provider in allowed else "auto"
     if "base_url" in sent and body.base_url is not None:
         base = body.base_url.strip()
-        if base and not is_trusted_base_url(base) and not (
-            body.trust_custom_base_url
-            if "trust_custom_base_url" in sent
-            else settings.trust_custom_base_url
-        ):
+        trust_store = RuntimeTrustStore()
+        approved_now = bool(root) and bool(body.trust_custom_base_url)
+        already_approved = bool(root) and trust_store.is_url_trusted(root, base)
+        if base and not is_trusted_base_url(base) and not (approved_now or already_approved):
             raise HTTPException(
                 status_code=400,
                 detail="Untrusted base_url — set trust_custom_base_url=true to confirm",
             )
         settings.base_url = base
-        if not base:
-            settings.trust_custom_base_url = False
-    if "trust_custom_base_url" in sent and body.trust_custom_base_url is not None:
-        settings.trust_custom_base_url = bool(body.trust_custom_base_url)
     if "aws_region" in sent and body.aws_region is not None:
         settings.aws_region = body.aws_region.strip()
     if "aws_profile" in sent and body.aws_profile is not None:
         settings.aws_profile = body.aws_profile.strip()
     if "mcp_enabled" in sent and body.mcp_enabled is not None:
         settings.mcp_enabled = bool(body.mcp_enabled)
-    if "mcp_trust_workspace" in sent and body.mcp_trust_workspace is not None:
-        settings.mcp_trust_workspace = bool(body.mcp_trust_workspace)
     if "context_mode" in sent and body.context_mode is not None:
         settings.context_mode = bool(body.context_mode)
     if "browser_tools" in sent and body.browser_tools is not None:
@@ -168,8 +218,6 @@ def patch_app_settings(body: AppSettingsPatchBody) -> dict:
         settings.action_mode = body.action_mode if body.action_mode in ("tools", "code") else "tools"
     if "agent_mode" in sent and body.agent_mode is not None:
         settings.agent_mode = body.agent_mode
-    if "allow_full_access" in sent and body.allow_full_access is not None:
-        settings.allow_full_access = bool(body.allow_full_access)
     if "reasoning_effort" in sent and body.reasoning_effort is not None:
         effort = body.reasoning_effort.strip().lower()
         allowed_effort = {"", "none", "low", "medium", "high", "xhigh", "max"}
@@ -190,6 +238,11 @@ def patch_app_settings(body: AppSettingsPatchBody) -> dict:
         settings.skill_exclude = [str(x).strip() for x in body.skill_exclude if str(x).strip()]
     if "skill_user_homes" in sent and body.skill_user_homes is not None:
         settings.skill_user_homes = bool(body.skill_user_homes)
+    if root and requested_runtime:
+        changes = {field: getattr(body, field) for field in requested_runtime}
+        if "trust_custom_base_url" in requested_runtime:
+            changes["base_url"] = body.base_url if "base_url" in sent else settings.base_url
+        RuntimeTrustStore().update(root, changes)
     store.save(settings)
     # Push AWS region/profile into process env for native Bedrock turns.
     if settings.aws_region:
@@ -197,7 +250,7 @@ def patch_app_settings(body: AppSettingsPatchBody) -> dict:
         os.environ.setdefault("AWS_DEFAULT_REGION", settings.aws_region)
     if settings.aws_profile:
         os.environ["AWS_PROFILE"] = settings.aws_profile
-    return get_app_settings()
+    return get_app_settings(project_id=project_id, projectless=projectless)
 
 
 class VerifyKeyBody(BaseModel):

@@ -159,6 +159,36 @@ def test_rejects_image_extension_with_non_image_bytes(client: TestClient) -> Non
     assert "does not match" in r.json()["detail"]
 
 
+def test_detected_image_mime_overrides_same_family_declaration(client: TestClient) -> None:
+    r = client.post(
+        "/chats/chat-1/attachments",
+        json={
+            "filename": "camera.png",
+            "mime_type": "image/png",
+            "data_base64": _b64(b"\xff\xd8\xff\xe0" + b"jpeg payload"),
+        },
+    )
+
+    assert r.status_code == 201
+    assert r.json()["mime_type"] == "image/jpeg"
+    assert any("detected image/jpeg" in warning for warning in r.json()["warnings"])
+
+
+def test_detected_text_mime_overrides_active_content_declaration(client: TestClient) -> None:
+    r = client.post(
+        "/chats/chat-1/attachments",
+        json={
+            "filename": "notes.txt",
+            "mime_type": "text/html",
+            "data_base64": _b64(b"plain notes"),
+        },
+    )
+
+    assert r.status_code == 201
+    assert r.json()["mime_type"] == "text/plain"
+    assert any("detected text/plain" in warning for warning in r.json()["warnings"])
+
+
 def test_upload_xlsx_extracts_rows(client: TestClient) -> None:
     buf = BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:

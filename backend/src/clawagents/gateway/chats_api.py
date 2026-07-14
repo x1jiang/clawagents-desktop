@@ -906,9 +906,9 @@ async def run_chat_turn(
     import inspect
 
     from clawagents.agent import create_claw_agent
-    from clawagents.desktop_stores.settings_store import SettingsStore
+    from clawagents.desktop_stores.settings_store import effective_settings
 
-    settings = SettingsStore().load()
+    settings = effective_settings(project_root)
     # Gate full_access behind an explicit settings toggle (VS Code parity).
     if mode == "full_access" and not settings.allow_full_access:
         mode = "ask"

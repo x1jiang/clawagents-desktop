@@ -34,9 +34,9 @@ xcrun notarytool store-credentials clawagents-notary \
 SKIP_NOTARIZE=1 ./build.sh
 ```
 
-## Features (0.3.0)
+## Features (0.3.1)
 
-- **VS Code parity:** library **6.12.12**, Wire API / Effort / TLS verify, personal skill homes
+- **VS Code parity:** library **6.12.13**, enforced skill capabilities, project-scoped runtime trust, and quarantine-aware skill previews
 - **Native attachments:** images + PDF/DOCX via `invoke(images=/files=)` (not just OCR text)
 - **Keychain-safe keys:** sidecar skips dotenv override so Settings keys win
 - **Reliable Stop:** Cancel clears the send queue; SSE keep-alive + 60s idle watchdog

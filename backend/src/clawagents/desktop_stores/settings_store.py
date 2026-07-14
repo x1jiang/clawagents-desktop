@@ -6,7 +6,8 @@ Atomic writes via atomic_write_text. Corrupt JSON returns defaults.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
+from pathlib import Path
 
 from clawagents.desktop_stores.app_paths import settings_file
 from clawagents.utils.atomic_write import atomic_write_text
@@ -37,6 +38,7 @@ class AppSettings:
     action_mode: str = "tools"  # "tools" | "code"
     agent_mode: str = ""        # persona from .clawagents/modes.json
     allow_full_access: bool = False
+    allow_external_skill_dirs: bool = False
     # OpenAI reasoning effort (none|low|medium|high|xhigh). Empty = provider default.
     reasoning_effort: str = "medium"
     # OpenAI transport: auto | responses | chat_completions.
@@ -79,4 +81,32 @@ class SettingsStore:
         return AppSettings(**kwargs)
 
     def save(self, settings: AppSettings) -> None:
-        atomic_write_text(self.path, json.dumps(asdict(settings), indent=2))
+        payload = asdict(settings)
+        # Runtime authority is project-scoped.  Legacy values are tolerated on
+        # read but are intentionally dropped on the next ordinary settings save.
+        for key in (
+            "trust_custom_base_url",
+            "mcp_trust_workspace",
+            "allow_full_access",
+            "allow_external_skill_dirs",
+        ):
+            payload.pop(key, None)
+        atomic_write_text(self.path, json.dumps(payload, indent=2))
+
+
+def effective_settings(project_root: str | Path) -> AppSettings:
+    """Merge global preferences with the selected workspace's approvals."""
+    from clawagents.desktop_stores.runtime_trust import RuntimeTrustStore
+
+    settings = replace(SettingsStore().load())
+    trust = RuntimeTrustStore().load(project_root)
+    settings.trust_custom_base_url = (
+        bool(trust.trusted_base_url)
+        and trust.trusted_base_url == settings.base_url.strip().rstrip("/")
+    )
+    settings.mcp_trust_workspace = trust.mcp_trust_workspace
+    settings.allow_full_access = trust.allow_full_access
+    settings.allow_external_skill_dirs = trust.allow_external_skill_dirs
+    if not trust.allow_external_skill_dirs:
+        settings.skill_dirs = []
+    return settings

@@ -11,7 +11,7 @@ from typing import Any, Literal
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from clawagents.desktop_stores.settings_store import SettingsStore
+from clawagents.desktop_stores.settings_store import SettingsStore, effective_settings
 from clawagents.gateway.desktop_router import require_auth
 from clawagents.gateway.mcp_loader import context_mode_available, list_mcp_config
 
@@ -80,7 +80,6 @@ def post_ask_user(request_id: str, body: AskUserBody) -> dict:
 @router.get("/mcp")
 def get_mcp(project_id: str | None = None) -> dict:
     """List configured MCP servers for a project (or home-only if no project)."""
-    settings = SettingsStore().load()
     workspace = Path.home()
     if project_id:
         from clawagents.desktop_stores.project_store import ProjectNotFoundError, ProjectStore
@@ -88,6 +87,9 @@ def get_mcp(project_id: str | None = None) -> dict:
             workspace = Path(ProjectStore().get(project_id).root_path)
         except ProjectNotFoundError:
             raise HTTPException(status_code=404, detail=f"project {project_id} not found")
+    settings = effective_settings(workspace) if project_id else SettingsStore().load()
+    if not project_id:
+        settings.mcp_trust_workspace = False
     return {
         "mcp_enabled": settings.mcp_enabled,
         "mcp_trust_workspace": settings.mcp_trust_workspace,

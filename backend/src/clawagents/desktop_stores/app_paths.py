@@ -24,6 +24,10 @@ def settings_file() -> Path:
     return app_support_dir() / "settings.json"
 
 
+def runtime_trust_file() -> Path:
+    return app_support_dir() / "runtime-trust.json"
+
+
 def permissions_file() -> Path:
     return app_support_dir() / "permissions.json"
 

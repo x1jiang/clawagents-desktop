@@ -99,6 +99,7 @@ export interface AppSettings {
   action_mode: string;
   agent_mode: string;
   allow_full_access: boolean;
+  allow_external_skill_dirs?: boolean;
   reasoning_effort?: string;
   wire_api?: string;
   ssl_verify?: boolean;
@@ -249,8 +250,13 @@ export class GatewayClient {
     });
   }
 
-  listProviders(): Promise<ProviderCatalogEntry[]> {
-    return this.request("/providers");
+  listProviders(projectId?: string | null, projectless = false): Promise<ProviderCatalogEntry[]> {
+    const query = projectId
+      ? `?project_id=${encodeURIComponent(projectId)}`
+      : projectless
+        ? "?projectless=true"
+        : "";
+    return this.request(`/providers${query}`);
   }
 
   patchChat(chatId: string, body: { title?: string; model?: string; mode?: string; pinned?: boolean; note?: string }): Promise<{ id: string; title: string; model: string; mode: string; pinned?: boolean; note?: string }> {
@@ -308,12 +314,26 @@ export class GatewayClient {
     });
   }
 
-  getAppSettings(): Promise<AppSettings> {
-    return this.request("/settings/app");
+  getAppSettings(projectId?: string | null, projectless = false): Promise<AppSettings> {
+    const query = projectId
+      ? `?project_id=${encodeURIComponent(projectId)}`
+      : projectless
+        ? "?projectless=true"
+        : "";
+    return this.request(`/settings/app${query}`);
   }
 
-  patchAppSettings(body: Partial<AppSettings>): Promise<AppSettings> {
-    return this.request("/settings/app", {
+  patchAppSettings(
+    body: Partial<AppSettings>,
+    projectId?: string | null,
+    projectless = false,
+  ): Promise<AppSettings> {
+    const query = projectId
+      ? `?project_id=${encodeURIComponent(projectId)}`
+      : projectless
+        ? "?projectless=true"
+        : "";
+    return this.request(`/settings/app${query}`, {
       method: "PATCH",
       body: JSON.stringify(body),
     });
@@ -545,7 +565,10 @@ export class GatewayClient {
    */
   discoveredSkills(projectId: string): Promise<{
     root: string;
-    skills: Array<{ name: string; description: string; source_dir: string; path: string }>;
+    skills: Array<{ name: string; description: string; source_dir: string; path: string; origin?: string }>;
+    unavailable: Record<string, string>;
+    quarantined: Record<string, string>;
+    warnings: string[];
   }> {
     return this.request(`/skills/discovered?project_id=${encodeURIComponent(projectId)}`);
   }

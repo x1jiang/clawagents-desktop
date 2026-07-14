@@ -38,6 +38,12 @@ import { FilesTouched } from "./FilesTouched";
 import { ResizableSide } from "./ResizableSide";
 import type { ExecMode } from "../stores/settings";
 import { MAX_ATTACHMENT_BYTES, type AutoApprove, type ChatAttachment } from "../lib/gateway";
+import {
+  abortAndDropOtherChats,
+  attachmentsForChat,
+  updateOwnedAttachment,
+  type OwnedComposerAttachment,
+} from "../lib/chat_attachments";
 
 const DEFAULT_AUTO_APPROVE: AutoApprove = { edit: false, execute: false, web: false, browser: false };
 
@@ -73,14 +79,10 @@ interface ReplayedMessage {
   attachments?: ChatAttachment[];
 }
 
-interface ComposerAttachment {
-  localId: string;
+interface ComposerAttachment extends OwnedComposerAttachment<ChatAttachment> {
   file: File;
-  status: "uploading" | "ready" | "error";
   progress: number;
-  attachment?: ChatAttachment;
   error?: string;
-  abort?: AbortController;
 }
 
 function formatBytes(size: number): string {
@@ -160,6 +162,8 @@ export function ChatSurface({ projectId, chatId }: Props) {
   const toggleFiles = useUI((s) => s.toggleFilesPanel);
   const router = useRouter();
   const abortRef = useRef<AbortController | null>(null);
+  const activeChatIdRef = useRef(chatId);
+  activeChatIdRef.current = chatId;
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const anchorRefs = useRef<Record<number, HTMLDivElement | null>>({});
   const [draft, setDraft] = useState<string>(() => loadDraft(chatId));
@@ -176,8 +180,9 @@ export function ChatSurface({ projectId, chatId }: Props) {
   const [checkpointTick, setCheckpointTick] = useState(() => Date.now());
   const [compacting, setCompacting] = useState(false);
   const sendQueueRef = useRef<Array<{ content: string; attachments?: ChatAttachment[] }>>([]);
-  const uploading = attachmentItems.some((item) => item.status === "uploading");
-  const readyAttachments = attachmentItems
+  const activeAttachmentItems = attachmentsForChat(attachmentItems, chatId);
+  const uploading = activeAttachmentItems.some((item) => item.status === "uploading");
+  const readyAttachments = activeAttachmentItems
     .filter((item): item is ComposerAttachment & { attachment: ChatAttachment } => item.status === "ready" && !!item.attachment)
     .map((item) => item.attachment);
   // Tick once per second while a turn is running so the "elapsed" text refreshes.
@@ -191,6 +196,7 @@ export function ChatSurface({ projectId, chatId }: Props) {
     setAutoApprove(loadAutoApprove(chatId));
     setCaveman(loadCaveman(chatId));
     sendQueueRef.current = [];
+    setAttachmentItems((current) => abortAndDropOtherChats(current, chatId).remaining);
     recordVisit(chatId);
     recordLastPath(window.location.pathname);
   }, [chatId]);
@@ -642,32 +648,32 @@ export function ChatSurface({ projectId, chatId }: Props) {
   async function uploadOneAttachment(item: ComposerAttachment): Promise<void> {
     if (!client) return;
     const abort = new AbortController();
-    setAttachmentItems((current) => current.map((candidate) =>
-      candidate.localId === item.localId
-        ? { ...candidate, status: "uploading", progress: 0, error: undefined, abort }
-        : candidate,
+    setAttachmentItems((current) => updateOwnedAttachment(
+      current, activeChatIdRef.current, item.ownerChatId, item.localId,
+      (candidate) => ({ ...candidate, status: "uploading", progress: 0, error: undefined, abort }),
     ));
     try {
-      const attachment = await client.uploadChatAttachment(chatId, item.file, {
+      const attachment = await client.uploadChatAttachment(item.ownerChatId, item.file, {
         signal: abort.signal,
         onProgress: (progress) => {
-          setAttachmentItems((current) => current.map((candidate) =>
-            candidate.localId === item.localId ? { ...candidate, progress } : candidate,
+          setAttachmentItems((current) => updateOwnedAttachment(
+            current, activeChatIdRef.current, item.ownerChatId, item.localId,
+            (candidate) => ({ ...candidate, progress }),
           ));
         },
       });
-      setAttachmentItems((current) => current.map((candidate) =>
-        candidate.localId === item.localId
-          ? { ...candidate, status: "ready", progress: 100, attachment, abort: undefined }
-          : candidate,
+      setAttachmentItems((current) => updateOwnedAttachment(
+        current, activeChatIdRef.current, item.ownerChatId, item.localId,
+        (candidate) => ({ ...candidate, status: "ready", progress: 100, attachment, abort: undefined }),
       ));
-      appendInfo(chatId, `Attached ${attachment.filename}.`);
+      if (activeChatIdRef.current === item.ownerChatId) {
+        appendInfo(item.ownerChatId, `Attached ${attachment.filename}.`);
+      }
     } catch (e) {
       const message = (e as Error).name === "AbortError" ? "Upload cancelled" : (e as Error).message;
-      setAttachmentItems((current) => current.map((candidate) =>
-        candidate.localId === item.localId
-          ? { ...candidate, status: "error", error: message, abort: undefined }
-          : candidate,
+      setAttachmentItems((current) => updateOwnedAttachment(
+        current, activeChatIdRef.current, item.ownerChatId, item.localId,
+        (candidate) => ({ ...candidate, status: "error", error: message, abort: undefined }),
       ));
     }
   }
@@ -676,6 +682,7 @@ export function ChatSurface({ projectId, chatId }: Props) {
     if (!client || files.length === 0) return;
     const items: ComposerAttachment[] = files.map((file, index) => ({
       localId: `${Date.now()}-${index}-${file.name}`,
+      ownerChatId: chatId,
       file,
       status: file.size > MAX_ATTACHMENT_BYTES ? "error" : "uploading",
       progress: 0,
@@ -1138,9 +1145,9 @@ export function ChatSurface({ projectId, chatId }: Props) {
           onCavemanChange={setCaveman}
           disabled={streaming}
         />
-        {attachmentItems.length > 0 && (
+        {activeAttachmentItems.length > 0 && (
           <div className="mb-2 flex flex-wrap gap-2 text-xs">
-            {attachmentItems.map((item) => (
+            {activeAttachmentItems.map((item) => (
               <span
                 key={item.localId}
                 className={

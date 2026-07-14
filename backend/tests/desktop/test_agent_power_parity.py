@@ -9,6 +9,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from clawagents.desktop_stores.settings_store import AppSettings, SettingsStore
+from clawagents.desktop_stores.project_store import ProjectStore
 from clawagents.gateway.chats_api import _translate_event
 from clawagents.gateway.mcp_loader import _command_allowed, _url_allowed, list_mcp_config
 from clawagents.gateway.settings_api import router as settings_router
@@ -41,17 +42,23 @@ def test_settings_store_round_trip_agent_power(app_support_dir: Path) -> None:
     loaded = store.load()
     assert loaded.mcp_enabled is True
     assert loaded.action_mode == "code"
-    assert loaded.allow_full_access is True
+    # Runtime authority is intentionally omitted from global settings.
+    assert loaded.allow_full_access is False
     assert loaded.context_mode is False
 
 
-def test_settings_api_patch_agent_power(app_support_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_settings_api_patch_agent_power(
+    app_support_dir: Path,
+    project_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.delenv("GATEWAY_API_KEY", raising=False)
     app = FastAPI()
     app.include_router(settings_router)
     client = TestClient(app)
+    project = ProjectStore().create(name="test", root_path=str(project_root))
     r = client.patch(
-        "/settings/app",
+        f"/settings/app?project_id={project.id}",
         json={
             "mcp_enabled": True,
             "browser_tools": True,

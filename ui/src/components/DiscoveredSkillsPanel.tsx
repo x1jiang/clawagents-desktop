@@ -17,13 +17,15 @@ interface Props {
  * Shows the skills the agent auto-loaded for this project. Skills come
  * from any `SKILL.md` under `skills/`, `.agents/skills/`, `.cursor/skills/`
  * (and a few legacy variants). Pulled fresh each mount — the directory is
- * scanned on demand, not cached server-side, so dropping a new skill in
- * the project root only takes a panel refresh to surface.
+ * fingerprinted server-side, so unchanged panels reuse a safe snapshot while
+ * content changes and removals invalidate it automatically.
  */
 export function DiscoveredSkillsPanel({ projectId }: Props) {
   const client = useProjectGateway(projectId);
   const openFile = useUI((s) => s.openFileViewer);
   const [skills, setSkills] = useState<Skill[] | null>(null);
+  const [unavailable, setUnavailable] = useState<Record<string, string>>({});
+  const [quarantined, setQuarantined] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
 
@@ -34,6 +36,8 @@ export function DiscoveredSkillsPanel({ projectId }: Props) {
     try {
       const out = await client.discoveredSkills(projectId);
       setSkills(out.skills);
+      setUnavailable(out.unavailable || {});
+      setQuarantined(out.quarantined || {});
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -95,6 +99,22 @@ export function DiscoveredSkillsPanel({ projectId }: Props) {
             </li>
           ))}
         </ul>
+      )}
+      {Object.keys(unavailable).length > 0 && (
+        <div className="mt-2 text-xs text-amber-700 dark:text-amber-300">
+          <div className="font-medium">Unavailable</div>
+          {Object.entries(unavailable).map(([name, reason]) => (
+            <div key={name}><span className="font-mono">{name}</span>: {reason}</div>
+          ))}
+        </div>
+      )}
+      {Object.keys(quarantined).length > 0 && (
+        <div className="mt-2 text-xs text-red-700 dark:text-red-300">
+          <div className="font-medium">Quarantined by content scan</div>
+          {Object.entries(quarantined).map(([name, reason]) => (
+            <div key={name}><span className="font-mono">{name}</span>: {reason}</div>
+          ))}
+        </div>
       )}
     </div>
   );

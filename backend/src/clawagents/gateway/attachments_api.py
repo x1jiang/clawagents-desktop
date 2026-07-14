@@ -386,12 +386,21 @@ def _validate_type(filename: str, declared_mime: str | None, raw: bytes) -> tupl
     if ext in TEXT_EXTS and sniffed == "application/octet-stream":
         raise HTTPException(status_code=415, detail=f"{ext} appears to be binary data")
 
+    if sniffed.startswith("image/") or sniffed in {"application/pdf", "text/plain"}:
+        canonical = sniffed
+    elif sniffed == "application/zip":
+        canonical = expected if ext in OFFICE_EXTS else sniffed
+    else:
+        canonical = declared_mime or expected
+
     if declared_mime and declared_mime != "application/octet-stream":
         declared_family = declared_mime.split("/", 1)[0]
         expected_family = expected.split("/", 1)[0]
         if declared_family != expected_family and ext not in OFFICE_EXTS:
             warnings.append(f"declared MIME {declared_mime} differs from expected {expected}")
-    return declared_mime or expected, warnings
+        if declared_mime != canonical:
+            warnings.append(f"declared MIME {declared_mime} differs from detected {canonical}")
+    return canonical, warnings
 
 
 def _chunks_for_text(text: str) -> list[dict[str, Any]]:

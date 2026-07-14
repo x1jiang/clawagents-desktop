@@ -33,6 +33,7 @@ export function SettingsModal({ onClose }: Props) {
   const apiKeys = useSettings((s) => s.apiKeys);
   const setApiKey = useSettings((s) => s.setApiKey);
   const client = useProjects((s) => s.client);
+  const projects = useProjects((s) => s.projects);
 
   const [tab, setTab] = useState<SettingsTab>("providers");
   const [drafts, setDrafts] = useState<Record<string, string>>(() =>
@@ -57,12 +58,14 @@ export function SettingsModal({ onClose }: Props) {
   const [actionMode, setActionMode] = useState("tools");
   const [agentMode, setAgentMode] = useState("");
   const [allowFullAccess, setAllowFullAccess] = useState(false);
+  const [allowExternalSkillDirs, setAllowExternalSkillDirs] = useState(false);
   const [reasoningEffort, setReasoningEffort] = useState("medium");
   const [wireApi, setWireApi] = useState("auto");
   const [sslVerify, setSslVerify] = useState(true);
   const [skillUserHomes, setSkillUserHomes] = useState(true);
   const [catalog, setCatalog] = useState<ProviderCatalogEntry[]>([]);
   const [saving, setSaving] = useState(false);
+  const [securityScope, setSecurityScope] = useState("projectless");
   const [verifying, setVerifying] = useState<Record<string, boolean>>({});
   const [verdicts, setVerdicts] = useState<Record<string, Verdict | undefined>>({});
 
@@ -70,7 +73,8 @@ export function SettingsModal({ onClose }: Props) {
     if (!client) return;
     void (async () => {
       try {
-        const s = await client.getAppSettings();
+        const projectId = securityScope === "projectless" ? null : securityScope;
+        const s = await client.getAppSettings(projectId, securityScope === "projectless");
         setLoaded(s);
         setWorkspacePrompt(s.workspace_system_prompt || "");
         setDefaultMode(s.default_mode || "auto");
@@ -90,6 +94,7 @@ export function SettingsModal({ onClose }: Props) {
         setActionMode(s.action_mode || "tools");
         setAgentMode(s.agent_mode || "");
         setAllowFullAccess(Boolean(s.allow_full_access));
+        setAllowExternalSkillDirs(Boolean(s.allow_external_skill_dirs));
         setReasoningEffort(s.reasoning_effort || "medium");
         setWireApi(s.wire_api || "auto");
         setSslVerify(s.ssl_verify !== false);
@@ -98,8 +103,9 @@ export function SettingsModal({ onClose }: Props) {
         /* defaults */
       }
     })();
-    void client.listProviders().then(setCatalog).catch(() => setCatalog([]));
-  }, [client]);
+    const projectId = securityScope === "projectless" ? null : securityScope;
+    void client.listProviders(projectId, securityScope === "projectless").then(setCatalog).catch(() => setCatalog([]));
+  }, [client, securityScope]);
 
   useEffect(() => {
     function onKey(e: KeyboardEvent): void {
@@ -147,7 +153,8 @@ export function SettingsModal({ onClose }: Props) {
         await persistKey(id, key);
       }
       if (id === "bedrock" && v.ok) {
-        const s = await client.getAppSettings();
+        const projectId = securityScope === "projectless" ? null : securityScope;
+        const s = await client.getAppSettings(projectId, securityScope === "projectless");
         setHasAwsCreds(Boolean(s.has_aws_credentials));
       }
     } catch (e) {
@@ -182,6 +189,7 @@ export function SettingsModal({ onClose }: Props) {
           }
           setTrustBaseUrl(true);
         }
+        const projectId = securityScope === "projectless" ? null : securityScope;
         await client.patchAppSettings({
           workspace_system_prompt: workspacePrompt,
           default_model: defaultModel,
@@ -200,13 +208,14 @@ export function SettingsModal({ onClose }: Props) {
           action_mode: actionMode,
           agent_mode: agentMode,
           allow_full_access: allowFullAccess,
+          allow_external_skill_dirs: allowExternalSkillDirs,
           reasoning_effort: reasoningEffort,
           wire_api: wireApi,
           ssl_verify: sslVerify,
           skill_user_homes: skillUserHomes,
-        });
+        }, projectId, securityScope === "projectless");
         // Refresh catalog so custom base_url model probes show up.
-        void client.listProviders().then(setCatalog).catch(() => undefined);
+        void client.listProviders(projectId, securityScope === "projectless").then(setCatalog).catch(() => undefined);
       }
       onClose();
     } finally {
@@ -630,6 +639,19 @@ export function SettingsModal({ onClose }: Props) {
                   <p className="text-xs text-gray-500 dark:text-gray-400">
                     Same opt-in surfaces as the VS Code plugin. Defaults stay safe.
                   </p>
+                  <label className="text-xs text-gray-500 dark:text-gray-400">
+                    Security scope
+                    <select
+                      value={securityScope}
+                      onChange={(e) => setSecurityScope(e.target.value)}
+                      className="mt-1 w-full px-2 py-1.5 text-sm border border-gray-300 dark:border-gray-700 rounded-lg bg-white dark:bg-gray-800 dark:text-gray-100"
+                    >
+                      <option value="projectless">Projectless chats</option>
+                      {projects.filter((project) => project.kind !== "ssh").map((project) => (
+                        <option key={project.id} value={project.id}>{project.name}</option>
+                      ))}
+                    </select>
+                  </label>
                   {(
                     [
                       [mcpEnabled, setMcpEnabled, "Enable MCP servers (~/.clawagents/mcp.json)"],
@@ -639,6 +661,7 @@ export function SettingsModal({ onClose }: Props) {
                       [trajectory, setTrajectory, "Trajectory logging"],
                       [learn, setLearn, "Learn from trajectories"],
                       [allowFullAccess, setAllowFullAccess, "Allow Full Access mode"],
+                      [allowExternalSkillDirs, setAllowExternalSkillDirs, "Allow registered external skill folders"],
                       [skillUserHomes, setSkillUserHomes, "Load personal skill homes (~/.codex, ~/.claude, ~/.agents)"],
                     ] as const
                   ).map(([checked, setChecked, label], i) => (
