@@ -37,6 +37,26 @@ class AppSettings:
     action_mode: str = "tools"  # "tools" | "code"
     agent_mode: str = ""        # persona from .clawagents/modes.json
     allow_full_access: bool = False
+    # OpenAI reasoning effort (none|low|medium|high|xhigh). Empty = provider default.
+    reasoning_effort: str = "medium"
+    # OpenAI transport: auto | responses | chat_completions.
+    wire_api: str = "auto"
+    # TLS verify for custom base_url (False for private-CA / corporate proxies).
+    ssl_verify: bool = True
+    # Skill roots (absolute paths). Personal homes loaded when skill_user_homes.
+    skill_dirs: list | None = None
+    skill_auto_discover: bool = True
+    skill_ignore_dirs: list | None = None
+    skill_exclude: list | None = None
+    skill_user_homes: bool = True
+
+    def __post_init__(self) -> None:
+        if self.skill_dirs is None:
+            self.skill_dirs = []
+        if self.skill_ignore_dirs is None:
+            self.skill_ignore_dirs = []
+        if self.skill_exclude is None:
+            self.skill_exclude = []
 
 
 class SettingsStore:
@@ -51,7 +71,12 @@ class SettingsStore:
             data = json.loads(self.path.read_text() or "{}")
         except json.JSONDecodeError:
             return AppSettings()
-        return AppSettings(**{k: v for k, v in data.items() if k in AppSettings.__dataclass_fields__})
+        fields = AppSettings.__dataclass_fields__
+        kwargs = {k: v for k, v in data.items() if k in fields}
+        for list_key in ("skill_dirs", "skill_ignore_dirs", "skill_exclude"):
+            if list_key not in kwargs or kwargs[list_key] is None:
+                kwargs[list_key] = []
+        return AppSettings(**kwargs)
 
     def save(self, settings: AppSettings) -> None:
         atomic_write_text(self.path, json.dumps(asdict(settings), indent=2))

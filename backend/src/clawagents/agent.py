@@ -177,13 +177,52 @@ class ClawAgent:
         session_id: Optional[str] = None,
         session_dir: Optional[Path] = None,
         permission_callback: Optional[Callable[[dict], Any]] = None,
+        images: Optional[list[dict]] = None,
+        files: Optional[list[dict]] = None,
     ) -> AgentState:
         """Start the ReAct agent loop for ``task``.
 
         All per-call keyword arguments (``hooks``, ``input_guardrails``,
         ``output_type``, ``session``, ``on_stream_event`` …) override the
         values supplied to ``ClawAgent.__init__`` for just this invocation.
+
+        ``images`` / ``files`` attach multimodal content to the first user message
+        (vision pixels / native PDF / DOCX text extraction).
         """
+        image_blocks: Optional[list[dict]] = None
+        if images:
+            from clawagents.media.images import build_user_image_block
+
+            image_blocks = []
+            for img in images:
+                if isinstance(img, str):
+                    image_blocks.append(build_user_image_block(img))
+                elif isinstance(img, dict):
+                    data = img.get("data") or img.get("url") or ""
+                    media_type = (
+                        img.get("media_type") or img.get("mime_type") or "image/png"
+                    )
+                    if data:
+                        image_blocks.append(build_user_image_block(data, media_type))
+
+        file_blocks: Optional[list[dict]] = None
+        if files:
+            from clawagents.media.documents import build_user_file_block
+
+            file_blocks = []
+            for f in files:
+                if not isinstance(f, dict):
+                    continue
+                data = f.get("data") or f.get("url") or ""
+                media_type = (
+                    f.get("media_type") or f.get("mime_type") or "application/pdf"
+                )
+                fname = f.get("name") or f.get("filename") or None
+                if data:
+                    file_blocks.append(
+                        build_user_file_block(data, media_type, name=fname)
+                    )
+
         if run_context is None:
             run_context = RunContext(context=user_context)
         elif user_context is not None and run_context.context is None:
@@ -242,6 +281,8 @@ class ClawAgent:
             session_id=session_id,
             session_dir=session_dir,
             permission_callback=permission_callback,
+            image_blocks=image_blocks,
+            file_blocks=file_blocks,
         )
 
     # ── Convenience hook methods ──────────────────────────────────────
@@ -495,6 +536,9 @@ def create_claw_agent(
     context_window: Optional[int] = None,
     max_tokens: Optional[int] = None,
     temperature: Optional[float] = None,
+    reasoning_effort: Optional[str] = None,
+    wire_api: Optional[str] = None,
+    ssl_verify: Optional[bool] = None,
     use_native_tools: bool = True,
     on_event: Optional[OnEvent] = None,
     trajectory: Optional[bool] = None,
@@ -653,7 +697,10 @@ def create_claw_agent(
         api_version = resolved_profile.api_version
 
     # ── Resolve model → LLMProvider ────────────────────────────────────
-    llm = _resolve_model(model, streaming, api_key, context_window, max_tokens, temperature, base_url, api_version)
+    llm = _resolve_model(
+        model, streaming, api_key, context_window, max_tokens, temperature, base_url, api_version,
+        reasoning_effort=reasoning_effort, wire_api=wire_api, ssl_verify=ssl_verify,
+    )
 
     # ── Resolve fallback providers ──────────────────────────────────────
     llm = _apply_fallback_providers(
@@ -991,13 +1038,16 @@ def _resolve_model(
     temperature: Optional[float] = None,
     base_url: Optional[str] = None,
     api_version: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
+    wire_api: Optional[str] = None,
+    ssl_verify: Optional[bool] = None,
 ) -> LLMProvider:
     """Accept a model name string, an LLMProvider, or None (auto-detect)."""
     if isinstance(model, LLMProvider):
         return model
 
     from clawagents.config.config import load_config, get_default_model, is_bedrock_model_id
-    from clawagents.providers.llm import create_provider
+    from clawagents.providers.llm import create_provider, normalize_reasoning_effort, _normalize_wire_api
 
     config = load_config()
     config.streaming = streaming
@@ -1011,6 +1061,12 @@ def _resolve_model(
         config.openai_base_url = base_url
     if api_version is not None:
         config.openai_api_version = api_version
+    if reasoning_effort is not None:
+        config.reasoning_effort = normalize_reasoning_effort(reasoning_effort) or ""
+    if wire_api is not None:
+        config.openai_wire_api = _normalize_wire_api(wire_api)
+    if ssl_verify is not None:
+        config.openai_ssl_verify = bool(ssl_verify)
 
     active_model = model if isinstance(model, str) and model else get_default_model(config)
 

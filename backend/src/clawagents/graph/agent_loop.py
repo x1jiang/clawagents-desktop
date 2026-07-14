@@ -1905,6 +1905,8 @@ async def run_agent_graph(
     session_id: Optional[str] = None,
     session_dir: Optional[Path] = None,
     permission_callback: Optional[Callable[[dict], Any]] = None,
+    image_blocks: Optional[list[dict]] = None,
+    file_blocks: Optional[list[dict]] = None,
 ) -> AgentState:
     """Single ReAct loop: LLM → tools → LLM → tools → ... → final answer."""
     if features is not None:
@@ -2162,9 +2164,18 @@ async def run_agent_graph(
         tool_description=tool_desc,
         lesson_preamble=lesson_preamble,
     )
+    # Attach images/files (if any) to the first user message as content blocks.
+    if image_blocks or file_blocks:
+        first_user_content: Any = (
+            ([{"type": "text", "text": task}] if task else [])
+            + list(image_blocks or [])
+            + list(file_blocks or [])
+        )
+    else:
+        first_user_content = task
     messages: list[LLMMessage] = [
         LLMMessage(role="system", content=system_content),
-        LLMMessage(role="user", content=task),
+        LLMMessage(role="user", content=first_user_content),
     ]
 
     # Session: write initial state

@@ -99,6 +99,14 @@ export interface AppSettings {
   action_mode: string;
   agent_mode: string;
   allow_full_access: boolean;
+  reasoning_effort?: string;
+  wire_api?: string;
+  ssl_verify?: boolean;
+  skill_dirs?: string[];
+  skill_auto_discover?: boolean;
+  skill_ignore_dirs?: string[];
+  skill_exclude?: string[];
+  skill_user_homes?: boolean;
   has_aws_credentials?: boolean;
 }
 

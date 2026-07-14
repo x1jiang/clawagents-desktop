@@ -46,6 +46,10 @@ impl Sidecar {
         ]);
         cmd.env("GATEWAY_HOST", "127.0.0.1");
         cmd.env("GATEWAY_API_KEY", &cfg.api_key);
+        // Keychain-injected keys must win over any workspace .env the library
+        // might load mid-process (VS Code 1.0.22–1.0.23 parity).
+        cmd.env("CLAWAGENTS_SKIP_DOTENV", "1");
+        cmd.env("CLAWAGENTS_DOTENV_OVERRIDE", "0");
         if let Some(override_path) = &cfg.app_support_override {
             cmd.env("CLAWAGENTS_DESKTOP_APP_SUPPORT", override_path);
         }

@@ -69,6 +69,14 @@ def _settings_payload(s) -> dict:
         "action_mode": s.action_mode,
         "agent_mode": s.agent_mode,
         "allow_full_access": s.allow_full_access,
+        "reasoning_effort": s.reasoning_effort,
+        "wire_api": s.wire_api,
+        "ssl_verify": s.ssl_verify,
+        "skill_dirs": list(s.skill_dirs or []),
+        "skill_auto_discover": s.skill_auto_discover,
+        "skill_ignore_dirs": list(s.skill_ignore_dirs or []),
+        "skill_exclude": list(s.skill_exclude or []),
+        "skill_user_homes": s.skill_user_homes,
         "has_aws_credentials": _has_aws_credentials(),
     }
 
@@ -98,6 +106,14 @@ class AppSettingsPatchBody(BaseModel):
     action_mode: str | None = None
     agent_mode: str | None = None
     allow_full_access: bool | None = None
+    reasoning_effort: str | None = None
+    wire_api: str | None = None
+    ssl_verify: bool | None = None
+    skill_dirs: list[str] | None = None
+    skill_auto_discover: bool | None = None
+    skill_ignore_dirs: list[str] | None = None
+    skill_exclude: list[str] | None = None
+    skill_user_homes: bool | None = None
 
 
 @router.patch("/settings/app")
@@ -154,6 +170,26 @@ def patch_app_settings(body: AppSettingsPatchBody) -> dict:
         settings.agent_mode = body.agent_mode
     if "allow_full_access" in sent and body.allow_full_access is not None:
         settings.allow_full_access = bool(body.allow_full_access)
+    if "reasoning_effort" in sent and body.reasoning_effort is not None:
+        effort = body.reasoning_effort.strip().lower()
+        allowed_effort = {"", "none", "low", "medium", "high", "xhigh", "max"}
+        settings.reasoning_effort = effort if effort in allowed_effort else "medium"
+    if "wire_api" in sent and body.wire_api is not None:
+        wire = body.wire_api.strip().lower()
+        allowed_wire = {"auto", "responses", "chat_completions"}
+        settings.wire_api = wire if wire in allowed_wire else "auto"
+    if "ssl_verify" in sent and body.ssl_verify is not None:
+        settings.ssl_verify = bool(body.ssl_verify)
+    if "skill_dirs" in sent and body.skill_dirs is not None:
+        settings.skill_dirs = [str(x).strip() for x in body.skill_dirs if str(x).strip()]
+    if "skill_auto_discover" in sent and body.skill_auto_discover is not None:
+        settings.skill_auto_discover = bool(body.skill_auto_discover)
+    if "skill_ignore_dirs" in sent and body.skill_ignore_dirs is not None:
+        settings.skill_ignore_dirs = [str(x).strip() for x in body.skill_ignore_dirs if str(x).strip()]
+    if "skill_exclude" in sent and body.skill_exclude is not None:
+        settings.skill_exclude = [str(x).strip() for x in body.skill_exclude if str(x).strip()]
+    if "skill_user_homes" in sent and body.skill_user_homes is not None:
+        settings.skill_user_homes = bool(body.skill_user_homes)
     store.save(settings)
     # Push AWS region/profile into process env for native Bedrock turns.
     if settings.aws_region:

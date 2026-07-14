@@ -34,14 +34,19 @@ xcrun notarytool store-credentials clawagents-notary \
 SKIP_NOTARIZE=1 ./build.sh
 ```
 
-## Features (0.2.4)
+## Features (0.3.0)
 
-- **Developer ID signed** release builds (`./build.sh` signs after embedding Python)
+- **VS Code parity:** library **6.12.12**, Wire API / Effort / TLS verify, personal skill homes
+- **Native attachments:** images + PDF/DOCX via `invoke(images=/files=)` (not just OCR text)
+- **Keychain-safe keys:** sidecar skips dotenv override so Settings keys win
+- **Reliable Stop:** Cancel clears the send queue; SSE keep-alive + 60s idle watchdog
+- **Provider catalog:** live `/v1/models` probe for custom base URLs; Bedrock not unlocked by OpenAI key alone
 - Local projects and **SSH remote** projects (`~/.ssh/config`, including `ProxyJump`)
 - Chat UI with Export (Markdown) and Fork
 - File tree + **right-side file editor** (edit + autosave)
 - Providers: OpenAI / Anthropic / Gemini / **AWS Bedrock** (native IAM or gateway) / Ollama
 - Settings UI: sectioned Providers · Defaults · Agent · Data cards
+- **Developer ID signed** release builds (`./build.sh` signs after embedding Python)
 
 ## Develop
 

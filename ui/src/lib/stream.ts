@@ -38,6 +38,9 @@ export function parseSSE(blob: string): ParsedEvent[] {
   return events;
 }
 
+/** Idle watchdog: no SSE bytes for this long → treat stream as hung. */
+const IDLE_TIMEOUT_MS = 60_000;
+
 /**
  * Open an SSE connection by POST-ing to the gateway, then stream parsed
  * events into the callback until the body ends or the abort signal fires.
@@ -74,17 +77,49 @@ export async function streamMessages(
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let lastByteAt = Date.now();
 
   while (true) {
-    const { value, done } = await reader.read();
+    const remaining = IDLE_TIMEOUT_MS - (Date.now() - lastByteAt);
+    if (remaining <= 0) {
+      try {
+        await reader.cancel();
+      } catch {
+        /* ignore */
+      }
+      throw new Error("Stream idle timeout — no events from gateway for 60s");
+    }
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeoutPromise = new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => resolve("timeout"), remaining);
+    });
+    const readPromise = reader.read().then((r) => ({ kind: "read" as const, ...r }));
+
+    const raced = await Promise.race([readPromise, timeoutPromise]);
+    if (timer) clearTimeout(timer);
+
+    if (raced === "timeout") {
+      try {
+        await reader.cancel();
+      } catch {
+        /* ignore */
+      }
+      throw new Error("Stream idle timeout — no events from gateway for 60s");
+    }
+
+    const { value, done } = raced;
     if (done) break;
+    lastByteAt = Date.now();
     buffer += decoder.decode(value, { stream: true });
 
-    // Drain complete events from the buffer.
+    // Drain complete events from the buffer. Comment lines (": ping") keep
+    // the connection alive without producing events — that's fine.
     let idx;
     while ((idx = buffer.indexOf("\n\n")) !== -1) {
       const block = buffer.slice(0, idx);
       buffer = buffer.slice(idx + 2);
+      if (block.trim().startsWith(":")) continue; // SSE comment / keep-alive
       const parsed = parseSSE(block + "\n\n");
       for (const p of parsed) {
         onEvent({ kind: p.kind, ...((p.data as object) ?? {}) } as StreamEvent);

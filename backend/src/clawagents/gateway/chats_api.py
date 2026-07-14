@@ -843,11 +843,39 @@ def _resolve_model_kwargs(model: str | None, settings) -> dict:
         kwargs["api_key"] = (os.environ.get("OPENAI_API_KEY") or "").strip() or "ollama"
     elif provider == "openai" and kwargs.get("base_url"):
         kwargs["api_key"] = (os.environ.get("OPENAI_API_KEY") or "").strip() or "openai"
-    elif provider in {"openai", "anthropic", "gemini"} and not effective_model:
-        kwargs["profile"] = provider
+    elif provider == "openai":
+        key = (os.environ.get("OPENAI_API_KEY") or "").strip()
+        if key:
+            kwargs["api_key"] = key
+        if not effective_model:
+            kwargs["profile"] = "openai"
+    elif provider == "anthropic":
+        key = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
+        if key:
+            kwargs["api_key"] = key
+        if not effective_model:
+            kwargs["profile"] = "anthropic"
+    elif provider == "gemini":
+        key = (
+            (os.environ.get("GEMINI_API_KEY") or "").strip()
+            or (os.environ.get("GOOGLE_API_KEY") or "").strip()
+        )
+        if key:
+            kwargs["api_key"] = key
+        if not effective_model:
+            kwargs["profile"] = "gemini"
     elif not effective_model and provider == "auto":
         # Leave model unset — create_claw_agent auto-detects from env.
         pass
+
+    effort = str(getattr(settings, "reasoning_effort", None) or "").strip()
+    if effort:
+        kwargs["reasoning_effort"] = effort
+    wire = str(getattr(settings, "wire_api", None) or "").strip()
+    if wire:
+        kwargs["wire_api"] = wire
+    if hasattr(settings, "ssl_verify"):
+        kwargs["ssl_verify"] = bool(getattr(settings, "ssl_verify"))
     return kwargs
 
 
@@ -857,6 +885,8 @@ async def run_chat_turn(
     content: str,
     agent_content: str | None = None,
     attachments: list[dict] | None = None,
+    images: list[dict] | None = None,
+    files: list[dict] | None = None,
     project_root: str,
     mode: str,
     model: str,
@@ -1221,6 +1251,19 @@ async def run_chat_turn(
     if settings.learn:
         agent_kwargs["learn"] = True
 
+    # Personal + project skill homes (VS Code parity).
+    try:
+        from clawagents.desktop_stores.skills_catalog import resolve_skill_dir_paths
+
+        skill_paths = resolve_skill_dir_paths(settings, project_root=project_root)
+        if skill_paths:
+            agent_kwargs["skills"] = skill_paths
+        excludes = list(getattr(settings, "skill_exclude", None) or [])
+        if excludes:
+            agent_kwargs["skills_exclude"] = excludes
+    except Exception:  # noqa: BLE001
+        pass
+
     workspace = Path(project_root)
     mcp_servers: list = []
     if settings.mcp_enabled:
@@ -1325,20 +1368,24 @@ async def run_chat_turn(
                     agent.tools.register(_make_ask_user_tool())
                 except Exception:  # noqa: BLE001
                     pass
-                invoke_coro = agent.invoke(
-                    augmented_content,
-                    on_event=_on_legacy_event,
-                    session=prior_session,
-                    session_id=chat_id,
-                    session_dir=sessions_dir,
-                    permission_callback=_permission_cb,
-                    on_stream_event=_on_stream_event,
+                invoke_kwargs: dict = {
+                    "on_event": _on_legacy_event,
+                    "session": prior_session,
+                    "session_id": chat_id,
+                    "session_dir": sessions_dir,
+                    "permission_callback": _permission_cb,
+                    "on_stream_event": _on_stream_event,
                     # Desktop chats need persisted JSONL so GET
                     # /chats/:id/messages can replay history. The
                     # framework's default is off — opt in per turn.
                     # file_snapshots enables pre-write snapshot restore.
-                    features={"session_persistence": True, "file_snapshots": True},
-                )
+                    "features": {"session_persistence": True, "file_snapshots": True},
+                }
+                if images:
+                    invoke_kwargs["images"] = images
+                if files:
+                    invoke_kwargs["files"] = files
+                invoke_coro = agent.invoke(augmented_content, **invoke_kwargs)
                 try:
                     if cancel_event is None:
                         result = await invoke_coro
@@ -1382,18 +1429,34 @@ async def post_chat_message(chat_id: str, body: MessageBody, request: Request) -
     model = body.model_override or meta.get("model") or ""
     attachment_context = ""
     visible_attachments: list[dict] = []
+    invoke_images: list[dict] = []
+    invoke_files: list[dict] = []
     if body.attachment_ids:
-        from clawagents.gateway.attachments_api import build_attachment_context
-        attachment_context, visible_attachments = build_attachment_context(chat_id, body.content, body.attachment_ids)
+        from clawagents.gateway.attachments_api import (
+            build_attachment_context,
+            build_invoke_media,
+        )
+        attachment_context, visible_attachments = build_attachment_context(
+            chat_id, body.content, body.attachment_ids
+        )
+        invoke_images, invoke_files = build_invoke_media(chat_id, body.attachment_ids)
     else:
         try:
             from clawagents.gateway.attachments_api import build_attachment_context
             attachment_context, _ = build_attachment_context(chat_id, body.content, None)
         except Exception:  # noqa: BLE001
             attachment_context = ""
+    # Prefer native multimodal when we have images/files; keep text context as
+    # a lightweight index for non-vision models / chunk search.
     agent_content = body.content
-    if attachment_context:
+    if attachment_context and not (invoke_images or invoke_files):
         agent_content = f"{body.content}\n\n<uploaded_attachments>\n{attachment_context}\n</uploaded_attachments>"
+    elif attachment_context and (invoke_images or invoke_files):
+        # Short note so the model knows filenames even with native blocks.
+        names = [a.get("filename") or a.get("id") for a in visible_attachments]
+        note = ", ".join(n for n in names if n)
+        if note:
+            agent_content = f"{body.content}\n\n[Attached: {note}]"
 
     cancel_event = _cancel_events.setdefault(chat_id, asyncio.Event())
     cancel_event.clear()
@@ -1430,6 +1493,10 @@ async def post_chat_message(chat_id: str, body: MessageBody, request: Request) -
             if agent_content != body.content or visible_attachments:
                 turn_kwargs["agent_content"] = agent_content
                 turn_kwargs["attachments"] = visible_attachments
+            if invoke_images:
+                turn_kwargs["images"] = invoke_images
+            if invoke_files:
+                turn_kwargs["files"] = invoke_files
             await run_chat_turn(**turn_kwargs)
         except asyncio.CancelledError:
             emit("error", {"message": "cancelled"})
@@ -1441,8 +1508,17 @@ async def post_chat_message(chat_id: str, body: MessageBody, request: Request) -
     asyncio.create_task(run())
 
     async def gen():
+        # Keep-alive pings so proxies / clients don't treat a long tool turn
+        # as a hung connection (VS Code sidecar parity).
         while True:
-            chunk = await queue.get()
+            try:
+                chunk = await asyncio.wait_for(queue.get(), timeout=15.0)
+            except asyncio.TimeoutError:
+                yield ": ping\n\n"
+                if await request.is_disconnected():
+                    cancel_event.set()
+                    break
+                continue
             if chunk is None:
                 break
             yield chunk

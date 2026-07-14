@@ -572,3 +572,49 @@ def build_attachment_context(chat_id: str, query: str, attachment_ids: list[str]
         for chunk in search.chunks:
             parts.append(f"### {chunk.filename} chunk {chunk.chunk_index}\n```text\n{chunk.text}\n```")
     return "\n\n".join(parts), visible
+
+
+_MAX_IMAGES_PER_TURN = 8
+_MAX_FILES_PER_TURN = 4
+_MAX_B64_BYTES = 14 * 1024 * 1024
+
+
+def build_invoke_media(
+    chat_id: str,
+    attachment_ids: list[str] | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Load uploaded attachments as native ``images`` / ``files`` for ``agent.invoke``.
+
+    Images go to vision; PDF/DOCX (and other docs) go through the library's
+    document path. Returns (images, files) as base64 payloads.
+    """
+    import base64
+
+    if not attachment_ids:
+        return [], []
+    selected = set(attachment_ids)
+    records = _active_records(chat_id, selected)
+    images: list[dict[str, Any]] = []
+    files: list[dict[str, Any]] = []
+    for record in records:
+        try:
+            raw = Path(record.path).read_bytes()
+        except OSError:
+            continue
+        b64 = base64.b64encode(raw).decode("ascii")
+        if len(b64) > _MAX_B64_BYTES:
+            continue
+        mime = (record.mime_type or "application/octet-stream").strip()
+        if record.kind == "image" or mime.startswith("image/"):
+            if len(images) >= _MAX_IMAGES_PER_TURN:
+                continue
+            images.append({"data": b64, "media_type": mime or "image/png"})
+        else:
+            if len(files) >= _MAX_FILES_PER_TURN:
+                continue
+            files.append({
+                "data": b64,
+                "media_type": mime or "application/pdf",
+                "name": record.filename or "attachment",
+            })
+    return images, files

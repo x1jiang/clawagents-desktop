@@ -341,6 +341,7 @@ export function ChatSurface({ projectId, chatId }: Props) {
       handler: async () => {
         if (findOpen) { setFindOpen(false); return; }
         if (!streaming || !client) return;
+        sendQueueRef.current = [];
         abortRef.current?.abort();
         try {
           await client.cancelChat(chatId);
@@ -861,6 +862,7 @@ export function ChatSurface({ projectId, chatId }: Props) {
               <button
                 onClick={async () => {
                   if (!client) return;
+                  sendQueueRef.current = [];
                   abortRef.current?.abort();
                   try {
                     await client.cancelChat(chatId);

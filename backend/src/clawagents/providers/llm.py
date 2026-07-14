@@ -450,13 +450,11 @@ def _parse_openai_tool_calls(
 
 # ─── OpenAI Provider ──────────────────────────────────────────────────────
 #
-# Uses the Chat Completions API (chat.completions.create). Supports native
-# function calling via the `tools` parameter for models like GPT-4o, GPT-5,
-# GPT-5-nano, GPT-5.1, and GPT-5.2 (non-Codex).
-#
-# NOTE: GPT-5.2-Codex and similar models use the Responses API
-# (client.responses.create) which has a different tool-calling interface.
-# Those would need a separate ResponsesAPIProvider.
+# Auto-selects Chat Completions (``chat.completions.create``) vs Responses
+# (``responses.create``) from model + endpoint. GPT-5.5 / GPT-5.6 / Codex and
+# reasoning+tools on official OpenAI prefer Responses so effort works with
+# tools; Ollama/BAG/Azure stay on Chat Completions. If Responses is missing on
+# the endpoint, the provider falls back to Chat Completions for the session.
 
 
 # o-series reasoning models require temperature=1 (API restriction).
@@ -495,11 +493,125 @@ def _chat_completions_needs_reasoning_none(model: str) -> bool:
 
     GPT-5.5 / GPT-5.6 default to a non-``none`` reasoning effort. On
     ``/v1/chat/completions``, that combination with function tools returns
-    HTTP 400 ("use /v1/responses or set reasoning_effort to 'none'"). Until
-    we speak Responses API, force ``none`` whenever tools are attached.
+    HTTP 400 ("use /v1/responses or set reasoning_effort to 'none'"). Prefer
+    Responses for those models; this force-none is only for the Chat Completions
+    fallback path.
     """
     m = (model or "").strip().lower()
     return m.startswith("gpt-5.5") or m.startswith("gpt-5.6")
+
+
+_REASONING_EFFORT_VALUES = frozenset({
+    "none", "minimal", "low", "medium", "high", "xhigh", "max",
+})
+
+
+def normalize_reasoning_effort(value: str | None) -> str | None:
+    """Return a valid effort string, or None to omit the parameter."""
+    if value is None:
+        return None
+    v = str(value).strip().lower()
+    if not v:
+        return None
+    # UI labels → API values
+    aliases = {
+        "light": "low",
+        "extra high": "xhigh",
+        "extra_high": "xhigh",
+        "extrahigh": "xhigh",
+    }
+    v = aliases.get(v, v)
+    return v if v in _REASONING_EFFORT_VALUES else None
+
+
+def model_supports_reasoning_effort(model: str) -> bool:
+    """Heuristic: models that accept ``reasoning_effort`` / Responses ``reasoning``."""
+    m = (model or "").strip().lower()
+    if not m:
+        return False
+    if m.startswith(("o1", "o3", "o4")):
+        return True
+    if m.startswith(("gpt-5.5", "gpt-5.6")):
+        return True
+    # Bare gpt-5 / gpt-5-codex family (not gpt-5-nano/micro as primary chat)
+    if m == "gpt-5" or m.startswith("gpt-5-"):
+        return True
+    return False
+
+
+def _normalize_wire_api(value: str | None) -> str:
+    """Return ``auto``, ``responses``, or ``chat_completions``."""
+    v = (value or "auto").strip().lower().replace("-", "_")
+    if v in ("responses", "response"):
+        return "responses"
+    if v in ("chat", "chat_completions", "completions", "chatcompletions"):
+        return "chat_completions"
+    return "auto"
+
+
+def _responses_endpoint_likely(base_url: str | None, api_type: str = "") -> bool:
+    """True when Responses is a reasonable default for this host.
+
+    Official OpenAI and unknown OpenAI-compatible gateways (corporate
+    Responses-only proxies) are allowed. Azure stays on Chat Completions
+    unless ``wire_api=responses`` forces it.
+    """
+    if (api_type or "").lower() == "azure":
+        return False
+    return True
+
+
+def prefers_responses_api(
+    model: str,
+    *,
+    base_url: str | None = None,
+    api_type: str = "",
+    has_tools: bool = False,
+    reasoning_effort: str | None = None,
+    wire_api: str | None = None,
+) -> bool:
+    """Pick Responses vs Chat Completions from model + endpoint + wire_api."""
+    wire = _normalize_wire_api(wire_api)
+    if wire == "chat_completions":
+        return False
+    if wire == "responses":
+        return True
+    # auto
+    if not _responses_endpoint_likely(base_url, api_type):
+        return False
+    m = (model or "").strip().lower()
+    if not m:
+        return False
+    if "codex" in m:
+        return True
+    if m.startswith(("gpt-5.5", "gpt-5.6")):
+        return True
+    # Other GPT-5 / o-series: Responses when tools + non-none effort so the
+    # API accepts both (Chat Completions often forces effort=none).
+    effort = normalize_reasoning_effort(reasoning_effort)
+    if has_tools and effort and effort != "none":
+        if m.startswith(("o1", "o3", "o4")) or m == "gpt-5" or m.startswith("gpt-5"):
+            return True
+    return False
+
+
+def _is_responses_unsupported(exc: BaseException) -> bool:
+    """True when the endpoint does not implement Responses (safe to fall back)."""
+    if isinstance(exc, APIStatusError) and exc.status_code in (404, 405, 501):
+        return True
+    msg = str(exc).lower()
+    needles = (
+        "unrecognized request url",
+        "invalid pathname",
+        "unknown route",
+        "not implemented",
+        "/v1/responses",
+        "does not support responses",
+        "no such endpoint",
+    )
+    if isinstance(exc, APIStatusError) and exc.status_code in (400, 404, 405, 501):
+        return any(n in msg for n in needles)
+    return "unrecognized request url" in msg or "does not support responses" in msg
 
 
 def _apply_tool_reasoning_compat(
@@ -507,9 +619,191 @@ def _apply_tool_reasoning_compat(
     *,
     model: str,
     has_tools: bool,
+    preferred: str | None = None,
 ) -> None:
+    """Chat Completions reasoning_effort (forces none for GPT-5.5/5.6 + tools)."""
+    effort = normalize_reasoning_effort(preferred)
+    if effort:
+        kwargs["reasoning_effort"] = effort
+    # Chat Completions + tools on GPT-5.5/5.6 still requires none.
     if has_tools and _chat_completions_needs_reasoning_none(model):
         kwargs["reasoning_effort"] = "none"
+
+
+def _apply_responses_reasoning(
+    kwargs: dict[str, Any],
+    *,
+    preferred: str | None = None,
+) -> None:
+    """Responses API uses ``reasoning={"effort": ...}`` (tools keep effort)."""
+    effort = normalize_reasoning_effort(preferred)
+    if effort:
+        kwargs["reasoning"] = {"effort": effort}
+
+
+
+def _chat_tools_to_responses_tools(
+    oai_tools: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]] | None:
+    """Chat Completions nested ``function`` tools → Responses flat tools."""
+    if not oai_tools:
+        return None
+    out: list[dict[str, Any]] = []
+    for t in oai_tools:
+        if not isinstance(t, dict):
+            continue
+        if t.get("type") == "function" and isinstance(t.get("function"), dict):
+            fn = t["function"]
+            item: dict[str, Any] = {
+                "type": "function",
+                "name": fn.get("name") or "",
+                "description": fn.get("description") or "",
+                "parameters": fn.get("parameters") or {"type": "object", "properties": {}},
+                # Explicit non-strict: our schemas may omit additionalProperties /
+                # full required lists that Responses strict mode expects.
+                "strict": False,
+            }
+            out.append(item)
+        else:
+            out.append(t)
+    return out or None
+
+
+def _content_to_responses_parts(content: list[Any], role: str) -> list[dict[str, Any]]:
+    """Convert Chat Completions-style content parts to Responses API parts.
+
+    User-image attachments travel internally as ``{"type": "image_url"}``
+    blocks; the Responses endpoint rejects that type — it wants
+    ``input_text`` / ``input_image`` parts with ``image_url`` as a plain
+    string. Assistant history text maps to ``output_text``. Unconvertible
+    parts are dropped so one stray block can't 400 the whole request.
+    """
+    text_type = "output_text" if role == "assistant" else "input_text"
+    parts: list[dict[str, Any]] = []
+    for p in content:
+        if not isinstance(p, dict):
+            continue
+        ptype = p.get("type")
+        if ptype in ("text", "input_text", "output_text"):
+            parts.append({"type": text_type, "text": p.get("text", "") or ""})
+        elif ptype == "input_image" and role != "assistant":
+            parts.append(p)
+        elif ptype == "image_url" and role != "assistant":
+            url = ((p.get("image_url") or {}).get("url")) or ""
+            if isinstance(url, str) and url:
+                parts.append({"type": "input_image", "image_url": url})
+        elif ptype == "input_file" and role != "assistant":
+            parts.append(p)
+        elif ptype == "file" and role != "assistant":
+            f = p.get("file") or {}
+            fd = f.get("file_data") or ""
+            if isinstance(fd, str) and fd:
+                parts.append(
+                    {
+                        "type": "input_file",
+                        "filename": f.get("filename") or "attachment",
+                        "file_data": fd,
+                    }
+                )
+    return parts
+
+
+def _messages_to_responses_input(
+    messages: list[dict[str, Any]],
+) -> tuple[str | None, list[dict[str, Any]]]:
+    """Convert Chat Completions-style messages to Responses ``instructions`` + ``input``."""
+    instructions_parts: list[str] = []
+    items: list[dict[str, Any]] = []
+    for m in messages:
+        role = m.get("role")
+        if role == "system":
+            content = m.get("content")
+            if isinstance(content, str) and content.strip():
+                instructions_parts.append(content)
+            continue
+        if role == "tool":
+            content = m.get("content")
+            if not isinstance(content, str):
+                content = json.dumps(content)
+            items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": str(m.get("tool_call_id") or ""),
+                    "output": content or "",
+                }
+            )
+            continue
+        if role == "assistant" and m.get("tool_calls"):
+            content = m.get("content")
+            if isinstance(content, str) and content:
+                items.append({"role": "assistant", "content": content})
+            for tc in m.get("tool_calls") or []:
+                fn = tc.get("function") or {}
+                items.append(
+                    {
+                        "type": "function_call",
+                        "call_id": str(tc.get("id") or ""),
+                        "name": fn.get("name") or "",
+                        "arguments": fn.get("arguments") or "{}",
+                    }
+                )
+            continue
+        if role in ("user", "assistant", "developer"):
+            content = m.get("content")
+            if content is None:
+                content = ""
+            if isinstance(content, list):
+                content = _content_to_responses_parts(content, role)
+                if not content:
+                    # Nothing convertible survived (unknown block types); an
+                    # empty content list would 400 the request — drop the message.
+                    continue
+            items.append({"role": role, "content": content})
+            continue
+        # Unknown roles: pass through if they look like Responses items.
+        if isinstance(m.get("type"), str):
+            items.append(m)
+    instructions = "\n\n".join(instructions_parts) if instructions_parts else None
+    return instructions, items
+
+
+def _parse_responses_result(
+    resp: Any,
+) -> tuple[str, list[NativeToolCall] | None, int, int, int]:
+    """Return (text, tool_calls, total_tokens, prompt_tokens, cached_tokens)."""
+    content_parts: list[str] = []
+    calls: list[NativeToolCall] = []
+    for item in getattr(resp, "output", None) or []:
+        itype = getattr(item, "type", None)
+        if itype == "message":
+            for part in getattr(item, "content", None) or []:
+                ptype = getattr(part, "type", None)
+                if ptype in ("output_text", "text"):
+                    content_parts.append(getattr(part, "text", "") or "")
+        elif itype == "function_call":
+            calls.append(
+                NativeToolCall(
+                    tool_name=getattr(item, "name", "") or "",
+                    args=_repair_json(getattr(item, "arguments", None) or "{}"),
+                    tool_call_id=(
+                        getattr(item, "call_id", "") or getattr(item, "id", "") or ""
+                    ),
+                )
+            )
+    text = "".join(content_parts)
+    if not text:
+        text = getattr(resp, "output_text", None) or ""
+    usage = getattr(resp, "usage", None)
+    total = int(getattr(usage, "total_tokens", 0) or 0) if usage else 0
+    prompt = int(getattr(usage, "input_tokens", 0) or 0) if usage else 0
+    cached = 0
+    if usage:
+        details = getattr(usage, "input_tokens_details", None)
+        try:
+            cached = int(getattr(details, "cached_tokens", 0) or 0) if details else 0
+        except (TypeError, ValueError):
+            cached = 0
+    return text, (calls or None), total, prompt, cached
 
 
 def _sanitize_openai_tool_pairs(formatted: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -567,6 +861,39 @@ def _sanitize_openai_tool_pairs(formatted: list[dict[str, Any]]) -> list[dict[st
     return final
 
 
+def _openai_chat_messages(messages: list[LLMMessage]) -> list[dict[str, Any]]:
+    """Format LLMMessages for the OpenAI wire (Chat Completions directly;
+    the Responses path converts further via ``_messages_to_responses_input``).
+
+    Multimodal user content — the canonical ``text`` / ``image_url`` /
+    ``file`` parts — passes through verbatim: Chat Completions accepts those
+    shapes natively. The ``__CACHE_BOUNDARY__`` marker is an Anthropic-only
+    prompt-cache hint; strip it here so OpenAI never receives the stray
+    internal token at the tail of its system prompt.
+    """
+    formatted: list[dict[str, Any]] = []
+    for m in messages:
+        if m.role == "tool" and m.tool_call_id:
+            formatted.append(
+                {"role": "tool", "tool_call_id": m.tool_call_id, "content": m.content}
+            )
+        elif m.role == "assistant" and m.tool_calls_meta:
+            formatted.append({
+                "role": "assistant",
+                "content": m.content or None,
+                "tool_calls": [
+                    {"id": tc["id"], "type": "function", "function": {"name": tc["name"], "arguments": json.dumps(tc["args"])}}
+                    for tc in m.tool_calls_meta
+                ],
+            })
+        else:
+            content = m.content
+            if isinstance(content, str) and "__CACHE_BOUNDARY__" in content:
+                content = content.replace("__CACHE_BOUNDARY__", "").strip()
+            formatted.append({"role": m.role, "content": content})
+    return formatted
+
+
 class OpenAIProvider(LLMProvider):
     name = "openai"
 
@@ -580,27 +907,66 @@ class OpenAIProvider(LLMProvider):
         # first assignment branch and complain when the fallback assigns the
         # other concrete type.
         self.client: Any
+        self._http_client: Any = None
         api_type = (config.openai_api_type or "").lower()
         is_azure = api_type == "azure" or (api_version and base_url and "azure" in base_url.lower())
+        ssl_verify = bool(getattr(config, "openai_ssl_verify", True))
+        # Custom hosts with private CAs often need verify=False; keep verify
+        # for official OpenAI / empty base_url.
+        if base_url and "api.openai.com" not in base_url.lower() and not ssl_verify:
+            try:
+                import httpx
+                self._http_client = httpx.AsyncClient(verify=False, timeout=120.0)
+            except ImportError:
+                self._http_client = None
+
         if is_azure and api_version and base_url:
             try:
                 from openai import AsyncAzureOpenAI
-                self.client = AsyncAzureOpenAI(
-                    api_key=api_key,
-                    azure_endpoint=base_url,
-                    api_version=api_version,
-                )
+                azure_kwargs: dict[str, Any] = {
+                    "api_key": api_key,
+                    "azure_endpoint": base_url,
+                    "api_version": api_version,
+                }
+                if self._http_client is not None:
+                    azure_kwargs["http_client"] = self._http_client
+                self.client = AsyncAzureOpenAI(**azure_kwargs)
             except ImportError:
-                self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+                client_kwargs: dict[str, Any] = {"api_key": api_key, "base_url": base_url}
+                if self._http_client is not None:
+                    client_kwargs["http_client"] = self._http_client
+                self.client = AsyncOpenAI(**client_kwargs)
         else:
-            client_kwargs: dict[str, Any] = {"api_key": api_key}
+            client_kwargs = {"api_key": api_key}
             if base_url:
                 client_kwargs["base_url"] = base_url
+            if self._http_client is not None:
+                client_kwargs["http_client"] = self._http_client
             self.client = AsyncOpenAI(**client_kwargs)
 
         self.model = config.openai_model
         self._max_tokens = config.max_tokens
         self._temperature = _resolve_temperature(config.openai_model, config.temperature)
+        self._reasoning_effort = normalize_reasoning_effort(
+            getattr(config, "reasoning_effort", None) or None
+        )
+        self._base_url = base_url
+        self._api_type = "azure" if is_azure else api_type
+        self._wire_api = _normalize_wire_api(getattr(config, "openai_wire_api", None))
+        # Sticky fallback when Responses is missing — never when wire_api forces it.
+        self._force_chat_completions = False
+
+    def _should_use_responses(self, has_tools: bool) -> bool:
+        if self._force_chat_completions and self._wire_api != "responses":
+            return False
+        return prefers_responses_api(
+            self.model,
+            base_url=self._base_url,
+            api_type=self._api_type,
+            has_tools=has_tools,
+            reasoning_effort=self._reasoning_effort,
+            wire_api=self._wire_api,
+        )
 
     async def chat(
         self,
@@ -609,29 +975,33 @@ class OpenAIProvider(LLMProvider):
         cancel_event: asyncio.Event | None = None,
         tools: list[NativeToolSchema] | None = None,
     ) -> LLMResponse:
-        formatted: list[dict[str, Any]] = []
-        for m in messages:
-            if m.role == "tool" and m.tool_call_id:
-                formatted.append({"role": "tool", "tool_call_id": m.tool_call_id, "content": m.content})
-            elif m.role == "assistant" and m.tool_calls_meta:
-                formatted.append({
-                    "role": "assistant",
-                    "content": m.content or None,
-                    "tool_calls": [
-                        {"id": tc["id"], "type": "function", "function": {"name": tc["name"], "arguments": json.dumps(tc["args"])}}
-                        for tc in m.tool_calls_meta
-                    ],
-                })
-            else:
-                content = m.content
-                # The ``__CACHE_BOUNDARY__`` marker is an Anthropic-only prompt
-                # cache hint; strip it here so OpenAI never receives the stray
-                # internal token at the tail of its system prompt.
-                if isinstance(content, str) and "__CACHE_BOUNDARY__" in content:
-                    content = content.replace("__CACHE_BOUNDARY__", "").strip()
-                formatted.append({"role": m.role, "content": content})
-        formatted = _sanitize_openai_tool_pairs(formatted)
+        formatted = _sanitize_openai_tool_pairs(_openai_chat_messages(messages))
         oai_tools = _to_openai_tools(tools) if tools else None
+
+        if self._should_use_responses(bool(oai_tools)):
+            try:
+                if not on_chunk:
+                    return await _with_retry(
+                        "openai-responses",
+                        lambda: self._request_once_responses(formatted, oai_tools),
+                        policy=getattr(self, "retry_policy", None),
+                    )
+                return await self._stream_with_retry_responses(
+                    formatted, on_chunk, cancel_event, oai_tools,
+                )
+            except Exception as exc:
+                if (
+                    _is_responses_unsupported(exc)
+                    and self._wire_api != "responses"
+                ):
+                    logger.warning(
+                        "  [openai] Responses API unavailable (%s) — "
+                        "falling back to Chat Completions",
+                        type(exc).__name__,
+                    )
+                    self._force_chat_completions = True
+                else:
+                    raise
 
         if not on_chunk:
             return await _with_retry(
@@ -654,7 +1024,10 @@ class OpenAIProvider(LLMProvider):
         if oai_tools:
             kwargs["tools"] = oai_tools
         _apply_tool_reasoning_compat(
-            kwargs, model=self.model, has_tools=bool(oai_tools),
+            kwargs,
+            model=self.model,
+            has_tools=bool(oai_tools),
+            preferred=self._reasoning_effort,
         )
         resp = await self.client.chat.completions.create(**kwargs)
         _prompt_tokens = (resp.usage.prompt_tokens or 0) if resp.usage else 0
@@ -677,6 +1050,211 @@ class OpenAIProvider(LLMProvider):
             cache_read_tokens=_cached_tokens,
             tool_calls=native_calls,
         )
+
+    def _responses_kwargs(
+        self,
+        messages: list[dict[str, Any]],
+        oai_tools: list[dict[str, Any]] | None,
+        *,
+        stream: bool = False,
+    ) -> dict[str, Any]:
+        instructions, input_items = _messages_to_responses_input(messages)
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "input": input_items,
+            "max_output_tokens": self._max_tokens,
+            "temperature": self._temperature,
+            "store": False,
+        }
+        if instructions:
+            kwargs["instructions"] = instructions
+        resp_tools = _chat_tools_to_responses_tools(oai_tools)
+        if resp_tools:
+            kwargs["tools"] = resp_tools
+        _apply_responses_reasoning(kwargs, preferred=self._reasoning_effort)
+        if stream:
+            kwargs["stream"] = True
+        return kwargs
+
+    async def _request_once_responses(
+        self,
+        messages: list[dict[str, Any]],
+        oai_tools: list[dict[str, Any]] | None = None,
+    ) -> LLMResponse:
+        # Some OpenAI-compatible gateways (Codex Responses proxies) ignore
+        # stream=false and return raw SSE text the SDK cannot parse. Always
+        # collect via the streaming path.
+        return await self._stream_with_retry_responses(
+            messages,
+            on_chunk=None,
+            cancel_event=None,
+            oai_tools=oai_tools,
+        )
+
+    async def _stream_with_retry_responses(
+        self,
+        messages: list[dict[str, Any]],
+        on_chunk: OnChunkCallback = None,
+        cancel_event: asyncio.Event | None = None,
+        oai_tools: list[dict[str, Any]] | None = None,
+    ) -> LLMResponse:
+        last_error: BaseException | None = None
+
+        for attempt in range(_MAX_RETRIES + 1):
+            if attempt > 0:
+                delay = _jittered_delay(attempt - 1)
+                logger.warning(
+                    "  [openai-responses] Stream retry %d/%d after %.1fs",
+                    attempt, _MAX_RETRIES, delay,
+                )
+                await asyncio.sleep(delay)
+
+            chunks: list[str] = []
+            final_tokens = 0
+            final_prompt_tokens = 0
+            final_cached_tokens = 0
+            tools_accumulation: dict[int, dict[str, Any]] = {}
+
+            def _accumulated_calls() -> list[NativeToolCall] | None:
+                if not tools_accumulation:
+                    return None
+                calls: list[NativeToolCall] = []
+                for _idx in sorted(tools_accumulation.keys()):
+                    _fn = tools_accumulation[_idx]
+                    if not _fn.get("name"):
+                        continue
+                    calls.append(NativeToolCall(
+                        tool_name=_fn["name"],
+                        args=_repair_json(_fn["arguments"] or "{}"),
+                        tool_call_id=_fn.get("id", ""),
+                    ))
+                return calls or None
+
+            try:
+                kwargs = self._responses_kwargs(messages, oai_tools, stream=True)
+                stream = await self.client.responses.create(**kwargs)
+
+                async for event in _stall_guarded_stream(stream, _CHUNK_STALL_S):
+                    if cancel_event and cancel_event.is_set():
+                        close = getattr(stream, "close", None)
+                        if callable(close):
+                            maybe = close()
+                            if asyncio.iscoroutine(maybe):
+                                await maybe
+                        return LLMResponse(
+                            content="".join(chunks),
+                            model=self.model,
+                            tokens_used=final_tokens,
+                            prompt_tokens=final_prompt_tokens,
+                            cache_read_tokens=final_cached_tokens,
+                            partial=True,
+                            tool_calls=_accumulated_calls(),
+                        )
+
+                    try:
+                        etype = getattr(event, "type", "") or ""
+                        if etype == "response.output_text.delta":
+                            text = getattr(event, "delta", None) or ""
+                            if text:
+                                chunks.append(text)
+                                await _invoke_callback(on_chunk, text)
+                        elif etype == "response.output_item.added":
+                            item = getattr(event, "item", None)
+                            idx = int(getattr(event, "output_index", 0) or 0)
+                            if item is not None and getattr(item, "type", None) == "function_call":
+                                tools_accumulation[idx] = {
+                                    "id": getattr(item, "call_id", "")
+                                    or getattr(item, "id", "")
+                                    or "",
+                                    "name": getattr(item, "name", "") or "",
+                                    "arguments": getattr(item, "arguments", "") or "",
+                                }
+                        elif etype == "response.function_call_arguments.delta":
+                            idx = int(getattr(event, "output_index", 0) or 0)
+                            if idx not in tools_accumulation:
+                                tools_accumulation[idx] = {
+                                    "id": "",
+                                    "name": "",
+                                    "arguments": "",
+                                }
+                            delta = getattr(event, "delta", None) or ""
+                            tools_accumulation[idx]["arguments"] += delta
+                        elif etype == "response.output_item.done":
+                            item = getattr(event, "item", None)
+                            idx = int(getattr(event, "output_index", 0) or 0)
+                            if item is not None and getattr(item, "type", None) == "function_call":
+                                prev = tools_accumulation.get(idx, {})
+                                tools_accumulation[idx] = {
+                                    "id": getattr(item, "call_id", "")
+                                    or getattr(item, "id", "")
+                                    or prev.get("id", ""),
+                                    "name": getattr(item, "name", "")
+                                    or prev.get("name", ""),
+                                    "arguments": getattr(item, "arguments", None)
+                                    or prev.get("arguments", "")
+                                    or "",
+                                }
+                        elif etype == "response.completed":
+                            resp = getattr(event, "response", None)
+                            if resp is not None:
+                                _t, _c, total, prompt, cached = _parse_responses_result(resp)
+                                final_tokens = total
+                                final_prompt_tokens = prompt
+                                final_cached_tokens = cached
+                                if _t and not chunks:
+                                    chunks.append(_t)
+                                    await _invoke_callback(on_chunk, _t)
+                                if _c and not tools_accumulation:
+                                    for i, call in enumerate(_c):
+                                        tools_accumulation[i] = {
+                                            "id": call.tool_call_id,
+                                            "name": call.tool_name,
+                                            "arguments": json.dumps(call.args),
+                                        }
+                        elif etype in ("response.failed", "error"):
+                            raise RuntimeError(f"Responses stream failed: {event}")
+                    except RuntimeError:
+                        raise
+                    except Exception:
+                        pass  # malformed event — skip
+
+                return LLMResponse(
+                    content="".join(chunks),
+                    model=self.model,
+                    tokens_used=final_tokens,
+                    prompt_tokens=final_prompt_tokens,
+                    cache_read_tokens=final_cached_tokens,
+                    tool_calls=_accumulated_calls(),
+                )
+
+            except Exception as exc:
+                last_error = exc
+                if _is_responses_unsupported(exc):
+                    raise
+                if _is_retryable(exc) and attempt < _MAX_RETRIES:
+                    logger.warning(
+                        "  [openai-responses] Stream interrupted after %d chars — retrying",
+                        len("".join(chunks)),
+                    )
+                    continue
+                if chunks or tools_accumulation:
+                    partial = "".join(chunks)
+                    logger.warning(
+                        "  [openai-responses] Stream interrupted after %d chars — returning partial",
+                        len(partial),
+                    )
+                    return LLMResponse(
+                        content=partial,
+                        model=self.model,
+                        tokens_used=final_tokens,
+                        prompt_tokens=final_prompt_tokens,
+                        cache_read_tokens=final_cached_tokens,
+                        partial=True,
+                        tool_calls=_accumulated_calls(),
+                    )
+                break
+
+        raise last_error  # type: ignore[misc]
 
     async def _stream_with_retry(
         self,
@@ -727,7 +1305,10 @@ class OpenAIProvider(LLMProvider):
                 if oai_tools:
                     kwargs["tools"] = oai_tools
                 _apply_tool_reasoning_compat(
-                    kwargs, model=self.model, has_tools=bool(oai_tools),
+                    kwargs,
+                    model=self.model,
+                    has_tools=bool(oai_tools),
+                    preferred=self._reasoning_effort,
                 )
                 stream = await self.client.chat.completions.create(**kwargs)
 
@@ -1134,6 +1715,39 @@ def _flatten_gemini_tool_history(
     return flat
 
 
+def _gemini_part_from_block(part: Any) -> dict[str, Any] | None:
+    """Convert one canonical content part into a Gemini ``parts`` entry.
+
+    ``text`` → ``{"text"}``; data-URL ``image_url``/``file`` parts →
+    ``{"inline_data"}`` with decoded bytes (Gemini accepts image and PDF
+    mime types inline). Returns ``None`` for unconvertible parts so callers
+    drop them instead of sending an invalid entry.
+    """
+    if not isinstance(part, dict):
+        return None
+    ptype = part.get("type")
+    if ptype == "text":
+        return {"text": part.get("text", "")}
+    if ptype == "image_url":
+        url = ((part.get("image_url") or {}).get("url")) or ""
+    elif ptype == "file":
+        url = ((part.get("file") or {}).get("file_data")) or ""
+    else:
+        return None
+    if isinstance(url, str) and url.startswith("data:") and ";base64," in url:
+        import base64
+        import binascii
+
+        header, b64_str = url[5:].split(";base64,", 1)
+        mime = header.split(";", 1)[0].strip() or "application/octet-stream"
+        try:
+            decoded = base64.b64decode(b64_str)
+        except (binascii.Error, ValueError):
+            return None
+        return {"inline_data": {"mime_type": mime, "data": decoded}}
+    return None
+
+
 class GeminiProvider(LLMProvider):
     name = "gemini"
 
@@ -1199,20 +1813,9 @@ class GeminiProvider(LLMProvider):
                 elif isinstance(m.content, list):
                     parts2: list[dict[str, Any]] = []
                     for part in m.content:
-                        if part.get("type") == "text":
-                            parts2.append({"text": part.get("text", "")})
-                        elif part.get("type") == "image_url":
-                            import base64
-                            import binascii
-
-                            url = ((part.get("image_url") or {}).get("url")) or ""
-                            if url.startswith("data:") and ";base64," in url:
-                                mime, b64_str = url[5:].split(";base64,", 1)
-                                try:
-                                    decoded = base64.b64decode(b64_str)
-                                except (binascii.Error, ValueError):
-                                    continue
-                                parts2.append({"inline_data": {"mime_type": mime, "data": decoded}})
+                        converted = _gemini_part_from_block(part)
+                        if converted is not None:
+                            parts2.append(converted)
                     if parts2:
                         user_contents.append({"role": role_name, "parts": parts2})
 
@@ -1481,6 +2084,39 @@ except ImportError:
     _HAS_ANTHROPIC = False
 
 
+def _anthropic_message_content(content: Any) -> Any:
+    """Shape a user/assistant message's content for Anthropic's Messages API.
+
+    Anthropic has no ``image_url`` content type — convert the canonical
+    OpenAI-style image blocks (used for user-message images) into
+    ``image``/``source`` blocks. Without this an attached image reaches Claude
+    as an invalid block and the request 400s. Non-list content and non-image
+    blocks pass through unchanged; malformed image_url parts are dropped.
+    """
+    if not isinstance(content, list):
+        return content
+    if not any(
+        isinstance(p, dict) and p.get("type") in ("image_url", "file") for p in content
+    ):
+        return content
+    from clawagents.media.documents import file_part_to_anthropic_block
+    from clawagents.media.images import image_url_to_anthropic_block
+
+    converted: list[Any] = []
+    for part in content:
+        if isinstance(part, dict) and part.get("type") == "image_url":
+            block = image_url_to_anthropic_block(part)
+            if block is not None:
+                converted.append(block)
+        elif isinstance(part, dict) and part.get("type") == "file":
+            block = file_part_to_anthropic_block(part)
+            if block is not None:
+                converted.append(block)
+        else:
+            converted.append(part)
+    return converted
+
+
 class AnthropicProvider(LLMProvider):
     name = "anthropic"
 
@@ -1539,7 +2175,9 @@ class AnthropicProvider(LLMProvider):
                 api_messages.append({"role": "assistant", "content": content_blocks})
             else:
                 role = "assistant" if m.role == "assistant" else "user"
-                api_messages.append({"role": role, "content": m.content})
+                api_messages.append(
+                    {"role": role, "content": _anthropic_message_content(m.content)}
+                )
 
         kwargs: dict[str, Any] = {
             "model": self.model,
@@ -1828,6 +2466,83 @@ class BedrockProvider(AnthropicProvider):
         self._temperature = config.temperature
 
 
+def _converse_content_blocks(content: Any) -> list[dict[str, Any]]:
+    """Convert message content into Bedrock Converse content blocks.
+
+    Strings become a single text block. List content (the internal
+    OpenAI-style multimodal shape) maps text parts to text blocks and
+    data-URL ``image_url`` parts to native Converse image blocks with
+    decoded bytes. Unconvertible parts are dropped — letting the old
+    ``str(list)`` fallback run would dump megabytes of base64 into the
+    prompt as literal text.
+    """
+    if content is None or isinstance(content, str):
+        return [{"text": content or ""}]
+    if not isinstance(content, list):
+        return [{"text": str(content)}]
+    import base64 as _b64
+    import binascii as _binascii
+
+    blocks: list[dict[str, Any]] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        ptype = part.get("type")
+        if ptype == "text":
+            text = part.get("text") or ""
+            if text:
+                blocks.append({"text": text})
+        elif ptype == "image_url":
+            url = ((part.get("image_url") or {}).get("url")) or ""
+            if not (isinstance(url, str) and url.startswith("data:") and ";base64," in url):
+                continue
+            header, b64 = url[5:].split(";base64,", 1)
+            fmt = header.split(";", 1)[0].strip().lower().removeprefix("image/")
+            if fmt == "jpg":
+                fmt = "jpeg"
+            if fmt not in ("png", "jpeg", "gif", "webp"):
+                continue
+            try:
+                raw = _b64.b64decode(b64, validate=True)
+            except (_binascii.Error, ValueError):
+                continue
+            blocks.append({"image": {"format": fmt, "source": {"bytes": raw}}})
+        elif ptype == "file":
+            f = part.get("file") or {}
+            fd = f.get("file_data") or ""
+            if not (isinstance(fd, str) and fd.startswith("data:") and ";base64," in fd):
+                continue
+            header, b64 = fd[5:].split(";base64,", 1)
+            mime = header.split(";", 1)[0].strip().lower()
+            if mime != "application/pdf":
+                continue
+            try:
+                raw = _b64.b64decode(b64, validate=True)
+            except (_binascii.Error, ValueError):
+                continue
+            blocks.append(
+                {
+                    "document": {
+                        "format": "pdf",
+                        "name": _converse_doc_name(f.get("filename")),
+                        "source": {"bytes": raw},
+                    }
+                }
+            )
+    return blocks or [{"text": ""}]
+
+
+def _converse_doc_name(name: Any) -> str:
+    """Sanitize a filename into a Converse document name (ASCII alphanumerics,
+    single spaces, hyphens, parentheses, brackets — per the Converse API)."""
+    cleaned = "".join(
+        c if ((c.isalnum() and c.isascii()) or c in " -()[]") else "-"
+        for c in str(name or "")
+    )
+    cleaned = " ".join(cleaned.split())
+    return cleaned[:60] or "document"
+
+
 class BedrockConverseProvider(LLMProvider):
     """Non-Claude Bedrock models (Nova, Llama, GPT-OSS, …) via Converse API.
 
@@ -1876,13 +2591,15 @@ class BedrockConverseProvider(LLMProvider):
             if m.role == "system":
                 system_parts.append(m.content if isinstance(m.content, str) else str(m.content))
                 continue
-            role = "assistant" if m.role == "assistant" else "user"
-            text = m.content if isinstance(m.content, str) else str(m.content)
             if m.role == "tool":
-                text = f"[tool {m.tool_call_id or ''}] {text}"
-                role = "user"
+                text = m.content if isinstance(m.content, str) else str(m.content)
+                converse_messages.append(
+                    {"role": "user", "content": [{"text": f"[tool {m.tool_call_id or ''}] {text}"}]}
+                )
+                continue
+            role = "assistant" if m.role == "assistant" else "user"
             converse_messages.append(
-                {"role": role, "content": [{"text": text or ""}]}
+                {"role": role, "content": _converse_content_blocks(m.content)}
             )
 
         kwargs: dict[str, Any] = {

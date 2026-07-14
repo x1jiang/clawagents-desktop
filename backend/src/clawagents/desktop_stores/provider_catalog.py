@@ -98,23 +98,91 @@ def _has_aws_credentials() -> bool:
     return False
 
 
-def build_provider_catalog() -> list[dict[str, Any]]:
+def _ollama_alive() -> bool:
+    try:
+        import urllib.request
+
+        with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=0.6) as resp:
+            return 200 <= getattr(resp, "status", 200) < 300
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _probe_compatible_models(base_url: str, api_key: str) -> list[dict[str, str]]:
+    """GET {base}/models and return [{id, label}] when the gateway answers."""
+    import json
+    import urllib.error
+    import urllib.request
+    from urllib.parse import urljoin
+
+    root = base_url.rstrip("/") + "/"
+    url = urljoin(root, "models")
+    req = urllib.request.Request(url, method="GET")
+    if api_key:
+        req.add_header("Authorization", f"Bearer {api_key}")
+    try:
+        with urllib.request.urlopen(req, timeout=2.5) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="replace") or "{}")
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+        return []
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list):
+        return []
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        mid = str(item.get("id") or "").strip()
+        if not mid or mid in seen:
+            continue
+        seen.add(mid)
+        out.append({"id": mid, "label": mid})
+        if len(out) >= 80:
+            break
+    return out
+
+
+def build_provider_catalog(settings: Any | None = None) -> list[dict[str, Any]]:
     """Return providers with `available` flags computed from env keys."""
     out: list[dict[str, Any]] = []
+    base_url = ""
+    trust = False
+    if settings is not None:
+        base_url = str(getattr(settings, "base_url", "") or "").strip()
+        trust = bool(getattr(settings, "trust_custom_base_url", False))
+
     for p in _CATALOG:
         env_key = p.get("env_key")
+        models = list(p.get("models") or [])
         if env_key is None:
-            available = True
+            available = _ollama_alive()
+            if available:
+                probed = _probe_compatible_models(
+                    str(p.get("base_url") or "http://localhost:11434/v1"),
+                    "ollama",
+                )
+                if probed:
+                    models = probed
         elif env_key == "BEDROCK_API_KEY":
-            available = bool(
-                os.environ.get("BEDROCK_API_KEY")
-                or os.environ.get("OPENAI_API_KEY")
-                or _has_aws_credentials()
-            )
+            # Do not unlock Bedrock via OPENAI_API_KEY alone (VS Code 1.0.15).
+            available = bool(os.environ.get("BEDROCK_API_KEY") or _has_aws_credentials())
         else:
             available = bool(os.environ.get(str(env_key)))
             if env_key == "GEMINI_API_KEY" and not available:
                 available = bool(os.environ.get("GOOGLE_API_KEY"))
+
+        if (
+            p["id"] == "openai"
+            and base_url
+            and (trust or base_url.startswith(("http://localhost", "http://127.0.0.1")))
+        ):
+            key = (os.environ.get("OPENAI_API_KEY") or "").strip() or "openai"
+            probed = _probe_compatible_models(base_url, key)
+            if probed:
+                models = probed
+                available = True
+
         out.append({
             "id": p["id"],
             "name": p["name"],
@@ -122,7 +190,7 @@ def build_provider_catalog() -> list[dict[str, Any]]:
             "base_url": p.get("base_url"),
             "models": [
                 {**m, "available": available}
-                for m in p["models"]
+                for m in models
             ],
         })
     return out

@@ -57,6 +57,10 @@ export function SettingsModal({ onClose }: Props) {
   const [actionMode, setActionMode] = useState("tools");
   const [agentMode, setAgentMode] = useState("");
   const [allowFullAccess, setAllowFullAccess] = useState(false);
+  const [reasoningEffort, setReasoningEffort] = useState("medium");
+  const [wireApi, setWireApi] = useState("auto");
+  const [sslVerify, setSslVerify] = useState(true);
+  const [skillUserHomes, setSkillUserHomes] = useState(true);
   const [catalog, setCatalog] = useState<ProviderCatalogEntry[]>([]);
   const [saving, setSaving] = useState(false);
   const [verifying, setVerifying] = useState<Record<string, boolean>>({});
@@ -86,6 +90,10 @@ export function SettingsModal({ onClose }: Props) {
         setActionMode(s.action_mode || "tools");
         setAgentMode(s.agent_mode || "");
         setAllowFullAccess(Boolean(s.allow_full_access));
+        setReasoningEffort(s.reasoning_effort || "medium");
+        setWireApi(s.wire_api || "auto");
+        setSslVerify(s.ssl_verify !== false);
+        setSkillUserHomes(s.skill_user_homes !== false);
       } catch {
         /* defaults */
       }
@@ -192,7 +200,13 @@ export function SettingsModal({ onClose }: Props) {
           action_mode: actionMode,
           agent_mode: agentMode,
           allow_full_access: allowFullAccess,
+          reasoning_effort: reasoningEffort,
+          wire_api: wireApi,
+          ssl_verify: sslVerify,
+          skill_user_homes: skillUserHomes,
         });
+        // Refresh catalog so custom base_url model probes show up.
+        void client.listProviders().then(setCatalog).catch(() => undefined);
       }
       onClose();
     } finally {
@@ -488,6 +502,42 @@ export function SettingsModal({ onClose }: Props) {
                       }
                       className="w-full px-2 py-1.5 text-sm font-mono border border-gray-300 dark:border-gray-700 rounded-lg bg-white dark:bg-gray-800 dark:text-gray-100"
                     />
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 pt-1">
+                      <label className="text-xs text-gray-500 dark:text-gray-400">
+                        Wire API
+                        <select
+                          value={wireApi}
+                          onChange={(e) => setWireApi(e.target.value)}
+                          className="mt-1 w-full px-2 py-1.5 text-sm border border-gray-300 dark:border-gray-700 rounded-lg bg-white dark:bg-gray-800 dark:text-gray-100"
+                        >
+                          <option value="auto">auto</option>
+                          <option value="responses">Responses</option>
+                          <option value="chat_completions">Chat Completions</option>
+                        </select>
+                      </label>
+                      <label className="text-xs text-gray-500 dark:text-gray-400">
+                        Effort (GPT-5 / o-series)
+                        <select
+                          value={reasoningEffort}
+                          onChange={(e) => setReasoningEffort(e.target.value)}
+                          className="mt-1 w-full px-2 py-1.5 text-sm border border-gray-300 dark:border-gray-700 rounded-lg bg-white dark:bg-gray-800 dark:text-gray-100"
+                        >
+                          <option value="none">None</option>
+                          <option value="low">Light</option>
+                          <option value="medium">Medium</option>
+                          <option value="high">High</option>
+                          <option value="xhigh">Extra High</option>
+                        </select>
+                      </label>
+                      <label className="flex items-end gap-2 text-xs text-gray-600 dark:text-gray-300 pb-1.5">
+                        <input
+                          type="checkbox"
+                          checked={sslVerify}
+                          onChange={(e) => setSslVerify(e.target.checked)}
+                        />
+                        Verify TLS
+                      </label>
+                    </div>
                   </section>
 
                   <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 pt-1">
@@ -589,6 +639,7 @@ export function SettingsModal({ onClose }: Props) {
                       [trajectory, setTrajectory, "Trajectory logging"],
                       [learn, setLearn, "Learn from trajectories"],
                       [allowFullAccess, setAllowFullAccess, "Allow Full Access mode"],
+                      [skillUserHomes, setSkillUserHomes, "Load personal skill homes (~/.codex, ~/.claude, ~/.agents)"],
                     ] as const
                   ).map(([checked, setChecked, label], i) => (
                     <label
