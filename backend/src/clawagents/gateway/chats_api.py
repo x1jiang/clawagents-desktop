@@ -745,8 +745,15 @@ def _decide_by_mode(mode: str, file_path: str | None, project_root: str) -> str 
     through to the grant store + user prompt. The four UI modes map as:
 
     - ``read_only`` — refuse all writes
-    - ``full_access`` — auto-allow all writes
-    - ``auto`` — auto-allow writes inside ``project_root``; prompt otherwise
+    - ``full_access`` — auto-allow all writes, including secret-shaped ones
+      (that is the explicit point of the mode — the user opted all the way
+      in; unlike ``auto`` below, this is not a convenience default).
+    - ``auto`` — auto-allow writes inside ``project_root``, EXCEPT
+      secret-shaped paths (``.env``, ``*.pem``, ``credentials*`` — see
+      ``clawagents.security.secret_paths``), which fall through to the
+      grant-store + user prompt instead of being silently auto-allowed.
+      ``auto`` is a convenience default, not an explicit "trust everything"
+      opt-in the way ``full_access`` is.
     - ``ask`` (default) — always prompt
 
     Paths that fail to resolve (broken symlinks, perms errors) fall through
@@ -762,6 +769,10 @@ def _decide_by_mode(mode: str, file_path: str | None, project_root: str) -> str 
                 resolved_file = Path(file_path).resolve()
                 resolved_root = Path(project_root).resolve()
                 if resolved_file == resolved_root or resolved_root in resolved_file.parents:
+                    from clawagents.security.secret_paths import is_secret_basename
+
+                    if is_secret_basename(resolved_file.name):
+                        return None
                     return "allow_once"
             except OSError:
                 pass
@@ -1334,6 +1345,17 @@ async def run_chat_turn(
     action_mode = (settings.action_mode or "tools").strip()
     if action_mode == "code" and "action_mode" in agent_params:
         agent_kwargs["action_mode"] = "code"
+    # Couple UI chat mode → OS sandbox (permission layer alone is not enough).
+    if "chat_mode" in agent_params:
+        agent_kwargs["chat_mode"] = mode
+    if "allow_full_access" in agent_params:
+        agent_kwargs["allow_full_access"] = bool(settings.allow_full_access)
+    elif (
+        mode == "full_access"
+        and settings.allow_full_access
+        and "sandbox_profile" in agent_params
+    ):
+        agent_kwargs["sandbox_profile"] = "off"
 
     if settings.browser_tools:
         try:
@@ -1399,6 +1421,42 @@ async def run_chat_turn(
                     agent.tools.register(_make_ask_user_tool())
                 except Exception:  # noqa: BLE001
                     pass
+
+                # Wire PermissionEngine's declarative "ask" tier (e.g. the
+                # .env-write rule from clawagents.security.secret_paths) to
+                # a synchronous allow, instead of leaving it permanently
+                # denied. tools/registry.py.execute_tool runs two independent
+                # gates per write-class tool call: (1) evaluate_tool_permission
+                # + permission_callback (registry.py:552-605) — desktop's
+                # real, mode-aware, SSE-backed approval flow (_permission_cb /
+                # _decide_by_mode above). Since permission_mode is never
+                # overridden from DEFAULT, gate (1) always requires
+                # confirmation for write-class tools and returns early with a
+                # denial if the user/mode says no. Then (2) PermissionEngine
+                # .gate() (registry.py:607-620) runs a separate declarative
+                # rule set; its "ask" tier calls ask_handler synchronously and,
+                # left unset, always denies — so a .env write approved by
+                # full_access/auto mode, or by the user explicitly clicking
+                # Allow, was still refused with a generic "Permission ask
+                # required" error. Gate (2) is only ever reached for a call
+                # gate (1) already approved (gate (1) returns immediately on
+                # denial), so this handler is only ever consulted about a
+                # tool call already approved by the real flow — deny-tier
+                # PermissionEngine rules (credentials*, secrets*, *.pem,
+                # sudo, rm -rf) are untouched and still hard-deny.
+                #
+                # Deliberately NOT using create_claw_agent(approval_handler=):
+                # setting that kwarg also flips graph/agent_loop.py's
+                # require_approval_set to include every WRITE_CLASS_TOOLS
+                # entry, activating an unrelated, previously-dormant
+                # pre-dispatch approval gate (_wait_for_tool_approval) for
+                # every write-class call — a synchronous always-True handler
+                # there would rubber-stamp far more than just PermissionEngine
+                # 's "ask" tier. Setting the engine's ask_handler directly
+                # touches only PermissionEngine.gate(), nothing else.
+                _perm_engine = getattr(agent, "_permission_engine", None)
+                if _perm_engine is not None:
+                    _perm_engine.ask_handler = lambda tool_name, args, message: True
                 from clawagents.permissions.plan_approval import PLAN_APPROVAL_META_KEY
                 from clawagents.run_context import RunContext
 

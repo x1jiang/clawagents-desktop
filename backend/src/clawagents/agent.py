@@ -269,6 +269,19 @@ class ClawAgent:
             run_context._metadata["skill_store"] = store
         # Gate Goal reminder + final verifier on this turn's mode (Act ≠ Goal).
         run_context._metadata["goal_mode"] = bool(getattr(self, "goal_mode", False))
+        if not isinstance(run_context._metadata, dict):
+            run_context._metadata = {}
+        run_context._metadata["sandbox_profile"] = getattr(
+            self, "_sandbox_profile_name", "workspace"
+        )
+        run_context._metadata["chat_mode"] = getattr(self, "_chat_mode", None)
+        run_context._metadata["allow_full_access"] = bool(
+            getattr(self, "_allow_full_access", False)
+        )
+        run_context._metadata["allow_unsandboxed_exec"] = bool(
+            getattr(self, "_allow_full_access", False)
+            and getattr(self, "_chat_mode", None) == "full_access"
+        )
 
         return await run_agent_graph(
             task=task,
@@ -620,6 +633,8 @@ def create_claw_agent(
     memory: Union[str, List[Union[str, os.PathLike]], None] = None,
     sandbox: Any = None,
     sandbox_profile: str | None = None,
+    chat_mode: str | None = None,
+    allow_full_access: bool = False,
     streaming: bool = True,
     context_window: Optional[int] = None,
     max_tokens: Optional[int] = None,
@@ -814,6 +829,7 @@ def create_claw_agent(
         context_window = _lc().context_window  # default: 1_000_000
 
     # ── Resolve optional provider profile before model construction ─────
+    provider_hint: Optional[str] = None
     if profile:
         from clawagents.provider_profiles import resolve_provider_profile
         resolved_profile = resolve_provider_profile(
@@ -828,11 +844,15 @@ def create_claw_agent(
         api_key = resolved_profile.api_key
         base_url = resolved_profile.base_url
         api_version = resolved_profile.api_version
+        # Declared profile provider drives routing/key fields (not re-inferred
+        # solely from the model string — aliases like internal-claude-* need this).
+        provider_hint = (resolved_profile.provider or "").strip() or None
 
     # ── Resolve model → LLMProvider ────────────────────────────────────
     llm = _resolve_model(
         model, streaming, api_key, context_window, max_tokens, temperature,
         base_url, api_version, reasoning_effort, wire_api, ssl_verify,
+        provider=provider_hint,
     )
 
     # ── Resolve fallback providers ──────────────────────────────────────
@@ -856,18 +876,35 @@ def create_claw_agent(
         resolved_advisor_llm = _resolve_model(advisor_spec, streaming, adv_key, context_window)
 
     # ── Resolve sandbox backend ────────────────────────────────────────
+    sandbox_profile_name = "off"
     if sandbox is not None:
         sb = sandbox
+        sandbox_profile_name = str(
+            getattr(getattr(sb, "_profile", None), "name", None)
+            or getattr(sb, "kind", "custom")
+        )
     else:
-        from clawagents.sandbox.profiles import resolve_sandbox
+        from clawagents.sandbox.profiles import (
+            resolve_sandbox,
+            sandbox_profile_for_chat_mode,
+        )
 
-        # Default workspace confinement when profiles enabled; honor explicit profile.
         env_profile = (os.environ.get("CLAW_SANDBOX_PROFILE") or "").strip() or None
-        chosen = sandbox_profile or env_profile
+        chosen = sandbox_profile_for_chat_mode(
+            chat_mode,
+            allow_full_access=bool(allow_full_access),
+            explicit=sandbox_profile,
+            env_profile=env_profile,
+        )
         sb = resolve_sandbox(
             chosen,
             workspace=workspace_root,
             default="workspace",
+        )
+        sandbox_profile_name = str(
+            getattr(getattr(sb, "_profile", None), "name", None)
+            or chosen
+            or "workspace"
         )
 
     registry = ToolRegistry()
@@ -1184,6 +1221,9 @@ def create_claw_agent(
         agent.skill_store = skill_store  # type: ignore[attr-defined]
     agent._permission_engine = _perm_engine  # type: ignore[attr-defined]
     agent._sandbox_backend = sb  # type: ignore[attr-defined]
+    agent._sandbox_profile_name = sandbox_profile_name  # type: ignore[attr-defined]
+    agent._chat_mode = str(chat_mode or "").strip().lower() or None  # type: ignore[attr-defined]
+    agent._allow_full_access = bool(allow_full_access)  # type: ignore[attr-defined]
 
     # Compose permission deny-gate with mode before_tool (HookResult-aware).
     from clawagents.graph.agent_loop import HookResult
@@ -1316,13 +1356,19 @@ def _resolve_model(
     reasoning_effort: Optional[str] = None,
     wire_api: Optional[str] = None,
     ssl_verify: Optional[bool] = None,
+    provider: Optional[str] = None,
 ) -> LLMProvider:
     """Accept a model name string, an LLMProvider, or None (auto-detect)."""
     if isinstance(model, LLMProvider):
         return model
 
-    from clawagents.config.config import load_config, get_default_model, is_bedrock_model_id
+    from clawagents.config.config import load_config, get_default_model
     from clawagents.providers.llm import create_provider, normalize_reasoning_effort, _normalize_wire_api
+    from clawagents.providers.model_classify import (
+        api_key_field_for,
+        classify_model,
+        parse_model_ref,
+    )
 
     config = load_config()
     config.streaming = streaming
@@ -1344,32 +1390,27 @@ def _resolve_model(
         config.openai_ssl_verify = bool(ssl_verify)
 
     active_model = model if isinstance(model, str) and model else get_default_model(config)
+    kind = classify_model(
+        active_model,
+        base_url=config.openai_base_url,
+        provider_hint=provider,
+    )
 
-    # Override the appropriate API key if provided.
-    # Route by model family so a single ``api_key`` parameter targets the
-    # correct provider config field. Without this, e.g. a Claude key
-    # silently lands in ``openai_api_key`` and the Anthropic provider
-    # falls back to the env var.
+    # Override the appropriate API key if provided — driven by the classifier
+    # (and optional profile provider hint), not ad-hoc startswith checks.
     if api_key:
-        lower = active_model.lower()
-        if lower.startswith("gemini"):
+        field = api_key_field_for(kind, base_url=config.openai_base_url)
+        if field == "gemini_api_key":
             config.gemini_api_key = api_key
-        elif is_bedrock_model_id(active_model) and not config.openai_base_url:
-            # Native Bedrock uses the AWS credential chain (IAM / profile /
-            # env keys) — do not stash a placeholder in anthropic_api_key.
-            pass
-        elif (
-            (lower.startswith("claude") or lower.startswith("anthropic"))
-            and not config.openai_base_url
-        ):
+        elif field == "anthropic_api_key":
             config.anthropic_api_key = api_key
-        else:
-            # OpenAI, Ollama, Bedrock gateway, Azure, and other OpenAI-compatible
-            # endpoints (including anthropic.* model IDs with a custom base_url).
+        elif field == "openai_api_key":
             config.openai_api_key = api_key
+        # field is None → native Bedrock IAM; leave key fields alone.
 
-    provider = create_provider(active_model, config)
-    return provider
+    # Strip litellm ``provider/`` before the factory (SDK must not see it).
+    sdk_name = parse_model_ref(active_model).bare_id
+    return create_provider(sdk_name, config, provider_hint=provider or kind)
 
 
 def _resolve_system_prompt(
