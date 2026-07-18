@@ -105,6 +105,8 @@ class RunContext(Generic[TContext]):
     pending_skill_total_chars: int | None = None
     pending_skill_allowed_tools: frozenset[str] | None = None
     pending_skill_boundary_declared: bool = False
+    session_id: str | None = None
+    on_event: Any | None = None
     _approvals: dict[str, ApprovalRecord] = field(default_factory=dict)
     _always_approvals: dict[str, ApprovalRecord] = field(default_factory=dict)
     _metadata: dict[str, Any] = field(default_factory=dict)
@@ -161,6 +163,30 @@ class RunContext(Generic[TContext]):
                 if self.active_skill_allowed_tools is None
                 else self.active_skill_allowed_tools & boundary
             )
+        # Keep compaction carryover in sync with fully-read skills.
+        try:
+            from clawagents.context.carryover import (
+                get_compaction_carryover,
+                set_compaction_carryover,
+            )
+
+            existing = get_compaction_carryover(self)
+            invoked = list(existing.invoked_skills)
+            if name not in invoked:
+                invoked.append(name)
+            set_compaction_carryover(
+                self,
+                task_focus=existing.task_focus or None,
+                recent_files=existing.recent_files,
+                recent_work_log=existing.recent_work_log,
+                invoked_skills=invoked,
+                active_workers=existing.active_workers,
+                channel_log=existing.channel_log,
+                plan_reminder=existing.plan_reminder or None,
+                metadata=existing.metadata,
+            )
+        except Exception:
+            pass
 
     async def ensure_iteration_budget(self, size: int) -> IterationBudget:
         """Lazily attach an :class:`IterationBudget` if none is set yet.

@@ -51,6 +51,8 @@ class AppSettings:
     skill_ignore_dirs: list | None = None
     skill_exclude: list | None = None
     skill_user_homes: bool = True
+    # Auto-install/upgrade context-mode + rtk companions (VS Code parity).
+    ensure_companions: bool = True
 
     def __post_init__(self) -> None:
         if self.skill_dirs is None:

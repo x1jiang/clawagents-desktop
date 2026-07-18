@@ -62,6 +62,17 @@ export interface ProviderCatalogEntry {
   models: Array<{ id: string; label: string; available: boolean }>;
 }
 
+export interface CompanionStatus {
+  name: string;
+  found: boolean;
+  version?: string | null;
+  min_version?: string;
+  ok: boolean;
+  detail: string;
+  path?: string | null;
+  hint?: string;
+}
+
 export interface GatewayDiagnostics {
   backend_version: string;
   python_version: string;
@@ -78,6 +89,8 @@ export interface GatewayDiagnostics {
   };
   providers_with_env_keys: string[];
   external_tools: Record<string, boolean>;
+  companions?: CompanionStatus[];
+  ensure_companions?: boolean;
 }
 
 export interface AppSettings {
@@ -109,6 +122,7 @@ export interface AppSettings {
   skill_exclude?: string[];
   skill_user_homes?: boolean;
   has_aws_credentials?: boolean;
+  ensure_companions?: boolean;
 }
 
 export interface AutoApprove {
@@ -247,6 +261,65 @@ export class GatewayClient {
     return this.request(`/permissions/${requestId}`, {
       method: "POST",
       body: JSON.stringify({ decision }),
+    });
+  }
+
+  resolvePlanApproval(
+    requestId: string,
+    decision: "approve" | "request_changes" | "reject",
+    comment = "",
+  ): Promise<{ ok: boolean }> {
+    return this.request(`/plan-approvals/${requestId}`, {
+      method: "POST",
+      body: JSON.stringify({ decision, comment }),
+    });
+  }
+
+  interjectChat(chatId: string, text: string): Promise<{ ok: boolean; queued: number; reason?: string }> {
+    return this.request(`/chats/${chatId}/interject`, {
+      method: "POST",
+      body: JSON.stringify({ text }),
+    });
+  }
+
+  listRewind(opts: { projectId?: string | null; chatId?: string; rootPath?: string } = {}): Promise<{
+    ok: boolean;
+    snapshots: Array<Record<string, unknown>>;
+    workspace?: string;
+    error?: string;
+  }> {
+    const params = new URLSearchParams();
+    if (opts.projectId) params.set("project_id", opts.projectId);
+    if (opts.chatId) params.set("chat_id", opts.chatId);
+    if (opts.rootPath) params.set("root_path", opts.rootPath);
+    const q = params.toString();
+    return this.request(`/rewind${q ? `?${q}` : ""}`);
+  }
+
+  rewindTo(body: {
+    prompt_index: number;
+    project_id?: string | null;
+    chat_id?: string;
+    root_path?: string;
+  }): Promise<Record<string, unknown>> {
+    return this.request("/rewind", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  }
+
+  ensureCompanions(force = false): Promise<{
+    ok: boolean;
+    skipped?: boolean;
+    reason?: string;
+    before?: CompanionStatus[];
+    after?: CompanionStatus[];
+    companions?: CompanionStatus[];
+    actions?: Array<Record<string, unknown>>;
+  }> {
+    return this.request("/diagnostics/ensure-companions", {
+      method: "POST",
+      body: JSON.stringify({ force }),
     });
   }
 

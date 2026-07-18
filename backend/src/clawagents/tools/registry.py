@@ -8,7 +8,9 @@ Optimizations learned from deepagents/openclaw:
 
 import asyncio
 import json
+import os
 import re
+import traceback
 from typing import Any, Dict, List, Optional, Protocol
 
 
@@ -19,6 +21,34 @@ class ToolResult:
         self.success = success
         self.output = output
         self.error = error
+
+
+def _tool_error_debug_enabled() -> bool:
+    for key in ("CLAW_DEBUG", "CLAWAGENTS_DEV", "CLAW_DEV"):
+        if os.environ.get(key, "").lower() in ("1", "true", "yes", "on"):
+            return True
+    try:
+        from clawagents.config.features import is_enabled
+
+        return is_enabled("tool_error_traceback")
+    except Exception:
+        return False
+
+
+def format_tool_error(err: BaseException, *, include_traceback: bool | None = None) -> str:
+    """Format a tool exception for ToolResult.error (type + optional traceback)."""
+    type_name = type(err).__name__
+    msg = str(err)
+    text = f"{type_name}: {msg}" if msg else type_name
+    if include_traceback is None:
+        include_traceback = _tool_error_debug_enabled()
+    if include_traceback:
+        tb = traceback.format_exc()
+        if tb and tb.strip() != "NoneType: None\n":
+            lines = tb.strip().splitlines()
+            short = "\n".join(lines[-10:]) if len(lines) > 10 else tb.strip()
+            return f"{text}\n{short}"
+    return text
 
 
 class Tool(Protocol):
@@ -79,7 +109,7 @@ _NEVER_PARALLEL_TOOLS: frozenset[str] = frozenset({
 # their target paths are independent. Write-side tools are intentionally
 # excluded — they run sequentially via the snapshot path.
 _DEFAULT_PARALLEL_SAFE: frozenset[str] = frozenset({
-    "read_file", "list_dir", "glob", "search_files", "grep",
+    "read_file", "hashline_read", "hashline_grep", "list_dir", "glob", "search_files", "grep",
     "web_fetch", "web_search", "shell",  # stateless reads
 })
 
@@ -87,6 +117,9 @@ _DEFAULT_PARALLEL_SAFE: frozenset[str] = frozenset({
 # their own ``path_scoped_arg`` attribute.
 _DEFAULT_PATH_SCOPED_ARGS: Dict[str, str] = {
     "read_file": "path",
+    "hashline_read": "path",
+    "hashline_grep": "path",
+    "hashline_edit": "path",
     "list_dir": "path",
     "glob": "path",
     "search_files": "path",
@@ -122,8 +155,8 @@ def _path_scope_of(tool: "Tool", args: Dict[str, Any]) -> Optional[str]:
 # Before write tools modify a file, snapshot it for undo/rollback capability.
 
 _WRITE_TOOLS: frozenset[str] = frozenset({
-    "write_file", "edit_file", "apply_patch", "create_file", "replace_in_file",
-    "insert_in_file", "insert_lines", "patch_file",
+    "write_file", "edit_file", "apply_patch", "hashline_edit", "create_file",
+    "replace_in_file", "insert_in_file", "insert_lines", "patch_file",
 })
 
 
@@ -180,6 +213,70 @@ def _snapshot_before_write(tool_name: str, args: Dict[str, Any]) -> None:
                 tool=tool_name,
                 phase="pre",
             )
+    except Exception:
+        pass
+
+
+def _record_hunk_watcher_write(
+    tool_name: str,
+    args: Dict[str, Any],
+    *,
+    prompt_index: int | None = None,
+) -> None:
+    """Feed successful writes into hunk watcher for rewind attribution."""
+    from clawagents.config.features import is_enabled
+
+    if not (is_enabled("hunk_watcher") or is_enabled("session_rewind")):
+        return
+    if tool_name not in _WRITE_TOOLS:
+        return
+    path_str = args.get("path") or args.get("file_path") or args.get("target_path") or ""
+    if not path_str:
+        return
+    try:
+        from pathlib import Path
+
+        from clawagents.memory.hunk_watcher import get_watcher
+
+        root = Path.cwd().resolve()
+        resolved = Path(path_str).resolve()
+        if resolved != root and root not in resolved.parents:
+            return
+        if not resolved.is_file():
+            return
+        rel = str(resolved.relative_to(root)).replace("\\", "/")
+        content = resolved.read_text(encoding="utf-8", errors="replace")
+        get_watcher(root).record_agent_write(rel, content, prompt_index=prompt_index)
+    except Exception:
+        pass
+
+
+async def _fire_permission_denied_hook(
+    run_context: Any,
+    tool_name: str,
+    reason: str,
+    *,
+    source: str = "permission_engine",
+) -> None:
+    """Fire taxonomy PermissionDenied when a declarative gate blocks a tool."""
+    if run_context is None:
+        return
+    meta = getattr(run_context, "_metadata", None)
+    if not isinstance(meta, dict):
+        return
+    dispatcher = meta.get("taxonomy_dispatcher")
+    if dispatcher is None:
+        return
+    try:
+        from clawagents.hooks.external import dispatch_taxonomy_hook
+        from clawagents.hooks.taxonomy import HookEvent
+
+        await dispatch_taxonomy_hook(
+            dispatcher,
+            HookEvent.PERMISSION_DENIED,
+            {"tool": tool_name, "reason": reason, "source": source},
+            blocking=False,
+        )
     except Exception:
         pass
 
@@ -459,11 +556,18 @@ class ToolRegistry:
                 or args.get("file_path")
                 or args.get("filePath")
             )
+            project_root = None
+            meta = getattr(run_context, "_metadata", None)
+            if isinstance(meta, dict):
+                root = meta.get("project_root") or meta.get("workspace")
+                if isinstance(root, str) and root:
+                    project_root = root
             decision = evaluate_tool_permission(
                 tool_name,
                 mode=mode,
                 file_path=file_path if isinstance(file_path, str) else None,
                 command=args.get("command") if isinstance(args.get("command"), str) else None,
+                project_root=project_root,
             )
             if not decision.allowed and not decision.requires_confirmation:
                 return ToolResult(
@@ -499,6 +603,21 @@ class ToolRegistry:
                             success=False, output="",
                             error=f"Refused: '{tool_name}' was denied by the user.",
                         )
+
+        # Declarative permission rules (deny wins)
+        engine = getattr(self, "_permission_engine", None)
+        if engine is not None and hasattr(engine, "gate"):
+            ok, msg = engine.gate(tool_name, args if isinstance(args, dict) else {})
+            if not ok:
+                reason = msg or f"Denied by permission rule: {tool_name}"
+                await _fire_permission_denied_hook(
+                    run_context, tool_name, reason, source="permission_engine",
+                )
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=reason,
+                )
 
         # Parameter validation with lenient coercion
         effective_args = args
@@ -539,6 +658,20 @@ class ToolRegistry:
             if is_cacheable and truncated.success:
                 self._result_cache.set(tool_name, effective_args, truncated)
 
+            if truncated.success and tool_name in _WRITE_TOOLS:
+                prompt_idx = None
+                if run_context is not None and isinstance(
+                    getattr(run_context, "_metadata", None), dict
+                ):
+                    raw_idx = run_context._metadata.get("prompt_index")
+                    try:
+                        prompt_idx = int(raw_idx) if raw_idx is not None else None
+                    except (TypeError, ValueError):
+                        prompt_idx = None
+                _record_hunk_watcher_write(
+                    tool_name, effective_args, prompt_index=prompt_idx,
+                )
+
             return truncated
         except asyncio.TimeoutError:
             return ToolResult(
@@ -549,7 +682,7 @@ class ToolRegistry:
                 ),
             )
         except Exception as err:
-            return ToolResult(success=False, output="", error=f"Tool error: {str(err)}")
+            return ToolResult(success=False, output="", error=format_tool_error(err))
 
     async def execute_tools_parallel(
         self,
@@ -575,7 +708,7 @@ class ToolRegistry:
             try:
                 return await self.execute_tool(call.tool_name, call.args, run_context=run_context)
             except Exception as err:
-                return ToolResult(success=False, output="", error=f"Tool error: {str(err)}")
+                return ToolResult(success=False, output="", error=format_tool_error(err))
 
         # Build batches. Each batch is a list of (original_index, call).
         batches: List[List[tuple[int, ParsedToolCall]]] = []

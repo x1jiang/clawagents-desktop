@@ -149,6 +149,22 @@ class LLMProvider(ABC):
     ) -> LLMResponse:
         pass
 
+    async def complete(
+        self,
+        messages: list[LLMMessage],
+        *args: Any,
+        stream: bool = False,
+        **kwargs: Any,
+    ) -> LLMResponse:
+        """Non-tool convenience alias for ``chat``.
+
+        Goal / memory-flush / dream helpers historically called ``complete``.
+        Providers only implement ``chat``; this default forwards and accepts
+        (then ignores) ``stream=`` so those call sites don't AttributeError.
+        Non-streaming is the default when ``on_chunk`` is omitted.
+        """
+        return await self.chat(messages)
+
 
 # ─── Streaming Robustness Internals ───────────────────────────────────────
 
@@ -226,16 +242,73 @@ async def _with_retry(
     fn: Callable[[], Coroutine[Any, Any, T]],
     *,
     policy: Any = None,
+    breaker_tag: str | None = None,
 ) -> T:
     """Retry ``fn`` with either the legacy heuristic or a :class:`RetryPolicy`.
 
     When ``policy`` is ``None``, behaviour matches the pre-existing
     ``_is_retryable`` heuristic so providers that don't opt-in keep working.
+
+    When ``provider_circuit_breaker`` is enabled, a per-endpoint breaker admits
+    half-open probes. ``BreakerOpen`` waits without burning retry budget.
+    ``breaker_tag`` should be a :func:`breaker_key` identity (base_url+model).
     """
     last_error: BaseException | None = None
+    breaker = None
+    bkey = breaker_tag or tag
+    try:
+        from clawagents.config.features import is_enabled as _feat_cb
+
+        if _feat_cb("provider_circuit_breaker"):
+            from clawagents.circuit_breaker import (
+                BreakerOpen,
+                Outcome,
+                get_provider_breaker,
+            )
+
+            breaker = get_provider_breaker(bkey)
+    except Exception:
+        breaker = None
+
+    async def _admit() -> None:
+        if breaker is None:
+            return
+        from clawagents.circuit_breaker import BreakerOpen
+
+        # Wait for half-open slots without consuming provider retries.
+        for _ in range(24):
+            try:
+                breaker.check()
+                return
+            except BreakerOpen as open_exc:
+                delay = max(0.05, float(open_exc.retry_after) or 0.05)
+                logger.warning(
+                    "  [%s] circuit breaker open — backing off %.2fs",
+                    bkey,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+        breaker.check()
+
+    async def _guarded() -> T:
+        await _admit()
+        try:
+            result = await fn()
+        except Exception as exc:
+            if breaker is not None and _is_retryable(exc):
+                from clawagents.circuit_breaker import Outcome
+
+                breaker.record(Outcome.FAILURE)
+            raise
+        if breaker is not None:
+            from clawagents.circuit_breaker import Outcome
+
+            breaker.record(Outcome.SUCCESS)
+        return result
 
     if policy is None:
-        for attempt in range(_MAX_RETRIES + 1):
+        attempt = 0
+        while attempt <= _MAX_RETRIES:
             if attempt > 0:
                 delay = _jittered_delay(attempt - 1)
                 logger.warning(
@@ -244,11 +317,22 @@ async def _with_retry(
                 )
                 await asyncio.sleep(delay)
             try:
-                return await fn()
+                return await _guarded()
             except Exception as exc:
                 last_error = exc
+                if breaker is not None:
+                    try:
+                        from clawagents.circuit_breaker import BreakerOpen as _BO
+
+                        if isinstance(exc, _BO):
+                            # Already waited in _admit; do not burn a retry slot.
+                            await asyncio.sleep(max(0.05, float(exc.retry_after) or 0.05))
+                            continue
+                    except Exception:
+                        pass
                 if not _is_retryable(exc):
                     break
+                attempt += 1
         raise last_error  # type: ignore[misc]
 
     # Policy-driven path.
@@ -256,9 +340,17 @@ async def _with_retry(
     attempt = 0
     while attempt < max_attempts:
         try:
-            return await fn()
+            return await _guarded()
         except Exception as exc:
             last_error = exc
+            try:
+                from clawagents.circuit_breaker import BreakerOpen as _BO
+
+                if isinstance(exc, _BO):
+                    await asyncio.sleep(max(0.05, float(exc.retry_after) or 0.05))
+                    continue  # do not burn attempt
+            except Exception:
+                pass
             attempt += 1
             try:
                 descriptor = policy.classify(exc)
@@ -282,6 +374,49 @@ async def _with_retry(
             )
             await asyncio.sleep(delay)
     raise last_error  # type: ignore[misc]
+
+
+def _get_stream_breaker(
+    tag: str,
+    *,
+    base_url: str | None = None,
+    model: str | None = None,
+) -> Any | None:
+    """Return a per-endpoint breaker for streaming paths, or None when disabled."""
+    try:
+        from clawagents.config.features import is_enabled as _feat_cb
+        from clawagents.circuit_breaker import breaker_key, get_provider_breaker
+
+        if not _feat_cb("provider_circuit_breaker"):
+            return None
+        return get_provider_breaker(breaker_key(tag, base_url=base_url, model=model))
+    except Exception:
+        return None
+
+
+async def _admit_stream_breaker(breaker: Any) -> None:
+    if breaker is None:
+        return
+    from clawagents.circuit_breaker import BreakerOpen
+
+    for _ in range(24):
+        try:
+            breaker.check()
+            return
+        except BreakerOpen as open_exc:
+            await asyncio.sleep(max(0.05, float(open_exc.retry_after) or 0.05))
+    breaker.check()
+
+
+def _record_stream_breaker(breaker: Any, *, success: bool) -> None:
+    if breaker is None:
+        return
+    try:
+        from clawagents.circuit_breaker import Outcome
+
+        breaker.record(Outcome.SUCCESS if success else Outcome.FAILURE)
+    except Exception:
+        pass
 
 
 # ─── Truncated JSON Repair ─────────────────────────────────────────────────
@@ -978,6 +1113,15 @@ class OpenAIProvider(LLMProvider):
         formatted = _sanitize_openai_tool_pairs(_openai_chat_messages(messages))
         oai_tools = _to_openai_tools(tools) if tools else None
 
+        try:
+            from clawagents.circuit_breaker import breaker_key as _bk
+
+            _bkey = _bk("openai", base_url=self._base_url, model=self.model)
+            _bkey_resp = _bk("openai-responses", base_url=self._base_url, model=self.model)
+        except Exception:
+            _bkey = "openai"
+            _bkey_resp = "openai-responses"
+
         if self._should_use_responses(bool(oai_tools)):
             try:
                 if not on_chunk:
@@ -985,6 +1129,7 @@ class OpenAIProvider(LLMProvider):
                         "openai-responses",
                         lambda: self._request_once_responses(formatted, oai_tools),
                         policy=getattr(self, "retry_policy", None),
+                        breaker_tag=_bkey_resp,
                     )
                 return await self._stream_with_retry_responses(
                     formatted, on_chunk, cancel_event, oai_tools,
@@ -1008,6 +1153,7 @@ class OpenAIProvider(LLMProvider):
                 "openai",
                 lambda: self._request_once(formatted, oai_tools),
                 policy=getattr(self, "retry_policy", None),
+                breaker_tag=_bkey,
             )
         return await self._stream_with_retry(formatted, on_chunk, cancel_event, oai_tools)
 
@@ -1023,6 +1169,14 @@ class OpenAIProvider(LLMProvider):
         }
         if oai_tools:
             kwargs["tools"] = oai_tools
+        schema = getattr(self, "_structured_json_schema", None)
+        if isinstance(schema, dict) and schema:
+            try:
+                from clawagents.structured_output import openai_chat_response_format
+
+                kwargs["response_format"] = openai_chat_response_format(schema)
+            except Exception:
+                pass
         _apply_tool_reasoning_compat(
             kwargs,
             model=self.model,
@@ -1071,6 +1225,14 @@ class OpenAIProvider(LLMProvider):
         resp_tools = _chat_tools_to_responses_tools(oai_tools)
         if resp_tools:
             kwargs["tools"] = resp_tools
+        schema = getattr(self, "_structured_json_schema", None)
+        if isinstance(schema, dict) and schema:
+            try:
+                from clawagents.structured_output import openai_responses_text_format
+
+                kwargs["text"] = openai_responses_text_format(schema)
+            except Exception:
+                pass
         _apply_responses_reasoning(kwargs, preferred=self._reasoning_effort)
         if stream:
             kwargs["stream"] = True
@@ -1099,8 +1261,12 @@ class OpenAIProvider(LLMProvider):
         oai_tools: list[dict[str, Any]] | None = None,
     ) -> LLMResponse:
         last_error: BaseException | None = None
+        breaker = _get_stream_breaker(
+            "openai-responses", base_url=self._base_url, model=self.model
+        )
 
-        for attempt in range(_MAX_RETRIES + 1):
+        attempt = 0
+        while attempt <= _MAX_RETRIES:
             if attempt > 0:
                 delay = _jittered_delay(attempt - 1)
                 logger.warning(
@@ -1108,6 +1274,20 @@ class OpenAIProvider(LLMProvider):
                     attempt, _MAX_RETRIES, delay,
                 )
                 await asyncio.sleep(delay)
+
+            try:
+                await _admit_stream_breaker(breaker)
+            except Exception as exc:
+                last_error = exc
+                try:
+                    from clawagents.circuit_breaker import BreakerOpen as _BO
+
+                    if isinstance(exc, _BO):
+                        await asyncio.sleep(max(0.05, float(exc.retry_after) or 0.05))
+                        continue
+                except Exception:
+                    pass
+                raise
 
             chunks: list[str] = []
             final_tokens = 0
@@ -1218,6 +1398,7 @@ class OpenAIProvider(LLMProvider):
                     except Exception:
                         pass  # malformed event — skip
 
+                _record_stream_breaker(breaker, success=True)
                 return LLMResponse(
                     content="".join(chunks),
                     model=self.model,
@@ -1231,11 +1412,14 @@ class OpenAIProvider(LLMProvider):
                 last_error = exc
                 if _is_responses_unsupported(exc):
                     raise
+                if _is_retryable(exc):
+                    _record_stream_breaker(breaker, success=False)
                 if _is_retryable(exc) and attempt < _MAX_RETRIES:
                     logger.warning(
                         "  [openai-responses] Stream interrupted after %d chars — retrying",
                         len("".join(chunks)),
                     )
+                    attempt += 1
                     continue
                 if chunks or tools_accumulation:
                     partial = "".join(chunks)
@@ -1264,8 +1448,12 @@ class OpenAIProvider(LLMProvider):
         oai_tools: list[dict[str, Any]] | None = None,
     ) -> LLMResponse:
         last_error: BaseException | None = None
+        breaker = _get_stream_breaker(
+            "openai", base_url=self._base_url, model=self.model
+        )
 
-        for attempt in range(_MAX_RETRIES + 1):
+        attempt = 0
+        while attempt <= _MAX_RETRIES:
             if attempt > 0:
                 delay = _jittered_delay(attempt - 1)
                 logger.warning(
@@ -1273,6 +1461,20 @@ class OpenAIProvider(LLMProvider):
                     attempt, _MAX_RETRIES, delay,
                 )
                 await asyncio.sleep(delay)
+
+            try:
+                await _admit_stream_breaker(breaker)
+            except Exception as exc:
+                last_error = exc
+                try:
+                    from clawagents.circuit_breaker import BreakerOpen as _BO
+
+                    if isinstance(exc, _BO):
+                        await asyncio.sleep(max(0.05, float(exc.retry_after) or 0.05))
+                        continue
+                except Exception:
+                    pass
+                raise
 
             chunks: list[str] = []
             final_tokens = 0
@@ -1352,6 +1554,7 @@ class OpenAIProvider(LLMProvider):
                     except Exception:
                         pass  # malformed chunk — skip
 
+                _record_stream_breaker(breaker, success=True)
                 return LLMResponse(
                     content="".join(chunks),
                     model=self.model,
@@ -1363,6 +1566,8 @@ class OpenAIProvider(LLMProvider):
 
             except Exception as exc:
                 last_error = exc
+                if _is_retryable(exc):
+                    _record_stream_breaker(breaker, success=False)
                 # A mid-stream exception used to return the truncated text as a
                 # non-retried "final" answer. Retry retryable errors first; only
                 # surface a partial (now including any accumulated tool calls)
@@ -1372,6 +1577,7 @@ class OpenAIProvider(LLMProvider):
                         "  [openai] Stream interrupted after %d chars — retrying",
                         len("".join(chunks)),
                     )
+                    attempt += 1
                     continue
                 if chunks or tools_accumulation:
                     partial = "".join(chunks)
@@ -1833,14 +2039,26 @@ class GeminiProvider(LLMProvider):
             config_opts["system_instruction"] = system_instruction
         if tools:
             config_opts["tools"] = _to_gemini_tools(tools)
+        schema = getattr(self, "_structured_json_schema", None)
+        if isinstance(schema, dict) and schema and not tools:
+            try:
+                from clawagents.structured_output import gemini_response_schema
+
+                config_opts["response_mime_type"] = "application/json"
+                config_opts["response_schema"] = gemini_response_schema(schema)
+            except Exception:
+                pass
         gemini_config = types.GenerateContentConfig(**config_opts)
 
         async def _call(contents: list[dict[str, Any]]) -> LLMResponse:
             if not on_chunk:
+                from clawagents.circuit_breaker import breaker_key as _bk
+
                 return await _with_retry(
                     "gemini",
                     lambda: self._request_once(contents, gemini_config),
                     policy=getattr(self, "retry_policy", None),
+                    breaker_tag=_bk("gemini", model=self.model),
                 )
             return await self._stream_with_retry(
                 contents, gemini_config, on_chunk, cancel_event,
@@ -1937,8 +2155,10 @@ class GeminiProvider(LLMProvider):
         cancel_event: asyncio.Event | None,
     ) -> LLMResponse:
         last_error: BaseException | None = None
+        breaker = _get_stream_breaker("gemini", model=self.model)
 
-        for attempt in range(_MAX_RETRIES + 1):
+        attempt = 0
+        while attempt <= _MAX_RETRIES:
             if attempt > 0:
                 delay = _jittered_delay(attempt - 1)
                 logger.warning(
@@ -1946,6 +2166,20 @@ class GeminiProvider(LLMProvider):
                     attempt, _MAX_RETRIES, delay,
                 )
                 await asyncio.sleep(delay)
+
+            try:
+                await _admit_stream_breaker(breaker)
+            except Exception as exc:
+                last_error = exc
+                try:
+                    from clawagents.circuit_breaker import BreakerOpen as _BO
+
+                    if isinstance(exc, _BO):
+                        await asyncio.sleep(max(0.05, float(exc.retry_after) or 0.05))
+                        continue
+                except Exception:
+                    pass
+                raise
 
             chunks: list[str] = []
             final_tokens = 0
@@ -2029,6 +2263,7 @@ class GeminiProvider(LLMProvider):
                     retry_config = types.GenerateContentConfig(**retry_opts)
                     return await self._request_once(user_contents, retry_config, _malformed_retry=True)
 
+                _record_stream_breaker(breaker, success=True)
                 return LLMResponse(
                     content="".join(chunks),
                     model=self.model,
@@ -2045,11 +2280,14 @@ class GeminiProvider(LLMProvider):
                 last_error = exc
                 # Retry retryable mid-stream failures before surfacing a
                 # truncated partial; include accumulated tool calls when we do.
+                if _is_retryable(exc):
+                    _record_stream_breaker(breaker, success=False)
                 if _is_retryable(exc) and attempt < _MAX_RETRIES:
                     logger.warning(
                         "  [gemini] Stream interrupted after %d chars — retrying",
                         len("".join(chunks)),
                     )
+                    attempt += 1
                     continue
                 if chunks or fn_calls:
                     partial = "".join(chunks)
@@ -2117,6 +2355,55 @@ def _anthropic_message_content(content: Any) -> Any:
     return converted
 
 
+def _apply_conversation_cache_breakpoints(api_messages: list[dict[str, Any]]) -> None:
+    """Mark the stable conversation prefix for Anthropic ephemeral prompt caching.
+
+    Places a ``cache_control`` breakpoint on the last content block immediately
+    before the final substantive user turn (typically the volatile tail).
+    """
+    if len(api_messages) < 2:
+        return
+
+    last_user_idx: int | None = None
+    for i in range(len(api_messages) - 1, -1, -1):
+        msg = api_messages[i]
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str) and content.strip():
+            last_user_idx = i
+            break
+        if isinstance(content, list):
+            has_text = any(
+                isinstance(block, dict)
+                and block.get("type") == "text"
+                and str(block.get("text", "")).strip()
+                for block in content
+            )
+            if has_text:
+                last_user_idx = i
+                break
+
+    if last_user_idx is None or last_user_idx <= 0:
+        return
+
+    boundary_idx = last_user_idx - 1
+    msg = api_messages[boundary_idx]
+    content = msg.get("content")
+    marker = {"cache_control": {"type": "ephemeral"}}
+
+    if isinstance(content, str):
+        msg["content"] = [{"type": "text", "text": content, **marker}]
+    elif isinstance(content, list) and content:
+        blocks = [dict(block) if isinstance(block, dict) else block for block in content]
+        last = blocks[-1]
+        if isinstance(last, dict):
+            last = dict(last)
+            last["cache_control"] = {"type": "ephemeral"}
+            blocks[-1] = last
+        msg["content"] = blocks
+
+
 class AnthropicProvider(LLMProvider):
     name = "anthropic"
 
@@ -2125,7 +2412,12 @@ class AnthropicProvider(LLMProvider):
             raise ImportError(
                 "anthropic package not installed. Install with: pip install clawagents[anthropic]"
             )
-        self.client = _anthropic_mod.AsyncAnthropic(api_key=config.anthropic_api_key)
+        client_kwargs: dict[str, Any] = {"api_key": config.anthropic_api_key}
+        base = (getattr(config, "anthropic_base_url", None) or "").strip()
+        if base:
+            # SDK appends /v1/messages — Mantle expects …/anthropic/v1/messages.
+            client_kwargs["base_url"] = base.rstrip("/")
+        self.client = _anthropic_mod.AsyncAnthropic(**client_kwargs)
         self.model = config.anthropic_model
         self._max_tokens = config.max_tokens
         self._temperature = config.temperature
@@ -2179,6 +2471,14 @@ class AnthropicProvider(LLMProvider):
                     {"role": role, "content": _anthropic_message_content(m.content)}
                 )
 
+        try:
+            from clawagents.config.features import is_enabled as _feat_cache
+
+            if _feat_cache("cache_boundary"):
+                _apply_conversation_cache_breakpoints(api_messages)
+        except Exception:
+            pass
+
         kwargs: dict[str, Any] = {
             "model": self.model,
             "max_tokens": self._max_tokens,
@@ -2204,6 +2504,16 @@ class AnthropicProvider(LLMProvider):
         # making "temperature: 0" runs non-deterministic only on Claude.
         if self._temperature is not None and self._temperature >= 0:
             kwargs["temperature"] = self._temperature
+        schema = getattr(self, "_structured_json_schema", None)
+        if isinstance(schema, dict) and schema and not tools:
+            # Anthropic structured output suppresses tools — only apply when
+            # this turn is tool-free (matches Grok shell StructuredOutput tool path).
+            try:
+                from clawagents.structured_output import anthropic_output_format
+
+                kwargs["output_config"] = {"format": anthropic_output_format(schema)}
+            except Exception:
+                pass
         if tools:
             def _anthropic_prop(v: dict[str, Any]) -> dict[str, Any]:
                 prop: dict[str, Any] = {
@@ -2232,10 +2542,13 @@ class AnthropicProvider(LLMProvider):
             ]
 
         if not on_chunk:
+            from clawagents.circuit_breaker import breaker_key as _bk
+
             return await _with_retry(
                 "anthropic",
                 lambda: self._request_once(kwargs),
                 policy=getattr(self, "retry_policy", None),
+                breaker_tag=_bk("anthropic", model=self.model),
             )
         return await self._stream_with_retry(kwargs, on_chunk, cancel_event)
 
@@ -2271,12 +2584,31 @@ class AnthropicProvider(LLMProvider):
         cancel_event: asyncio.Event | None,
     ) -> LLMResponse:
         last_error: BaseException | None = None
+        breaker = _get_stream_breaker(
+            "anthropic",
+            model=getattr(self, "model", None) or kwargs.get("model"),
+        )
 
-        for attempt in range(_MAX_RETRIES + 1):
+        attempt = 0
+        while attempt <= _MAX_RETRIES:
             if attempt > 0:
                 delay = _jittered_delay(attempt - 1)
                 logger.warning("  [anthropic] Retry %d/%d after %.1fs", attempt, _MAX_RETRIES, delay)
                 await asyncio.sleep(delay)
+
+            try:
+                await _admit_stream_breaker(breaker)
+            except Exception as exc:
+                last_error = exc
+                try:
+                    from clawagents.circuit_breaker import BreakerOpen as _BO
+
+                    if isinstance(exc, _BO):
+                        await asyncio.sleep(max(0.05, float(exc.retry_after) or 0.05))
+                        continue
+                except Exception:
+                    pass
+                raise
 
             chunks: list[str] = []
             tool_calls: list[NativeToolCall] = []
@@ -2332,6 +2664,7 @@ class AnthropicProvider(LLMProvider):
                             if hasattr(event.usage, "output_tokens"):
                                 output_tokens = event.usage.output_tokens
 
+                _record_stream_breaker(breaker, success=True)
                 return LLMResponse(
                     content="".join(chunks),
                     model=self.model,
@@ -2348,11 +2681,14 @@ class AnthropicProvider(LLMProvider):
                 last_error = exc
                 # Retry retryable mid-stream failures before surfacing a
                 # truncated partial; include accumulated tool calls when we do.
+                if _is_retryable(exc):
+                    _record_stream_breaker(breaker, success=False)
                 if _is_retryable(exc) and attempt < _MAX_RETRIES:
                     logger.warning(
                         "  [anthropic] Stream interrupted after %d chars — retrying",
                         len("".join(chunks)),
                     )
+                    attempt += 1
                     continue
                 if chunks or tool_calls:
                     return LLMResponse(
@@ -2690,6 +3026,64 @@ def _looks_like_ollama(model_name: str) -> bool:
     return any(lower.startswith(p) for p in _OLLAMA_PREFIXES)
 
 
+def _is_mantle_url(url: str | None) -> bool:
+    """True for Amazon Bedrock Mantle (OneHUB) OpenAI-compatible hosts."""
+    return bool(url) and "bedrock-mantle." in (url or "").lower()
+
+
+def _mantle_origin(url: str) -> str:
+    """``https://bedrock-mantle.{region}.api.aws`` from any Mantle path."""
+    from urllib.parse import urlparse
+
+    raw = (url or "").strip()
+    if not raw:
+        return ""
+    if "://" not in raw:
+        raw = f"https://{raw}"
+    parsed = urlparse(raw)
+    if not parsed.netloc:
+        return ""
+    scheme = parsed.scheme or "https"
+    return f"{scheme}://{parsed.netloc}"
+
+
+def mantle_anthropic_base_url(url: str) -> str:
+    """Mantle Anthropic Messages root (SDK appends ``/v1/messages``)."""
+    origin = _mantle_origin(url)
+    return f"{origin}/anthropic" if origin else ""
+
+
+def mantle_openai_base_url(url: str) -> str:
+    """Mantle OpenAI Responses root (client appends ``/v1/responses``)."""
+    origin = _mantle_origin(url)
+    return f"{origin}/openai" if origin else ""
+
+
+def is_mantle_anthropic_model(model: str) -> bool:
+    """Claude IDs that must use Mantle ``/anthropic/v1/messages`` (not chat)."""
+    m = (model or "").strip().lower()
+    if m.startswith("bedrock/"):
+        m = m[len("bedrock/") :]
+    for prefix in ("us.", "eu.", "ap.", "global."):
+        if m.startswith(prefix):
+            m = m[len(prefix) :]
+            break
+    return m.startswith("anthropic.") or m.startswith("claude")
+
+
+def is_mantle_openai_responses_model(model: str) -> bool:
+    """Frontier OpenAI IDs on Mantle that need ``/openai/v1/responses``.
+
+    ``openai.gpt-oss-*`` stays on chat completions; GPT-5.4/5.5/5.6 do not.
+    """
+    m = (model or "").strip().lower()
+    if not m.startswith("openai."):
+        return False
+    if "gpt-oss" in m:
+        return False
+    return any(token in m for token in ("gpt-5.3", "gpt-5.4", "gpt-5.5", "gpt-5.6"))
+
+
 def create_provider(model_name: str, config: EngineConfig) -> LLMProvider:
     """Create a single LLM provider inferred from model name.
 
@@ -2722,6 +3116,34 @@ def create_provider(model_name: str, config: EngineConfig) -> LLMProvider:
             config.anthropic_model = model_id
             return BedrockProvider(config)
         return BedrockConverseProvider(config)
+
+    # ── Mantle (OneHUB): multi-path host, not one OpenAI /v1 for all ───
+    # anthropic.* → /anthropic/v1/messages; openai.gpt-5.* → /openai/v1/responses;
+    # chat-ok catalog (gpt-oss, deepseek, qwen, …) → /v1/chat/completions.
+    if config.openai_base_url and _is_mantle_url(config.openai_base_url):
+        mantle_key = config.openai_api_key or config.anthropic_api_key
+        if is_mantle_anthropic_model(model_name):
+            if mantle_key:
+                config.anthropic_api_key = mantle_key
+            config.anthropic_model = model_name
+            config.anthropic_base_url = mantle_anthropic_base_url(config.openai_base_url)
+            return AnthropicProvider(config)
+        if is_mantle_openai_responses_model(model_name):
+            rewritten = mantle_openai_base_url(config.openai_base_url)
+            if rewritten:
+                config.openai_base_url = rewritten
+            if not config.openai_api_key and mantle_key:
+                config.openai_api_key = mantle_key
+            if not config.openai_api_key:
+                config.openai_api_key = "bedrock"
+            # These models reject /v1/chat/completions even when wire_api was
+            # saved as chat_completions from an older Mantle default.
+            config.openai_wire_api = "responses"
+            config.openai_model = model_name
+            return OpenAIProvider(config)
+        # Chat-completions catalog: keep …/v1 (or normalize to it).
+        if _normalize_wire_api(config.openai_wire_api) == "auto":
+            config.openai_wire_api = "chat_completions"
 
     if lower.startswith("claude") or lower.startswith("anthropic"):
         # Bedrock Access Gateway / LiteLLM / other OpenAI-compatible proxies set

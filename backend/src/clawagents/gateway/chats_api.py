@@ -649,6 +649,9 @@ class MessageBody(_BM):
 # the running turn checks it at every safe point and aborts cleanly.
 _cancel_events: dict[str, asyncio.Event] = {}
 
+# Active turns for mid-turn interject (chat_id → run_context).
+_active_runs: dict[str, Any] = {}
+
 # Process-wide lock: serializes all chdir-protected sections so concurrent
 # turns from different chats can't see each other's cwd.
 _chdir_lock = asyncio.Lock()
@@ -680,6 +683,7 @@ def _translate_event(kind: str, data: dict) -> tuple[str, dict] | None:
         "assistant_token", "assistant_final", "tool_use", "turn_completed",
         "usage", "info", "checkpoint", "compact_progress", "file_changed",
         "ask_user_required", "warn", "tool_skipped",
+        "plan_approval_required", "stranded_interject",
     ):
         return kind, data
 
@@ -1128,12 +1132,39 @@ async def run_chat_turn(
             "agent_done", "usage", "info", "error", "warn", "tool_skipped",
             "compact_progress", "file_changed", "ask_user_required",
             "permission_required", "user_message", "turn_started",
-            "turn_completed",
+            "turn_completed", "plan_approval_required", "stranded_interject",
         }:
             on_event(kind, payload)
 
     def _on_legacy_event(kind: str, data: dict | None = None) -> None:
         _forward_legacy(kind, data)
+
+    async def _plan_approval_cb(plan_text: str, _run_context: Any) -> Any:
+        from clawagents.gateway.plan_approvals_api import get_plan_registry
+        from clawagents.permissions.plan_approval import (
+            PlanApprovalAction,
+            PlanApprovalDecision,
+        )
+
+        registry = get_plan_registry()
+        request_id = registry.create()
+        on_event(
+            "plan_approval_required",
+            {
+                "request_id": request_id,
+                "plan_text": plan_text or "",
+            },
+        )
+        try:
+            decision, comment = await registry.wait(request_id, timeout=600.0)
+        except asyncio.TimeoutError:
+            return PlanApprovalDecision(PlanApprovalAction.REJECT, comment="timeout")
+        action = {
+            "approve": PlanApprovalAction.APPROVE,
+            "request_changes": PlanApprovalAction.REQUEST_CHANGES,
+            "reject": PlanApprovalAction.REJECT,
+        }.get(decision, PlanApprovalAction.REJECT)
+        return PlanApprovalDecision(action, comment=comment or "")
 
     async def _permission_cb(payload: dict) -> str:
         tool = str(payload.get("tool") or "")
@@ -1368,6 +1399,17 @@ async def run_chat_turn(
                     agent.tools.register(_make_ask_user_tool())
                 except Exception:  # noqa: BLE001
                     pass
+                from clawagents.permissions.plan_approval import PLAN_APPROVAL_META_KEY
+                from clawagents.run_context import RunContext
+
+                run_context = RunContext()
+                if not isinstance(run_context._metadata, dict):
+                    run_context._metadata = {}
+                run_context._metadata["workspace"] = project_root
+                run_context._metadata["project_root"] = project_root
+                run_context._metadata[PLAN_APPROVAL_META_KEY] = _plan_approval_cb
+                _active_runs[chat_id] = run_context
+
                 invoke_kwargs: dict = {
                     "on_event": _on_legacy_event,
                     "session": prior_session,
@@ -1375,17 +1417,28 @@ async def run_chat_turn(
                     "session_dir": sessions_dir,
                     "permission_callback": _permission_cb,
                     "on_stream_event": _on_stream_event,
+                    "run_context": run_context,
                     # Desktop chats need persisted JSONL so GET
                     # /chats/:id/messages can replay history. The
                     # framework's default is off — opt in per turn.
                     # file_snapshots enables pre-write snapshot restore.
-                    "features": {"session_persistence": True, "file_snapshots": True},
+                    # session_rewind / hunk_watcher power /rewind.
+                    "features": {
+                        "session_persistence": True,
+                        "file_snapshots": True,
+                        "session_rewind": True,
+                        "hunk_watcher": True,
+                        "plan_approval": True,
+                        "mid_turn_interject": True,
+                    },
                 }
                 if images:
                     invoke_kwargs["images"] = images
                 if files:
                     invoke_kwargs["files"] = files
                 invoke_coro = agent.invoke(augmented_content, **invoke_kwargs)
+                result = None
+                cancelled = False
                 try:
                     if cancel_event is None:
                         result = await invoke_coro
@@ -1394,9 +1447,22 @@ async def run_chat_turn(
                             invoke_coro, cancel_event, on_event
                         )
                         if result is _CANCELLED:
-                            return
+                            cancelled = True
                 except Exception as exc:  # noqa: BLE001
                     on_event("error", {"message": str(exc)})
+                    return
+                finally:
+                    ctx = _active_runs.pop(chat_id, None)
+                    if ctx is not None:
+                        try:
+                            from clawagents.interjection import take_stranded_interjects
+
+                            stranded = take_stranded_interjects(ctx)
+                            for text in stranded:
+                                on_event("stranded_interject", {"text": text})
+                        except Exception:  # noqa: BLE001
+                            pass
+                if cancelled or result is None:
                     return
 
     status = getattr(result, "status", "unknown")
@@ -1539,6 +1605,37 @@ def cancel_chat(chat_id: str) -> dict:
     event = _cancel_events.setdefault(chat_id, asyncio.Event())
     event.set()
     return {"ok": True}
+
+
+class InterjectBody(_BM):
+    text: str
+
+
+@router.post("/chats/{chat_id}/interject")
+def interject_chat(chat_id: str, body: InterjectBody) -> dict:
+    """Queue a mid-turn redirect on the active run (VS Code parity)."""
+    _resolve_chat(chat_id)  # 404 if unknown
+    msg = (body.text or "").strip()
+    if not msg:
+        raise HTTPException(status_code=400, detail="text required")
+    ctx = _active_runs.get(chat_id)
+    if ctx is None:
+        return {"ok": False, "queued": 0, "reason": "no active turn"}
+    try:
+        from clawagents.interjection import enqueue_interject
+
+        if enqueue_interject(ctx, msg):
+            return {"ok": True, "queued": 1}
+    except Exception:  # noqa: BLE001
+        meta = getattr(ctx, "_metadata", None)
+        if isinstance(meta, dict):
+            buf = meta.get("pending_interjects")
+            if not isinstance(buf, list):
+                buf = []
+                meta["pending_interjects"] = buf
+            buf.append(msg)
+            return {"ok": True, "queued": 1}
+    return {"ok": False, "queued": 0}
 
 
 class MoveChatBody(_BM):

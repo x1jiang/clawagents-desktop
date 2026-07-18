@@ -9,10 +9,12 @@ from __future__ import annotations
 import os
 import platform
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
 from fastapi import APIRouter
+from pydantic import BaseModel
 
 from clawagents.desktop_stores.app_paths import (
     app_support_dir,
@@ -22,9 +24,42 @@ from clawagents.desktop_stores.app_paths import (
     user_templates_dir,
 )
 from clawagents.desktop_stores.project_store import ProjectStore
+from clawagents.desktop_stores.settings_store import SettingsStore
 from clawagents.gateway.desktop_router import require_auth
 
 router = APIRouter(tags=["diagnostics"], dependencies=[require_auth()])
+
+
+def _companion_payloads() -> list[dict]:
+    try:
+        from clawagents.companions import probe_companions
+
+        return [
+            {
+                "name": s.name,
+                "found": s.found,
+                "version": s.version,
+                "min_version": s.min_version,
+                "ok": s.ok_vs_floor,
+                "detail": s.summary(),
+                "path": s.path,
+                "hint": s.hint,
+            }
+            for s in probe_companions()
+        ]
+    except Exception as exc:  # noqa: BLE001
+        return [
+            {
+                "name": "companions",
+                "found": False,
+                "ok": False,
+                "detail": f"probe failed: {exc}",
+            }
+        ]
+
+
+class EnsureCompanionsBody(BaseModel):
+    force: bool = False
 
 
 def _backend_version() -> str:
@@ -103,10 +138,82 @@ def diagnostics() -> dict:
                 "git",
                 "python3",
                 "node",
+                "npm",
+                "brew",
                 "ffmpeg",
                 "pdftotext",
                 "pdftoppm",
                 "tesseract",
+                "context-mode",
+                "rtk",
             )
         },
+        "companions": _companion_payloads(),
+        "ensure_companions": bool(SettingsStore().load().ensure_companions),
+    }
+
+
+def _run_cmd(cmd: list[str], *, timeout: float = 180.0) -> dict:
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        return {
+            "cmd": cmd,
+            "ok": proc.returncode == 0,
+            "returncode": proc.returncode,
+            "stdout": (proc.stdout or "")[-4000:],
+            "stderr": (proc.stderr or "")[-4000:],
+        }
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"cmd": cmd, "ok": False, "error": str(exc)}
+
+
+@router.post("/diagnostics/ensure-companions")
+def ensure_companions(body: EnsureCompanionsBody | None = None) -> dict:
+    """Best-effort install/upgrade of context-mode + rtk (non-fatal)."""
+    force = bool(body.force) if body is not None else False
+    settings = SettingsStore().load()
+    if not force and not settings.ensure_companions:
+        return {
+            "ok": False,
+            "skipped": True,
+            "reason": "ensure_companions=false",
+            "companions": _companion_payloads(),
+        }
+
+    before = _companion_payloads()
+    actions: list[dict] = []
+    by_name = {c.get("name"): c for c in before}
+
+    cm = by_name.get("context-mode") or {}
+    if force or not cm.get("ok"):
+        npm = shutil.which("npm")
+        if npm:
+            actions.append(_run_cmd([npm, "install", "-g", "context-mode@latest"]))
+        else:
+            actions.append({"cmd": ["npm"], "ok": False, "error": "npm not found"})
+
+    rtk = by_name.get("rtk") or {}
+    if force or not rtk.get("ok"):
+        brew = shutil.which("brew")
+        if brew:
+            # upgrade when present, install when missing
+            if rtk.get("found"):
+                actions.append(_run_cmd([brew, "upgrade", "rtk"]))
+            else:
+                actions.append(_run_cmd([brew, "install", "rtk"]))
+        else:
+            actions.append({"cmd": ["brew"], "ok": False, "error": "brew not found"})
+
+    after = _companion_payloads()
+    return {
+        "ok": all(c.get("ok") for c in after if c.get("name") in ("context-mode", "rtk")),
+        "before": before,
+        "after": after,
+        "actions": actions,
     }

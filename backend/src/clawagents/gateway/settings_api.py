@@ -82,6 +82,7 @@ def _settings_payload(s) -> dict:
         "skill_ignore_dirs": list(s.skill_ignore_dirs or []),
         "skill_exclude": list(s.skill_exclude or []),
         "skill_user_homes": s.skill_user_homes,
+        "ensure_companions": s.ensure_companions,
         "has_aws_credentials": _has_aws_credentials(),
     }
 
@@ -152,6 +153,7 @@ class AppSettingsPatchBody(BaseModel):
     skill_ignore_dirs: list[str] | None = None
     skill_exclude: list[str] | None = None
     skill_user_homes: bool | None = None
+    ensure_companions: bool | None = None
 
 
 @router.patch("/settings/app")
@@ -238,6 +240,8 @@ def patch_app_settings(
         settings.skill_exclude = [str(x).strip() for x in body.skill_exclude if str(x).strip()]
     if "skill_user_homes" in sent and body.skill_user_homes is not None:
         settings.skill_user_homes = bool(body.skill_user_homes)
+    if "ensure_companions" in sent and body.ensure_companions is not None:
+        settings.ensure_companions = bool(body.ensure_companions)
     if root and requested_runtime:
         changes = {field: getattr(body, field) for field in requested_runtime}
         if "trust_custom_base_url" in requested_runtime:

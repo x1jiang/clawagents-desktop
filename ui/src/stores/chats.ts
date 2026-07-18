@@ -20,6 +20,7 @@ export type Message =
   | { kind: "assistant_message"; content: string; thinking?: string; streamRaw?: string }
   | { kind: "tool_call"; id: string; name: string; args: unknown; result?: string; success?: boolean; running: boolean; startedAt?: number; elapsedMs?: number }
   | { kind: "permission_required"; request_id: string; tool: string; file_path?: string; reason: string; resolved?: "allow_once" | "allow_always" | "deny" }
+  | { kind: "plan_approval_required"; request_id: string; plan_text: string; resolved?: "approve" | "request_changes" | "reject" }
   | { kind: "ask_user_required"; request_id: string; question: string; resolved?: boolean; answer?: string | null }
   | { kind: "file_changed"; path: string; snapshot_id?: string }
   | { kind: "checkpoint"; sha?: string; label?: string; tool?: string }
@@ -35,12 +36,14 @@ export type StreamEvent =
   | { kind: "tool_use"; id: string; name: string; args: unknown }
   | { kind: "tool_result"; tool_call_id: string; success: boolean; output: string }
   | { kind: "permission_required"; request_id: string; tool: string; file_path?: string; reason: string }
+  | { kind: "plan_approval_required"; request_id: string; plan_text: string }
   | { kind: "ask_user_required"; request_id: string; question: string }
   | { kind: "file_changed"; path: string; snapshot_id?: string }
   | { kind: "checkpoint"; sha?: string; label?: string; tool?: string; message_count?: number }
   | { kind: "compact_progress"; phase?: string; message?: string; status?: string }
   | { kind: "warn"; message?: string }
   | { kind: "tool_skipped"; name?: string; reason?: string }
+  | { kind: "stranded_interject"; text?: string }
   | { kind: "turn_completed"; status: string; iterations?: number; result?: string }
   | { kind: "usage"; input_tokens?: number; output_tokens?: number; total_tokens?: number; cached_input_tokens?: number; cache_creation_tokens?: number; model?: string }
   | { kind: "info"; message: string }
@@ -75,6 +78,7 @@ interface ChatsState {
   clearLastRunUsage: (chatId: string) => void;
   setStreaming: (chatId: string, on: boolean) => void;
   resolvePermission: (chatId: string, requestId: string, decision: "allow_once" | "allow_always" | "deny") => void;
+  resolvePlanApproval: (chatId: string, requestId: string, decision: "approve" | "request_changes" | "reject") => void;
   resolveAskUser: (chatId: string, requestId: string, answer: string | null) => void;
 }
 
@@ -189,6 +193,21 @@ export const useChats = create<ChatsState>((set) => ({
             file_path: ev.file_path,
             reason: ev.reason,
           });
+          break;
+        case "plan_approval_required":
+          current.push({
+            kind: "plan_approval_required",
+            request_id: ev.request_id,
+            plan_text: ev.plan_text || "",
+          });
+          break;
+        case "stranded_interject":
+          if (ev.text) {
+            current.push({
+              kind: "info",
+              message: `Queued after turn ended — send again to continue: ${ev.text}`,
+            });
+          }
           break;
         case "ask_user_required":
           current.push({
@@ -334,6 +353,20 @@ export const useChats = create<ChatsState>((set) => ({
       if (idx === -1) return s;
       const next = [...current];
       const p = next[idx] as Extract<Message, { kind: "permission_required" }>;
+      next[idx] = { ...p, resolved: decision };
+      return { messages: { ...s.messages, [chatId]: next } };
+    }),
+
+  resolvePlanApproval: (chatId, requestId, decision) =>
+    set((s) => {
+      const current = s.messages[chatId];
+      if (!current) return s;
+      const idx = current.findIndex(
+        (m) => m.kind === "plan_approval_required" && m.request_id === requestId,
+      );
+      if (idx === -1) return s;
+      const next = [...current];
+      const p = next[idx] as Extract<Message, { kind: "plan_approval_required" }>;
       next[idx] = { ...p, resolved: decision };
       return { messages: { ...s.messages, [chatId]: next } };
     }),

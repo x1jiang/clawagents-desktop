@@ -47,11 +47,21 @@ def create_app() -> tuple:
 
     app = FastAPI(title="ClawAgents Gateway")
 
-    cors_origins = os.getenv("GATEWAY_CORS_ORIGINS", "*").split(",")
+    cors_env = os.getenv("GATEWAY_CORS_ORIGINS")
+    if cors_env is None:
+        # Safe default: only same-origin localhost dev UIs. Defaulting to "*"
+        # let any website the operator happened to visit drive agent runs on an
+        # unauthenticated loopback gateway (a CSRF/drive-by hole).
+        cors_origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
+    else:
+        cors_origins = [o.strip() for o in cors_env.split(",") if o.strip()]
+    allow_all = cors_origins == ["*"]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[o.strip() for o in cors_origins],
-        allow_credentials=True,
+        allow_origins=cors_origins,
+        # "*" + credentials is an invalid and dangerous CORS combination; never
+        # send Allow-Credentials when a wildcard origin is configured.
+        allow_credentials=not allow_all,
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -163,20 +173,29 @@ def create_app() -> tuple:
 
             return await agent.invoke(task, on_event=on_event)
 
-        asyncio.create_task(_run())
+        run_task = asyncio.create_task(_run())
 
         async def _stream():
-            while True:
-                msg = await event_queue.get()
-                if msg is None:
-                    break
-                yield msg
+            try:
+                while True:
+                    msg = await event_queue.get()
+                    if msg is None:
+                        break
+                    yield msg
+            finally:
+                # Client disconnected (or aborted) before the turn finished:
+                # stop the agent instead of letting it run to completion in the
+                # background. The agent loop converts the resulting
+                # CancelledError into a clean terminal state.
+                if not run_task.done():
+                    run_task.cancel()
 
         return StreamingResponse(
             _stream(),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
+
 
     from clawagents.gateway.projects_api import router as _projects_router, img_router as _projects_img_router
     from clawagents.gateway.chats_api import router as _chats_router
@@ -192,6 +211,8 @@ def create_app() -> tuple:
     from clawagents.gateway.skills_api import router as _skills_router
     from clawagents.gateway.attachments_api import router as _attachments_router
     from clawagents.gateway.agent_power_api import router as _agent_power_router
+    from clawagents.gateway.rewind_api import router as _rewind_router
+    from clawagents.gateway.plan_approvals_api import router as _plan_approvals_router
 
     app.include_router(_projects_router)
     app.include_router(_projects_img_router)
@@ -208,6 +229,8 @@ def create_app() -> tuple:
     app.include_router(_skills_router)
     app.include_router(_attachments_router)
     app.include_router(_agent_power_router)
+    app.include_router(_rewind_router)
+    app.include_router(_plan_approvals_router)
 
     attach_websocket(app, llm, _GATEWAY_API_KEY)
 

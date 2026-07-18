@@ -26,6 +26,7 @@ export interface SlashContext {
   openTrash?: () => void;
   refreshChat?: () => Promise<void>;
   openCheckpoints?: () => void;
+  openRewind?: () => void;
   /** Optional list of user-defined slash commands (for /help to surface). */
   getCustomCommands?: () => Array<{ name: string; description: string }>;
   /** Optional snapshot of the chat's cumulative usage for /usage. */
@@ -150,6 +151,17 @@ export const SLASH_COMMANDS: SlashCommand[] = [
         return;
       }
       ctx.openCheckpoints();
+    },
+  },
+  {
+    name: "rewind",
+    description: "Rewind workspace files to a prior prompt snapshot",
+    run: (_args, ctx) => {
+      if (!ctx.openRewind) {
+        ctx.appendError("Rewind is not available in this context.");
+        return;
+      }
+      ctx.openRewind();
     },
   },
   {

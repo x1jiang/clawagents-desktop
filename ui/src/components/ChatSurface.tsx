@@ -25,9 +25,11 @@ import { ErrorMessage } from "./Message/ErrorMessage";
 import { InfoMessage } from "./Message/InfoMessage";
 import { ToolCall } from "./Message/ToolCall";
 import { PermissionPrompt } from "./Message/PermissionPrompt";
+import { PlanApprovalPrompt } from "./Message/PlanApprovalPrompt";
 import { AskUserPrompt } from "./Message/AskUserPrompt";
 import { AutoApproveBar } from "./AutoApproveBar";
 import { CheckpointsPanel } from "./CheckpointsPanel";
+import { RewindPanel } from "./RewindPanel";
 import { tryRunSlashCommand } from "../lib/slash_commands";
 import { useUI } from "../stores/ui";
 import { useCustomCommands } from "../stores/custom_commands";
@@ -176,6 +178,7 @@ export function ChatSurface({ projectId, chatId }: Props) {
   const [autoApprove, setAutoApprove] = useState<AutoApprove>(() => loadAutoApprove(chatId));
   const [caveman, setCaveman] = useState(() => loadCaveman(chatId));
   const [checkpointsOpen, setCheckpointsOpen] = useState(false);
+  const [rewindOpen, setRewindOpen] = useState(false);
   const [lastCheckpointTs, setLastCheckpointTs] = useState<number | undefined>();
   const [checkpointTick, setCheckpointTick] = useState(() => Date.now());
   const [compacting, setCompacting] = useState(false);
@@ -435,7 +438,22 @@ export function ChatSurface({ projectId, chatId }: Props) {
 
   async function handleSend(content: string, attachmentOverride?: ChatAttachment[]) {
     if (!client) return;
-    // Queue while a turn is in flight (VS Code queue_send parity).
+    // Mid-turn redirect (VS Code interject) — don't queue a second stream.
+    if ((streaming || abortRef.current) && !content.startsWith("/")) {
+      try {
+        const res = await client.interjectChat(chatId, content);
+        if (res.ok && res.queued > 0) {
+          clearDraft(chatId);
+          appendInfo(chatId, `Interjected: ${content.slice(0, 80)}${content.length > 80 ? "…" : ""}`);
+          return;
+        }
+      } catch {
+        /* fall through to queue */
+      }
+      sendQueueRef.current.push({ content, attachments: attachmentOverride });
+      appendInfo(chatId, `Queued: ${content.slice(0, 80)}${content.length > 80 ? "…" : ""}`);
+      return;
+    }
     if (streaming || abortRef.current) {
       sendQueueRef.current.push({ content, attachments: attachmentOverride });
       appendInfo(chatId, `Queued: ${content.slice(0, 80)}${content.length > 80 ? "…" : ""}`);
@@ -453,6 +471,7 @@ export function ChatSurface({ projectId, chatId }: Props) {
         exportChat,
         openShortcuts,
         openCheckpoints: () => setCheckpointsOpen(true),
+        openRewind: () => setRewindOpen(true),
         patchChat: async (body) => {
           await client.patchChat(chatId, body);
           if (body.mode) setMode(body.mode as ExecMode);
@@ -1028,6 +1047,21 @@ export function ChatSurface({ projectId, chatId }: Props) {
               />
             );
           }
+          if (m.kind === "plan_approval_required") {
+            return (
+              <PlanApprovalPrompt
+                key={i}
+                request_id={m.request_id}
+                plan_text={m.plan_text}
+                resolved={m.resolved}
+                onResolve={async (decision, comment) => {
+                  if (!client) return;
+                  await client.resolvePlanApproval(m.request_id, decision, comment || "");
+                  useChats.getState().resolvePlanApproval(chatId, m.request_id, decision);
+                }}
+              />
+            );
+          }
           if (m.kind === "ask_user_required") {
             return (
               <AskUserPrompt
@@ -1224,6 +1258,23 @@ export function ChatSurface({ projectId, chatId }: Props) {
         </ResizableSide>
       )}
       <CheckpointsPanel chatId={chatId} projectId={projectId} open={checkpointsOpen} onClose={() => setCheckpointsOpen(false)} />
+      <RewindPanel
+        chatId={chatId}
+        projectId={projectId}
+        open={rewindOpen}
+        onClose={() => setRewindOpen(false)}
+        onRestored={() => {
+          void (async () => {
+            if (!client) return;
+            try {
+              const replayed = await client.getChatMessages(chatId);
+              setMessages(chatId, rebuildMessages(replayed as ReplayedMessage[]));
+            } catch {
+              /* ignore */
+            }
+          })();
+        }}
+      />
     </div>
   );
 }

@@ -2,6 +2,10 @@
 
 Also stores reversible full text keyed by tool_use_id so the agent can call
 ``retrieve_tool_result`` after content crushing.
+
+Security: body paths are always derived from sanitized artifact IDs under
+``.clawagents/tool-artifacts/``. Metadata ``path`` fields are never trusted
+for reads outside that directory.
 """
 
 from __future__ import annotations
@@ -42,6 +46,35 @@ def _body_path(directory: Path, artifact_id: str) -> Path:
     return directory / f"{artifact_id}.txt"
 
 
+def _path_under_dir(directory: Path, path: Path) -> Path | None:
+    """Return resolved ``path`` only if it is a file inside ``directory``."""
+    try:
+        root = directory.resolve()
+        resolved = path.expanduser().resolve()
+        resolved.relative_to(root)
+    except (OSError, ValueError):
+        return None
+    if not resolved.is_file():
+        return None
+    return resolved
+
+
+def _body_for_meta(directory: Path, meta: dict[str, Any], meta_file: Path) -> Path | None:
+    """Resolve a readable body path for meta — ID-derived first, never escape dir."""
+    aid = _safe_id(str(meta.get("id") or meta_file.stem.replace(".meta", "")))
+    derived = _body_path(directory, aid)
+    if derived.is_file():
+        return derived
+    # Legacy absolute/relative path in meta — only if contained in the artifact dir.
+    raw = str(meta.get("path") or "").strip()
+    if not raw:
+        return None
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        candidate = directory / candidate
+    return _path_under_dir(directory, candidate)
+
+
 def store_tool_artifact(
     *,
     tool_name: str,
@@ -67,10 +100,13 @@ def store_tool_artifact(
         "kind": kind,
         "chars": len(output),
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "path": str(body),
+        # Relative name only — loaders never follow absolute paths outside dir.
+        "path": body.name,
     }
     if extra_meta:
-        meta.update(extra_meta)
+        # Drop hostile path overrides from callers.
+        extra = {k: v for k, v in extra_meta.items() if k != "path"}
+        meta.update(extra)
     _meta_path(directory, artifact_id).write_text(
         json.dumps(meta, indent=2), encoding="utf-8"
     )
@@ -94,25 +130,27 @@ def load_tool_artifact(
             meta = json.loads(meta_file.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             meta = None
-    if not body.exists():
-        # Legacy timestamped filenames — scan metas for matching id / tool_use_id
-        for candidate in directory.glob("*.meta.json"):
-            try:
-                m = json.loads(candidate.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            if m.get("id") == artifact_id or m.get("tool_use_id") == artifact_id:
-                path = Path(m.get("path") or "")
-                if path.is_file():
-                    text = path.read_text(encoding="utf-8", errors="replace")
-                    if max_chars is not None and len(text) > max_chars:
-                        text = text[:max_chars] + f"\n... [truncated at {max_chars} chars]"
-                    return True, text, m
-        return False, f"No tool artifact found for id={artifact_id!r}", None
-    text = body.read_text(encoding="utf-8", errors="replace")
-    if max_chars is not None and len(text) > max_chars:
-        text = text[:max_chars] + f"\n... [truncated at {max_chars} chars]"
-    return True, text, meta
+
+    def _read(path: Path, m: dict[str, Any] | None) -> tuple[bool, str, dict[str, Any] | None]:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if max_chars is not None and len(text) > max_chars:
+            text = text[:max_chars] + f"\n... [truncated at {max_chars} chars]"
+        return True, text, m
+
+    if body.is_file():
+        return _read(body, meta)
+
+    # Legacy / alternate ids — scan metas; body path must stay under directory.
+    for candidate in directory.glob("*.meta.json"):
+        try:
+            m = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if m.get("id") == artifact_id or m.get("tool_use_id") == artifact_id:
+            path = _body_for_meta(directory, m, candidate)
+            if path is not None:
+                return _read(path, m)
+    return False, f"No tool artifact found for id={artifact_id!r}", None
 
 
 def offload_tool_output_if_needed(
@@ -141,7 +179,7 @@ def offload_tool_output_if_needed(
         f"Artifact id: {artifact_id}\n"
         f"Tool use id: {tool_use_id}\n"
         f"Original size: {len(output)} chars\n"
-        f"Full output saved to: {artifact_path}\n"
+        f"Full output saved to: {artifact_path.name}\n"
         f"Retrieve with: retrieve_tool_result(id=\"{artifact_id}\")\n"
         f"Inline preview: first {len(preview)} chars"
     )
@@ -173,13 +211,11 @@ def search_tool_artifacts(
             meta = json.loads(meta_file.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
-        body_path = Path(meta.get("path") or "")
-        if not body_path.is_file():
-            body_path = _body_path(directory, str(meta.get("id") or meta_file.stem.replace(".meta", "")))
+        body_path = _body_for_meta(directory, meta, meta_file)
         snippet = ""
         hay = f"{meta.get('tool_name', '')} {meta.get('id', '')} {meta.get('kind', '')}".lower()
         matched = q in hay
-        if body_path.is_file():
+        if body_path is not None:
             try:
                 text = body_path.read_text(encoding="utf-8", errors="replace")
             except OSError:
@@ -207,28 +243,66 @@ def search_tool_artifacts(
     return hits
 
 
+# Aggressive in-loop crush (feature ``aggressive_tool_crush``) — tighter than
+# the default Headroom-inspired thresholds so large tool dumps never linger
+# in the prompt waiting for a hook or model-chosen ctx_* call.
+_AGGRESSIVE_CRUSH_THRESHOLD = 1_200
+_AGGRESSIVE_TARGET_CHARS = 2_000
+_AGGRESSIVE_INLINE_LIMIT = 6_000
+
+
 def prepare_tool_output_for_context(
     *,
     tool_name: str,
     tool_use_id: str,
     output: str,
     workspace: str | Path | None = None,
-    crush_threshold: int = 2_000,
-    inline_limit: int = DEFAULT_INLINE_CHARS,
+    crush_threshold: int | None = None,
+    inline_limit: int | None = None,
+    target_chars: int | None = None,
 ) -> tuple[str, Optional[str]]:
     """Crush oversized outputs and store full text when crushed or huge.
 
     Returns ``(prompt_text, artifact_id_or_None)``.
+
+    When ``CLAW_FEATURE_AGGRESSIVE_TOOL_CRUSH=1`` (default), uses tighter
+    thresholds unless the caller overrides ``crush_threshold`` /
+    ``inline_limit`` / ``target_chars``.
     """
     if not isinstance(output, str):
         output = str(output)
 
+    thresh = crush_threshold
+    inline = inline_limit
+    target = target_chars
+    try:
+        from clawagents.config.features import is_enabled
+
+        if is_enabled("aggressive_tool_crush"):
+            if thresh is None:
+                thresh = _AGGRESSIVE_CRUSH_THRESHOLD
+            if inline is None:
+                inline = _AGGRESSIVE_INLINE_LIMIT
+            if target is None:
+                target = _AGGRESSIVE_TARGET_CHARS
+    except Exception:
+        pass
+    if thresh is None:
+        thresh = 2_000
+    if inline is None:
+        inline = DEFAULT_INLINE_CHARS
+    if target is None:
+        target = 3_500
+
     crush: CrushResult = crush_tool_output(
-        output, tool_name=tool_name, threshold=crush_threshold
+        output,
+        tool_name=tool_name,
+        threshold=thresh,
+        target_chars=target,
     )
 
     # Always store when we crushed or when still over inline limit.
-    need_store = crush.did_crush or len(output) > inline_limit
+    need_store = crush.did_crush or len(output) > inline
     artifact_id: str | None = None
     if need_store:
         artifact_id, _path = store_tool_artifact(
@@ -243,7 +317,7 @@ def prepare_tool_output_for_context(
             },
         )
 
-    if not crush.did_crush and len(output) <= inline_limit:
+    if not crush.did_crush and len(output) <= inline:
         return output, artifact_id
 
     if crush.did_crush and artifact_id:
@@ -259,7 +333,7 @@ def prepare_tool_output_for_context(
     preview = output[:preview_chars]
     omitted = max(0, len(output) - len(preview))
     aid = artifact_id or tool_use_id
-    inline = (
+    stub = (
         "[Tool output truncated]\n"
         f"Tool: {tool_name}\n"
         f"Artifact id: {aid}\n"
@@ -268,7 +342,7 @@ def prepare_tool_output_for_context(
         f"Inline preview: first {len(preview)} chars"
     )
     if omitted:
-        inline += f" ({omitted} chars omitted)"
+        stub += f" ({omitted} chars omitted)"
     if preview:
-        inline += f"\n\nPreview:\n{preview}"
-    return inline, artifact_id
+        stub += f"\n\nPreview:\n{preview}"
+    return stub, artifact_id

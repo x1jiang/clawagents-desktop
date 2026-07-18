@@ -51,6 +51,9 @@ class Skill:
     # Claude Code / openclaw `disable-model-invocation`: keep the skill out of
     # the model-facing catalog and refuse use_skill (user-invocation only).
     disable_model_invocation: bool = False
+    # Grok-style routing: when to invoke + path globs that unlock the skill.
+    when_to_use: str = ""
+    paths: List[str] = field(default_factory=list)
 
     @property
     def base_dir(self) -> str:
@@ -175,7 +178,35 @@ def _fallback_description(body: str) -> str:
 
 def _parse_inline_list(raw: str) -> List[str]:
     cleaned = re.sub(r'[\[\]"\']', "", raw)
-    return [x.strip() for x in re.split(r"[\s,]+", cleaned) if x.strip()]
+    # Drop YAML list bullets left over from `allowed-tools: - Bash` / bad parses.
+    return [
+        x.strip()
+        for x in re.split(r"[\s,]+", cleaned)
+        if x.strip() and x.strip() != "-"
+    ]
+
+
+# Claude Code / Codex skill frontmatter → clawagents tool names.
+_ALLOWED_TOOL_ALIASES: dict[str, str] = {
+    "bash": "execute",
+    "shell": "execute",
+    "run": "execute",
+    "read": "read_file",
+    "write": "write_file",
+    "edit": "edit_file",
+    "multiedit": "edit_file",
+    "grep": "grep",
+    "glob": "glob",
+    "ls": "list_dir",
+    "listdir": "list_dir",
+    "agent": "task",
+    "task": "task",
+    "askuserquestion": "ask_user",
+    "askuser": "ask_user",
+    "websearch": "web_search",
+    "webfetch": "web_fetch",
+    "notebookedit": "edit_file",
+}
 
 
 def _parse_requires_block(yaml_content: str) -> Tuple[Optional[str], Optional[List[str]], Optional[List[str]]]:
@@ -276,6 +307,8 @@ def parse_skill_file(content: str, file_path: str) -> Skill:
     workflow_steps: List[str] = []
     warnings: List[str] = []
     disable_model_invocation = False
+    when_to_use = ""
+    paths: List[str] = []
 
     # Closing `---` may sit at EOF (no trailing newline / empty body).
     frontmatter_match = re.match(
@@ -293,11 +326,29 @@ def parse_skill_file(content: str, file_path: str) -> Skill:
 
         description = _parse_frontmatter_description(yaml_content)
 
-        # Parse allowed-tools: space/comma-delimited string (optionally YAML-ish
-        # brackets/quotes, consistent with requires list parsing).
-        tools_match = re.search(r"^allowed-tools:\s*(.*)$", yaml_content, re.MULTILINE)
-        if tools_match:
-            allowed_tools = _parse_inline_list(tools_match.group(1))
+        # Parse allowed-tools: YAML block list (`- Bash`) or inline list.
+        # IMPORTANT: do not use `\s*` after the colon — it eats the newline and
+        # turns the first bullet into the bogus tokens "-", "Bash".
+        allowed_tools = None
+        block_tools = re.search(
+            r"^allowed-tools:[ \t]*\n((?:[ \t]+-[^\n]*\n?)+)",
+            yaml_content,
+            re.MULTILINE,
+        )
+        if block_tools:
+            allowed_tools = [
+                item.strip().strip("\"'")
+                for item in re.findall(
+                    r"^[ \t]+-\s+(.+)$", block_tools.group(1), re.MULTILINE
+                )
+                if item.strip().strip("\"'")
+            ]
+        else:
+            tools_match = re.search(
+                r"^allowed-tools:[ \t]*(.+)$", yaml_content, re.MULTILINE
+            )
+            if tools_match:
+                allowed_tools = _parse_inline_list(tools_match.group(1))
 
         # Only the literal true counts (Claude Code boolean parsing rule).
         dmi_match = re.search(
@@ -306,6 +357,13 @@ def parse_skill_file(content: str, file_path: str) -> Skill:
             re.MULTILINE,
         )
         disable_model_invocation = bool(dmi_match)
+        # Grok / Claude: user-invocable: false ≡ model must not invoke.
+        if re.search(
+            r"^user-invocable:\s*[\"']?false[\"']?\s*$",
+            yaml_content,
+            re.MULTILINE | re.IGNORECASE,
+        ):
+            disable_model_invocation = True
 
         req_os, req_bins, req_env = _parse_requires_block(yaml_content)
         if req_os or req_bins or req_env:
@@ -390,8 +448,45 @@ def parse_skill_file(content: str, file_path: str) -> Skill:
         if ws_items is not None:
             workflow_steps = ws_items
 
+        when_items = _parse_phrase_list("when-to-use") or _parse_phrase_list("when_to_use")
+        if when_items:
+            when_to_use = "; ".join(when_items)
+        else:
+            when_inline = re.search(
+                r"^when-to-use:\s*[\"']?(.+?)[\"']?\s*$",
+                yaml_content,
+                re.MULTILINE | re.IGNORECASE,
+            ) or re.search(
+                r"^when_to_use:\s*[\"']?(.+?)[\"']?\s*$",
+                yaml_content,
+                re.MULTILINE | re.IGNORECASE,
+            )
+            if when_inline:
+                when_to_use = when_inline.group(1).strip()
+
+        path_items = _parse_block_list("paths", yaml_content)
+        if path_items is not None:
+            paths = path_items
+        else:
+            paths = _parse_phrase_list("paths")
+
     if not description:
         description = _fallback_description(body)
+
+    # Peel "Use when …" out of description when frontmatter omitted when-to-use.
+    try:
+        from clawagents.config.features import is_enabled as _feat_on
+        from clawagents.skills.strategy import extract_when_to_use_from_description
+
+        if _feat_on("skill_when_to_use") and not when_to_use:
+            cleaned, extracted = extract_when_to_use_from_description(description)
+            if extracted:
+                when_to_use = extracted
+                if cleaned:
+                    description = cleaned
+    except Exception:
+        pass
+
     if len(description) > MAX_SKILL_DESCRIPTION_LENGTH:
         warnings.append(
             f"description exceeds {MAX_SKILL_DESCRIPTION_LENGTH} chars; truncated"
@@ -415,6 +510,8 @@ def parse_skill_file(content: str, file_path: str) -> Skill:
         workflow_steps=workflow_steps,
         warnings=warnings,
         disable_model_invocation=disable_model_invocation,
+        when_to_use=when_to_use,
+        paths=paths,
     )
 
 
@@ -620,6 +717,96 @@ class SkillStore:
             reused_files=0,
             collisions=(),
         )
+        # Session bag for path-gated skills (updated by agent loop / tools).
+        self.session_touched_paths: List[str] = []
+        self._dir_mtime_sig: Optional[tuple] = None
+        self._known_skill_names: set[str] = set()
+        self._discovery_seeded = False
+
+    def note_touched_path(self, path: str | None) -> None:
+        if not path:
+            return
+        normalized = str(path).replace("\\", "/").strip()
+        if not normalized:
+            return
+        if normalized not in self.session_touched_paths:
+            self.session_touched_paths.append(normalized)
+            if len(self.session_touched_paths) > 200:
+                del self.session_touched_paths[:-200]
+
+    def _skill_dir_mtime_sig(self) -> tuple:
+        sig: list[tuple[str, int]] = []
+        for d in self.skill_dirs:
+            p = Path(d)
+            if not p.exists():
+                continue
+            try:
+                sig.append((str(p.resolve()), int(p.stat().st_mtime_ns)))
+            except OSError:
+                continue
+            try:
+                for child in p.iterdir():
+                    if child.name.startswith("."):
+                        continue
+                    skill_md = child / "SKILL.md" if child.is_dir() else None
+                    if skill_md is not None and skill_md.exists():
+                        sig.append(
+                            (str(skill_md.resolve()), int(skill_md.stat().st_mtime_ns))
+                        )
+                    elif child.is_file() and child.suffix.lower() == ".md":
+                        sig.append((str(child.resolve()), int(child.stat().st_mtime_ns)))
+            except OSError:
+                continue
+            self_skill = p / "SKILL.md"
+            if self_skill.exists():
+                try:
+                    sig.append(
+                        (str(self_skill.resolve()), int(self_skill.stat().st_mtime_ns))
+                    )
+                except OSError:
+                    pass
+        return tuple(sorted(sig))
+
+    def maybe_hot_reload(self) -> bool:
+        """Rescan skill dirs when mtimes change. Returns True if reloaded."""
+        from clawagents.config.features import is_enabled
+
+        if not is_enabled("skill_hot_reload"):
+            return False
+        sig = self._skill_dir_mtime_sig()
+        if self._dir_mtime_sig is None:
+            self._dir_mtime_sig = sig
+            return False
+        if sig == self._dir_mtime_sig:
+            return False
+        self._rescan()
+        return True
+
+    def consume_discovery_announcement(self) -> str:
+        """One-shot notice for skills that appeared after the initial load."""
+        current = {
+            s.name
+            for s in self.list()
+            if not getattr(s, "disable_model_invocation", False)
+        }
+        if not self._discovery_seeded:
+            self._known_skill_names = set(current)
+            self._discovery_seeded = True
+            return ""
+        new = sorted(current - self._known_skill_names)
+        self._known_skill_names = set(current)
+        if not new:
+            return ""
+        shown = new[:12]
+        lines = ["### Newly available skills"]
+        lines.extend(f"- `{name}`" for name in shown)
+        if len(new) > len(shown):
+            lines.append(f"- …and {len(new) - len(shown)} more (use `list_skills`)")
+        return "\n".join(lines)
+
+    def reload(self) -> CatalogSnapshot:
+        """Synchronous full rescan (workshop apply / hot reload)."""
+        return self._rescan()
 
     @property
     def diagnostics(self) -> CatalogSnapshot:
@@ -716,7 +903,7 @@ class SkillStore:
         self.ineligible.pop(skill.name, None)
         self.quarantined.pop(skill.name, None)
 
-    async def load_all(self):
+    def _rescan(self) -> CatalogSnapshot:
         started = time.perf_counter()
         self.skills.clear()
         self.ineligible.clear()
@@ -789,6 +976,12 @@ class SkillStore:
             reused_files=self._reused_files,
             collisions=tuple(dict.fromkeys(self._collisions)),
         )
+        self._dir_mtime_sig = self._skill_dir_mtime_sig()
+        return self.catalog_snapshot
+
+    async def load_all(self):
+        self._rescan()
+        return self.catalog_snapshot
 
     def list(self) -> List[Skill]:
         """Model-invocable skills (feeds the catalog and skill tools)."""
@@ -972,6 +1165,14 @@ def create_skill_tools(
                 "description": "Required content hash for continuation pages",
                 "required": False,
             },
+            "arguments": {
+                "type": "string",
+                "description": (
+                    "Optional free-form arguments substituted into $ARGUMENTS / $N "
+                    "placeholders in the skill body"
+                ),
+                "required": False,
+            },
         }
 
         async def execute(self, args: Dict[str, Any], run_context: Any = None) -> ToolResult:
@@ -1029,6 +1230,7 @@ def create_skill_tools(
             effective_allowed_tools = (
                 list(skill.allowed_tools) if skill.allowed_tools is not None else None
             )
+            skill_unknown_tools: list[str] = []
             if effective_allowed_tools is not None:
                 control_keys = {_norm_skill_key("use_skill"), _norm_skill_key("list_skills")}
                 if available_tool_names is not None:
@@ -1039,15 +1241,25 @@ def create_skill_tools(
                     canonical: list[str] = []
                     unknown: list[str] = []
                     for declared in effective_allowed_tools:
-                        key = _norm_skill_key(declared)
+                        raw = declared.strip()
+                        if not raw or raw == "-":
+                            continue
+                        # Claude-style "Bash(git *)" → outer tool name only.
+                        if "(" in raw and raw.endswith(")"):
+                            raw = raw.split("(", 1)[0].strip()
+                        key = _norm_skill_key(raw)
                         if key in control_keys:
                             continue
+                        alias = _ALLOWED_TOOL_ALIASES.get(key)
+                        if alias is not None:
+                            key = _norm_skill_key(alias)
                         resolved = available_map.get(key)
                         if resolved is None:
                             unknown.append(declared)
                         elif resolved not in canonical:
                             canonical.append(resolved)
-                    if unknown:
+                    if unknown and not canonical:
+                        # Nothing mapped — hard fail (keeps bogus-tool regression).
                         return ToolResult(
                             success=False,
                             output="",
@@ -1056,12 +1268,16 @@ def create_skill_tools(
                                 + ", ".join(unknown)
                             ),
                         )
+                    # Claude skills often declare Agent/WebSearch/… — keep what
+                    # we know and note the rest so the agent can adapt.
                     effective_allowed_tools = canonical
+                    skill_unknown_tools = unknown
                 else:
                     effective_allowed_tools = [
                         tool_name
                         for tool_name in effective_allowed_tools
                         if _norm_skill_key(tool_name) not in control_keys
+                        and tool_name.strip() not in ("", "-")
                     ]
 
             parts = [f"# Skill: {skill.name}"]
@@ -1069,6 +1285,11 @@ def create_skill_tools(
                 parts.append(
                     "Active allowed-tools boundary: "
                     + (", ".join(effective_allowed_tools) or "no data-plane tools")
+                )
+            if skill_unknown_tools:
+                parts.append(
+                    "Note: ignored host-only allowed-tools (no clawagents equivalent): "
+                    + ", ".join(skill_unknown_tools)
                 )
             # Resources referenced by the skill body (scripts/…, references/…)
             # resolve relative to this directory — without it the agent cannot
@@ -1099,7 +1320,29 @@ def create_skill_tools(
                 for i, step in enumerate(skill.workflow_steps, 1):
                     parts.append(f"{i}. {step}")
 
-            parts.append(f"\n{skill.content}")
+            body = skill.content
+            try:
+                from clawagents.config.features import is_enabled as _feat_on
+                from clawagents.skills.strategy import apply_skill_substitutions
+
+                if _feat_on("skill_substitutions"):
+                    session_id = None
+                    if run_context is not None:
+                        session_id = getattr(run_context, "session_id", None) or (
+                            run_context._metadata.get("session_id")
+                            if isinstance(getattr(run_context, "_metadata", None), dict)
+                            else None
+                        )
+                    body = apply_skill_substitutions(
+                        body,
+                        skill_dir=skill.base_dir,
+                        arguments=args.get("arguments"),
+                        session_id=str(session_id) if session_id else None,
+                    )
+            except Exception:
+                body = skill.content
+
+            parts.append(f"\n{body}")
             rendered = "\n".join(parts)
             content_hash = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
             try:

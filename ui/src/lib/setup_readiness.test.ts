@@ -62,6 +62,30 @@ describe("setup readiness", () => {
       { openai: "sk-test" },
     );
 
-    expect(ready.map((item) => item.status)).toEqual(["ready", "ready", "ready"]);
+    expect(ready.map((item) => item.status)).toEqual(["ready", "ready", "ready", "warning"]);
+  });
+
+  test("marks companions ready when floors are met", () => {
+    const ready = buildSetupReadiness(
+      {
+        ...diagnostics,
+        counts: { ...diagnostics.counts, projects: 1 },
+        companions: [
+          { name: "context-mode", found: true, ok: true, detail: "ok" },
+          { name: "rtk", found: true, ok: true, detail: "ok" },
+        ],
+        external_tools: {
+          ...diagnostics.external_tools,
+          pdftotext: true,
+          pdftoppm: true,
+          tesseract: true,
+          "context-mode": true,
+          rtk: true,
+        },
+      },
+      providers,
+      { openai: "sk-test" },
+    );
+    expect(ready.find((item) => item.id === "companions")?.status).toBe("ready");
   });
 });

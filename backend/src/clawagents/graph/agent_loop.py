@@ -22,9 +22,11 @@ Efficiency features (learned from deepagents/openclaw):
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import logging
+import os
 import re
 import signal
 import sys
@@ -56,6 +58,10 @@ from clawagents.stream_events import (
 from clawagents.context.carryover import get_compaction_carryover
 from clawagents.handoffs import Handoff, HandoffInputData
 from clawagents.prompts import build_system_prompt
+from clawagents.tokenizer import (
+    count_messages_tokens as _count_messages_tokens,
+    count_tokens_content,
+)
 from clawagents.tracing import handoff_span
 
 logger = logging.getLogger(__name__)
@@ -173,11 +179,13 @@ def _create_content_preview(content: str, head_lines: int = 5, tail_lines: int =
                 + f"\n... [{len(content) - _PREVIEW_MAX_CHARS} chars truncated] ...\n"
                 + content[-half:])
 
-    head = "\n".join(f"{i + 1}: {l}" for i, l in enumerate(lines[:head_lines]))
+    head = "\n".join(
+        f"{i + 1}: {line}" for i, line in enumerate(lines[:head_lines])
+    )
     total = len(lines)
     tail = "\n".join(
-        f"{total - tail_lines + i + 1}: {l}"
-        for i, l in enumerate(lines[-tail_lines:])
+        f"{total - tail_lines + i + 1}: {line}"
+        for i, line in enumerate(lines[-tail_lines:])
     )
     omitted = total - head_lines - tail_lines
     return f"{head}\n... [{omitted} lines truncated] ...\n{tail}"
@@ -588,8 +596,6 @@ Keep working until the task is fully complete.
 # ─── Adaptive Token Estimation (learned from deepagents) ──────────────────
 # Now uses tiktoken for accurate BPE counting (with fallback to heuristic).
 
-from clawagents.tokenizer import count_tokens_content, count_messages_tokens as _count_messages_tokens
-
 # Keep _CHARS_PER_TOKEN for the Tier-3 preflight char-budget calculation only
 _CHARS_PER_TOKEN = 4
 
@@ -598,8 +604,19 @@ def _estimate_tokens(content: str | list[dict], multiplier: float = 1.0, model: 
     return count_tokens_content(content, model=model, multiplier=multiplier)
 
 
-def _estimate_messages_tokens(messages: list[LLMMessage], multiplier: float = 1.0, model: str | None = None) -> int:
-    return _count_messages_tokens(messages, model=model, multiplier=multiplier)
+def _estimate_messages_tokens(
+    messages: list[LLMMessage],
+    multiplier: float = 1.0,
+    model: str | None = None,
+    *,
+    cached_system_tokens: int | None = None,
+) -> int:
+    return _count_messages_tokens(
+        messages,
+        model=model,
+        multiplier=multiplier,
+        cached_system_tokens=cached_system_tokens,
+    )
 
 
 # ─── Tool Argument Truncation in Old Messages (learned from deepagents) ───
@@ -1029,11 +1046,29 @@ def _post_tool_side_effects(
     tool_output: str | list[dict[str, Any]],
     *,
     emit: OnEvent,
+    run_context: RunContext | None = None,
 ) -> str | list[dict[str, Any]]:
     """Ledger / shadow-checkpoint / auto-verify after a tool completes."""
     from clawagents.config.features import is_enabled
 
     out = tool_output
+    try:
+        if success:
+            path = None
+            if isinstance(args, dict):
+                path = args.get("path") or args.get("file_path") or args.get("file")
+            if path:
+                from clawagents.skills.strategy import note_touched_path
+
+                note_touched_path(run_context, str(path))
+                store = None
+                if run_context is not None and isinstance(run_context._metadata, dict):
+                    store = run_context._metadata.get("skill_store")
+                if store is not None and hasattr(store, "note_touched_path"):
+                    store.note_touched_path(str(path))
+    except Exception:
+        logger.debug("skill path touch tracking failed", exc_info=True)
+
     try:
         if success and is_enabled("context_ledger"):
             from clawagents.memory.context_ledger import maybe_record_from_tool_result
@@ -1377,6 +1412,194 @@ async def _summarize_chunk(
     raise RuntimeError("Summarization returned empty")
 
 
+def _content_key_text(content: Any) -> str:
+    """Stable text stand-in for message content (compaction input + reuse keys).
+
+    Multimodal list content must not go through ``str()`` — that dumps the
+    full base64 data URL (megabytes) into the summarizer prompt. Join the
+    real text parts and replace each image with a short digest placeholder;
+    the digest keeps reuse keys distinct per distinct image so compaction's
+    original-message reuse can't swap two same-text messages.
+    """
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content)
+    parts: list[str] = []
+    for p in content:
+        if not isinstance(p, dict):
+            continue
+        if p.get("type") == "text":
+            parts.append(str(p.get("text", "") or ""))
+        elif p.get("type") in ("image_url", "image"):
+            digest = hashlib.sha1(
+                json.dumps(p, sort_keys=True, default=str).encode("utf-8")
+            ).hexdigest()[:8]
+            parts.append(f"[image attachment #{digest}]")
+        elif p.get("type") in ("file", "document"):
+            digest = hashlib.sha1(
+                json.dumps(p, sort_keys=True, default=str).encode("utf-8")
+            ).hexdigest()[:8]
+            parts.append(f"[file attachment #{digest}]")
+    return "\n".join(parts)
+
+
+def _is_compactable_user(msg: LLMMessage) -> bool:
+    if msg.role != "user":
+        return False
+    content = msg.content if isinstance(msg.content, str) else ""
+    if content.startswith("[Tool Result]"):
+        return False
+    if "Compacted History" in content:
+        return False
+    if content.startswith("This session is being continued"):
+        return False
+    return True
+
+
+_FILE_PATH_RE = re.compile(
+    r"""(?:write_file|edit_file|apply_patch|read_file)[^\"']*[\"']([^\"']+)[\"']"""
+    r"""|path[\"']?\s*[:=]\s*[\"']([^\"']+)[\"']""",
+    re.I,
+)
+
+
+def _extract_recent_files(messages: list[LLMMessage], *, limit: int = 12) -> list[str]:
+    found: list[str] = []
+    seen: set[str] = set()
+    for m in messages:
+        blob = ""
+        if isinstance(m.content, str):
+            blob = m.content
+        if getattr(m, "tool_calls_meta", None):
+            try:
+                blob += " " + json.dumps(m.tool_calls_meta, default=str)
+            except TypeError:
+                pass
+        for match in _FILE_PATH_RE.finditer(blob):
+            path = next((g for g in match.groups() if g), None)
+            if not path or path in seen:
+                continue
+            if any(ch in path for ch in ("\n", " ")):
+                continue
+            seen.add(path)
+            found.append(path)
+            if len(found) >= limit:
+                return found
+    return found
+
+
+def _reuse_messages_where_possible(
+    originals: list[LLMMessage],
+    rebuilt: list[LLMMessage],
+) -> list[LLMMessage]:
+    """Prefer original LLMMessage object identity when (role, content) match.
+
+    Required for session-persistence trackers that key off identity.
+    """
+    buckets: dict[tuple[str, str], list[LLMMessage]] = {}
+    for om in originals:
+        key = (om.role, _content_key_text(om.content))
+        buckets.setdefault(key, []).append(om)
+    out: list[LLMMessage] = []
+    for m in rebuilt:
+        key = (m.role, _content_key_text(m.content))
+        bucket = buckets.get(key)
+        if bucket:
+            out.append(bucket.pop())
+        else:
+            out.append(m)
+    return out
+
+
+def _goal_llm_complete(run_context: Any, llm: LLMProvider):
+    """Bind a prompt→text callable for goal planner/verifier/strategist."""
+
+    async def _complete(prompt: str) -> str:
+        meta = getattr(run_context, "_metadata", None) if run_context else None
+        if isinstance(meta, dict) and callable(meta.get("goal_llm_complete")):
+            return await meta["goal_llm_complete"](prompt)
+        resp = await llm.chat([LLMMessage(role="user", content=prompt)])
+        return str(getattr(resp, "content", "") or "")
+
+    return _complete
+
+
+def _drain_interject(run_context: Any) -> str | None:
+    """Legacy single-string drain — prefer :func:`drain_interject_messages`."""
+    from clawagents.interjection import drain_interjects
+
+    parts = drain_interjects(run_context)
+    if not parts:
+        return None
+    # Compat: join only if caller expects one blob (prefer multi-message path).
+    return parts[0] if len(parts) == 1 else "\n\n".join(parts)
+
+
+def _drain_interject_messages(run_context: Any) -> list[LLMMessage]:
+    """Each pending interject → one standalone synthetic user turn (Grok parity)."""
+    from clawagents.interjection import drain_interjects
+
+    return [LLMMessage(role="user", content=text) for text in drain_interjects(run_context)]
+
+
+_GOAL_REMINDER_START = "\n\n<!--claw:goal-reminder-->\n"
+_GOAL_REMINDER_END = "\n<!--/claw:goal-reminder-->"
+
+
+def _strip_goal_reminder(system_content: str) -> str:
+    if not isinstance(system_content, str):
+        return system_content
+    start = system_content.find("<!--claw:goal-reminder-->")
+    if start < 0:
+        # Legacy unwrapped block from first-turn injection
+        marker = "\n## Active Goal\n"
+        idx = system_content.find(marker)
+        if idx < 0:
+            return system_content
+        return system_content[:idx].rstrip()
+    # Include any blank lines immediately before the marker
+    while start > 0 and system_content[start - 1] == "\n":
+        start -= 1
+        if start > 0 and system_content[start - 1] == "\n":
+            break
+    end = system_content.find("<!--/claw:goal-reminder-->", start)
+    if end < 0:
+        return system_content[:start].rstrip()
+    end += len("<!--/claw:goal-reminder-->")
+    return (system_content[:start] + system_content[end:]).rstrip()
+
+
+def _sync_goal_reminder_into_system(
+    messages: list[LLMMessage],
+    run_context: Any,
+) -> None:
+    """Keep Active Goal standing reminder fresh when start_goal runs mid-loop."""
+    if not messages or getattr(messages[0], "role", None) != "system":
+        return
+    content = messages[0].content
+    if not isinstance(content, str):
+        return
+    try:
+        from clawagents.config.features import is_enabled as _feat_goal_sys
+        from clawagents.goal import get_goal_tracker, goal_system_reminder
+
+        meta = getattr(run_context, "_metadata", None)
+        if not (isinstance(meta, dict) and meta.get("goal_mode")):
+            return
+        if not _feat_goal_sys("goal_autopilot"):
+            return
+        tracker = get_goal_tracker(run_context)
+        rem = goal_system_reminder(tracker.state if tracker else None)
+    except Exception:
+        return
+    base = _strip_goal_reminder(content)
+    if rem:
+        messages[0].content = base + _GOAL_REMINDER_START + rem + _GOAL_REMINDER_END
+    else:
+        messages[0].content = base
+
+
 async def _compact_if_needed(
     messages: list[LLMMessage],
     context_window: int,
@@ -1387,6 +1610,7 @@ async def _compact_if_needed(
     run_context: Optional[RunContext] = None,
     fire_hook: Optional[Callable[..., Any]] = None,
     savings_history: list[float] | None = None,
+    taxonomy_dispatcher: Any | None = None,
 ) -> list[LLMMessage]:
     messages = _truncate_old_tool_args(messages)
 
@@ -1439,6 +1663,66 @@ async def _compact_if_needed(
         emit("context", {"message": "compacted oversized tool results before summarization"})
     current_tokens = _estimate_messages_tokens(messages, token_multiplier)
 
+    # Pre-compaction memory flush (Grok memory_flush)
+    try:
+        from clawagents.config.features import is_enabled as _feat_flush
+        from clawagents.memory.memory_flush import should_flush, run_memory_flush
+
+        cycle = 0
+        if run_context is not None and isinstance(run_context._metadata, dict):
+            cycle = int(run_context._metadata.get("compaction_cycle") or 0)
+        ws = None
+        if run_context is not None and isinstance(run_context._metadata, dict):
+            ws = run_context._metadata.get("workspace")
+        if _feat_flush("memory_flush") and should_flush(
+            current_tokens, budget, compaction_cycle=cycle, workspace=ws
+        ):
+            async def _flush_llm(prompt: str) -> str:
+                resp = await llm.chat([LLMMessage(role="user", content=prompt)])
+                return str(getattr(resp, "content", "") or "")
+
+            flush_out = await run_memory_flush(
+                messages, _flush_llm, workspace=ws, compaction_cycle=cycle
+            )
+            emit(
+                "context",
+                {
+                    "message": (
+                        f"memory flush: {flush_out.status}"
+                        + (f" ({flush_out.detail})" if flush_out.detail else "")
+                    )
+                },
+            )
+            if run_context is not None and isinstance(run_context._metadata, dict):
+                run_context._metadata["compaction_cycle"] = cycle + 1
+    except Exception:
+        logger.debug("memory flush failed", exc_info=True)
+
+    # Prefire / two-pass: summarize before the hard cliff (Grok two_pass).
+    try:
+        from clawagents.config.features import is_enabled as _feat_prefire
+
+        prefire_ratio = 0.85
+        if (
+            _feat_prefire("prefire_compaction")
+            and current_tokens > int(budget * prefire_ratio)
+            and current_tokens <= budget
+        ):
+            emit(
+                "context",
+                {
+                    "message": (
+                        f"prefire compaction ~{current_tokens}/{budget} "
+                        f"(>{int(prefire_ratio * 100)}% headroom)"
+                    )
+                },
+            )
+            # Force into the compaction path below by pretending we're over budget
+            # only for the summarize stage — callers still see a successful shrink.
+            current_tokens = budget + 1
+    except Exception:
+        logger.debug("prefire compaction probe failed", exc_info=True)
+
     if current_tokens <= budget:
         return messages
 
@@ -1457,6 +1741,24 @@ async def _compact_if_needed(
         except Exception:
             logger.debug("on_pre_compact hook failed", exc_info=True)
 
+    if taxonomy_dispatcher is not None:
+        try:
+            from clawagents.hooks.external import dispatch_taxonomy_hook
+            from clawagents.hooks.taxonomy import HookEvent
+
+            await dispatch_taxonomy_hook(
+                taxonomy_dispatcher,
+                HookEvent.PRE_COMPACT,
+                {
+                    "message_count": len(messages),
+                    "current_tokens": current_tokens,
+                    "budget": budget,
+                },
+                blocking=False,
+            )
+        except Exception:
+            logger.debug("taxonomy pre_compact hook failed", exc_info=True)
+
     system_msgs: list[LLMMessage] = []
     non_system: list[LLMMessage] = []
     for m in messages:
@@ -1465,6 +1767,172 @@ async def _compact_if_needed(
     if len(non_system) <= _RECENT_MESSAGES_TO_KEEP:
         return messages
 
+    # ── Grok-style full-replace (preferred when enabled) ───────────────
+    try:
+        from clawagents.config.features import is_enabled as _feat
+
+        if _feat("full_replace_compaction"):
+            from clawagents.memory.full_replace_compaction import (
+                apply_full_replace_compaction,
+                build_state_reminder,
+            )
+            from clawagents.context.carryover import (
+                get_compaction_carryover,
+                set_compaction_carryover,
+            )
+
+            workspace = None
+            if run_context is not None:
+                ws = run_context._metadata.get("workspace")
+                if isinstance(ws, str):
+                    workspace = ws
+            if not workspace:
+                workspace = os.getcwd()
+
+            # Auto-enrich carryover from transcript signals when host didn't set it
+            try:
+                task_focus = ""
+                for m in non_system:
+                    if m.role == "user" and isinstance(m.content, str) and _is_compactable_user(m):
+                        task_focus = m.content[:500]
+                        break
+                recent_files = _extract_recent_files(non_system)
+                existing = get_compaction_carryover(run_context, task_context=task_focus)
+                active = list(getattr(run_context, "active_skills", {}) or {})
+                invoked = list(existing.invoked_skills) or active
+                for name in active:
+                    if name not in invoked:
+                        invoked.append(name)
+                if run_context is not None and (
+                    not existing.recent_files
+                    or not existing.task_focus
+                    or (active and not existing.invoked_skills)
+                ):
+                    set_compaction_carryover(
+                        run_context,
+                        task_focus=existing.task_focus or task_focus or None,
+                        recent_files=existing.recent_files or recent_files,
+                        recent_work_log=existing.recent_work_log,
+                        invoked_skills=invoked,
+                        active_workers=existing.active_workers,
+                        channel_log=existing.channel_log,
+                        plan_reminder=existing.plan_reminder,
+                        metadata=existing.metadata,
+                    )
+                carryover = get_compaction_carryover(run_context, task_context=task_focus)
+                carryover_md = carryover.to_markdown()
+                reminder = build_state_reminder(
+                    recent_files=carryover.recent_files,
+                    plan_text=carryover.plan_reminder,
+                    invoked_skills=carryover.invoked_skills,
+                    active_workers=carryover.active_workers,
+                )
+            except Exception:
+                logger.debug("full-replace carryover enrich failed", exc_info=True)
+                carryover_md = ""
+                reminder = None
+
+            fr = await apply_full_replace_compaction(
+                messages,
+                llm,
+                workspace=workspace,
+                carryover_markdown=carryover_md or None,
+                system_reminder=reminder,
+                history_then_steps=_feat("history_then_steps"),
+            )
+            if fr is not None:
+                # Prefer identity reuse for system + recent tails that survived
+                fr = _reuse_messages_where_possible(messages, fr)
+                fr_tokens = _estimate_messages_tokens(fr, token_multiplier)
+                # Input ladder: if still over budget, retry lossy summarizer input
+                if fr_tokens > budget:
+                    fr_lossy = await apply_full_replace_compaction(
+                        messages,
+                        llm,
+                        workspace=workspace,
+                        carryover_markdown=carryover_md or None,
+                        system_reminder=reminder,
+                        lossy=True,
+                        history_then_steps=_feat("history_then_steps"),
+                    )
+                    if fr_lossy is not None:
+                        fr = _reuse_messages_where_possible(messages, fr_lossy)
+                        fr_tokens = _estimate_messages_tokens(fr, token_multiplier)
+                if fr_tokens <= budget or fr_tokens < current_tokens:
+                    if savings_history is not None and current_tokens > 0:
+                        saved = max(0, current_tokens - fr_tokens)
+                        savings_history.append(saved / current_tokens * 100.0)
+                    emit("context", {
+                        "message": (
+                            f"full-replace compaction rebuilt history "
+                            f"(~{current_tokens} → ~{fr_tokens} tokens)"
+                        ),
+                    })
+                    emit("compact_progress", {
+                        "phase": "end",
+                        "message": "compaction completed via full_replace",
+                        "mode": "full_replace",
+                        "before_tokens": current_tokens,
+                        "after_tokens": fr_tokens,
+                    })
+                    if fire_hook is not None:
+                        try:
+                            summary_snip = next(
+                                (
+                                    m.content
+                                    for m in fr
+                                    if isinstance(m.content, str)
+                                    and "being continued" in m.content
+                                ),
+                                None,
+                            )
+                            await fire_hook("on_post_compact", len(fr), summary_snip)
+                        except Exception:
+                            logger.debug("on_post_compact hook failed", exc_info=True)
+                    if taxonomy_dispatcher is not None:
+                        try:
+                            from clawagents.hooks.external import dispatch_taxonomy_hook
+                            from clawagents.hooks.taxonomy import HookEvent
+
+                            await dispatch_taxonomy_hook(
+                                taxonomy_dispatcher,
+                                HookEvent.POST_COMPACT,
+                                {
+                                    "message_count": len(fr),
+                                    "before_tokens": current_tokens,
+                                    "after_tokens": fr_tokens,
+                                    "mode": "full_replace",
+                                },
+                                blocking=False,
+                            )
+                        except Exception:
+                            logger.debug("taxonomy post_compact hook failed", exc_info=True)
+                    # Greppable compaction segment archive
+                    try:
+                        from clawagents.config.features import is_enabled as _feat_seg
+                        from clawagents.memory.compaction_segments import (
+                            write_segment,
+                            segment_recovery_hint,
+                        )
+
+                        if _feat_seg("compaction_segments") and workspace:
+                            archive = "\n".join(
+                                f"[{m.role}] {str(m.content)[:500]}"
+                                for m in messages
+                                if getattr(m, "role", None) != "system"
+                            )[:12000]
+                            write_segment(
+                                archive,
+                                workspace=workspace,
+                                turns=max(1, len(messages) - 1),
+                            )
+                            emit("context", {"message": segment_recovery_hint()})
+                    except Exception:
+                        logger.debug("compaction segment write failed", exc_info=True)
+                    return fr
+    except Exception:
+        logger.debug("full_replace_compaction path failed; falling back", exc_info=True)
+
     # Prefer hardened compress_messages_safe when it yields meaningful savings.
     try:
         from clawagents.memory.compaction import AgentMessage, compress_messages_safe
@@ -1472,7 +1940,7 @@ async def _compact_if_needed(
         agent_msgs = [
             AgentMessage(
                 role=m.role,
-                content=m.content if isinstance(m.content, str) else str(m.content),
+                content=_content_key_text(m.content),
             )
             for m in ([*system_msgs, *non_system])
         ]
@@ -1494,7 +1962,7 @@ async def _compact_if_needed(
             for _om in (*system_msgs, *non_system):
                 _okey = (
                     _om.role,
-                    _om.content if isinstance(_om.content, str) else str(_om.content),
+                    _content_key_text(_om.content),
                 )
                 _originals_by_key.setdefault(_okey, []).append(_om)
 
@@ -1758,7 +2226,7 @@ def _archive_pre_compact_transcript(older_messages: list[LLMMessage], task_conte
             "\n### Messages\n\n",
         ]
         for m in older_messages:
-            content = m.content if isinstance(m.content, str) else str(m.content)
+            content = _content_key_text(m.content)
             lines.append(f"**{m.role}**: {content[:2000]}\n\n")
 
         path.write_text("".join(lines), "utf-8")
@@ -1869,7 +2337,7 @@ async def run_agent_graph(
     llm: LLMProvider,
     tools: Optional[ToolRegistry] = None,
     system_prompt: Optional[str] = None,
-    max_iterations: int = MAX_TOOL_ROUNDS,
+    max_iterations: int = 200,
     streaming: bool = True,
     context_window: int = 1_000_000,
     on_event: Optional[OnEvent] = None,
@@ -1880,6 +2348,8 @@ async def run_agent_graph(
     trajectory: bool = False,
     rethink: bool = False,
     learn: bool = False,
+    atlas: bool = False,  # deprecated no-op (ATLAS removed)
+    atlas_config: Optional[Any] = None,  # deprecated no-op
     preview_chars: int = 120,
     response_chars: int = 500,
     timeout_s: float = 0,
@@ -1902,17 +2372,158 @@ async def run_agent_graph(
     action_mode: str = "tools",
     approval_handler: Any = None,
     require_approval_tools: Optional[list[str]] = None,
+    image_blocks: Optional[list[dict]] = None,
+    file_blocks: Optional[list[dict]] = None,
+    session_end_tail: bool = True,
     session_id: Optional[str] = None,
     session_dir: Optional[Path] = None,
     permission_callback: Optional[Callable[[dict], Any]] = None,
-    image_blocks: Optional[list[dict]] = None,
-    file_blocks: Optional[list[dict]] = None,
 ) -> AgentState:
     """Single ReAct loop: LLM → tools → LLM → tools → ... → final answer."""
     if features is not None:
-        from clawagents.config.features import set_overrides
-        set_overrides(features)
+        from clawagents.config.features import temporary_overrides
 
+        with temporary_overrides(features):
+            return await _run_agent_graph_core(
+                task=task,
+                llm=llm,
+                tools=tools,
+                system_prompt=system_prompt,
+                max_iterations=max_iterations,
+                streaming=streaming,
+                context_window=context_window,
+                on_event=on_event,
+                before_llm=before_llm,
+                before_tool=before_tool,
+                after_tool=after_tool,
+                use_native_tools=use_native_tools,
+                trajectory=trajectory,
+                rethink=rethink,
+                learn=learn,
+                atlas=atlas,
+                atlas_config=atlas_config,
+                preview_chars=preview_chars,
+                response_chars=response_chars,
+                timeout_s=timeout_s,
+                advisor_llm=advisor_llm,
+                advisor_max_calls=advisor_max_calls,
+                run_context=run_context,
+                user_context=user_context,
+                hooks=hooks,
+                agent_hooks=agent_hooks,
+                input_guardrails=input_guardrails,
+                output_guardrails=output_guardrails,
+                output_type=output_type,
+                on_stream_event=on_stream_event,
+                session=session,
+                session_preload_limit=session_preload_limit,
+                handoffs=handoffs,
+                agent_name=agent_name,
+                action_mode=action_mode,
+                approval_handler=approval_handler,
+                require_approval_tools=require_approval_tools,
+                image_blocks=image_blocks,
+                file_blocks=file_blocks,
+                session_end_tail=session_end_tail,
+                session_id=session_id,
+                session_dir=session_dir,
+                permission_callback=permission_callback,
+            )
+    return await _run_agent_graph_core(
+        task=task,
+        llm=llm,
+        tools=tools,
+        system_prompt=system_prompt,
+        max_iterations=max_iterations,
+        streaming=streaming,
+        context_window=context_window,
+        on_event=on_event,
+        before_llm=before_llm,
+        before_tool=before_tool,
+        after_tool=after_tool,
+        use_native_tools=use_native_tools,
+        trajectory=trajectory,
+        rethink=rethink,
+        learn=learn,
+        atlas=atlas,
+        atlas_config=atlas_config,
+        preview_chars=preview_chars,
+        response_chars=response_chars,
+        timeout_s=timeout_s,
+        advisor_llm=advisor_llm,
+        advisor_max_calls=advisor_max_calls,
+        run_context=run_context,
+        user_context=user_context,
+        hooks=hooks,
+        agent_hooks=agent_hooks,
+        input_guardrails=input_guardrails,
+        output_guardrails=output_guardrails,
+        output_type=output_type,
+        on_stream_event=on_stream_event,
+        session=session,
+        session_preload_limit=session_preload_limit,
+        handoffs=handoffs,
+        agent_name=agent_name,
+        action_mode=action_mode,
+        approval_handler=approval_handler,
+        require_approval_tools=require_approval_tools,
+        image_blocks=image_blocks,
+        file_blocks=file_blocks,
+        session_end_tail=session_end_tail,
+        session_id=session_id,
+        session_dir=session_dir,
+        permission_callback=permission_callback,
+    )
+
+
+async def _run_agent_graph_core(
+    task: str,
+    llm: LLMProvider,
+    tools: Optional[ToolRegistry] = None,
+    system_prompt: Optional[str] = None,
+    max_iterations: int = MAX_TOOL_ROUNDS,
+    streaming: bool = True,
+    context_window: int = 1_000_000,
+    on_event: Optional[OnEvent] = None,
+    before_llm: Optional[BeforeLLMHook] = None,
+    before_tool: Optional[BeforeToolHook] = None,
+    after_tool: Optional[AfterToolHook] = None,
+    use_native_tools: bool = True,
+    trajectory: bool = False,
+    rethink: bool = False,
+    learn: bool = False,
+    atlas: bool = False,  # deprecated no-op (ATLAS removed)
+    atlas_config: Optional[Any] = None,  # deprecated no-op
+    preview_chars: int = 120,
+    response_chars: int = 500,
+    timeout_s: float = 0,
+    features: Optional[dict[str, bool]] = None,
+    advisor_llm: Optional[LLMProvider] = None,
+    advisor_max_calls: int = 3,
+    # ── New, fully backward-compatible keyword-only parameters ──
+    run_context: Optional[RunContext] = None,
+    user_context: Any = None,
+    hooks: Optional[RunHooks] = None,
+    agent_hooks: Optional[AgentHooks] = None,
+    input_guardrails: Optional[list[InputGuardrail]] = None,
+    output_guardrails: Optional[list[OutputGuardrail]] = None,
+    output_type: Optional[type] = None,
+    on_stream_event: Optional[Callable[[StreamEvent], None]] = None,
+    session: Optional[Any] = None,  # clawagents.session.Session protocol
+    session_preload_limit: int | None = 200,
+    handoffs: Optional[list[Handoff]] = None,
+    agent_name: Optional[str] = None,
+    action_mode: str = "tools",
+    approval_handler: Any = None,
+    require_approval_tools: Optional[list[str]] = None,
+    image_blocks: Optional[list[dict]] = None,
+    file_blocks: Optional[list[dict]] = None,
+    session_end_tail: bool = True,
+    session_id: Optional[str] = None,
+    session_dir: Optional[Path] = None,
+    permission_callback: Optional[Callable[[dict], Any]] = None,
+) -> AgentState:
+    """Internal ReAct loop body (feature overrides applied by :func:`run_agent_graph`)."""
     registry = tools or ToolRegistry()
     action_mode_norm = action_mode if action_mode in ("tools", "code") else "tools"
     require_approval_set = {
@@ -1975,6 +2586,15 @@ async def run_agent_graph(
     # an extra parameter threaded through every intermediate call.
     if permission_callback is not None:
         run_context.permission_callback = permission_callback
+    # Tools (execute streaming, skills) read callbacks/metadata from run_context.
+    run_context.on_event = emit
+    # Ephemeral id for ${SESSION_ID} skill substitutions when persistence is off.
+    if not getattr(run_context, "session_id", None):
+        import uuid as _uuid
+
+        _ephemeral_sid = f"run-{_uuid.uuid4().hex[:12]}"
+        run_context.session_id = _ephemeral_sid
+        run_context._metadata["session_id"] = _ephemeral_sid
     usage = run_context.usage
 
     # Per-agent iteration budget (Hermes parity). If the caller has not
@@ -2025,6 +2645,9 @@ async def run_agent_graph(
         active_hooks.append(hooks)
     if agent_hooks is not None and agent_hooks is not hooks:
         active_hooks.append(agent_hooks)
+    # Expose hooks to nested tools (e.g. task → on_subagent_start/end).
+    run_context._metadata["hooks"] = active_hooks
+    run_context._metadata["agent_name"] = agent_name or "ClawAgent"
 
     async def _fire_hook(method_name: str, *args: Any) -> None:
         for h in active_hooks:
@@ -2058,22 +2681,129 @@ async def run_agent_graph(
         from clawagents.trajectory.recorder import TrajectoryRecorder
         recorder = TrajectoryRecorder(task=task, response_chars=response_chars)
 
+    # Bind workspace + goal LLM for tools / final gate (parent runs).
+    if run_context is not None:
+        meta = run_context._metadata
+        if not isinstance(meta.get("workspace"), str):
+            meta["workspace"] = os.getcwd()
+        if getattr(registry, "_permission_engine", None) is not None:
+            meta.setdefault("permission_engine", registry._permission_engine)
+        if before_tool is not None:
+            meta["before_tool"] = before_tool
+        if approval_handler is not None:
+            meta["approval_handler"] = approval_handler
+
+        async def _bound_goal_llm(prompt: str) -> str:
+            resp = await llm.chat([LLMMessage(role="user", content=prompt)])
+            return str(getattr(resp, "content", "") or "")
+
+        meta["goal_llm_complete"] = _bound_goal_llm
+        try:
+            from clawagents.config.features import is_enabled as _feat_goal_bind
+            from clawagents.goal import (
+                GoalTracker,
+                attach_goal_to_run_context,
+                get_goal_tracker,
+            )
+
+            # Only bind the disk-backed goal tracker in Goal mode. Act/Plan must
+            # not inherit an active `.clawagents/goal/state.json` from a prior run.
+            _want_goal = bool(meta.get("goal_mode"))
+            if (
+                _want_goal
+                and _feat_goal_bind("goal_autopilot")
+                and get_goal_tracker(run_context) is None
+            ):
+                attach_goal_to_run_context(
+                    run_context, GoalTracker(meta["workspace"])
+                )
+        except Exception:
+            logger.debug("goal tracker bind failed", exc_info=True)
+
+
     # Feature: Session Persistence — save session as append-only JSONL
     session_writer = None
     from clawagents.config.features import is_enabled as _feat_enabled
     if _feat_enabled("session_persistence"):
         from clawagents.session.persistence import SessionWriter
         session_writer = SessionWriter(session_id=session_id, session_dir=session_dir)
+        run_context.session_id = session_writer.session_id
+        run_context._metadata["session_id"] = session_writer.session_id
         emit("context", {"message": f"session: {session_writer.session_id} → {session_writer.path}"})
 
     # Feature: External Hooks — load shell hooks from .clawagents/hooks.json or env
     ext_hook_runner = None
+    hooks_cfg = None
     if _feat_enabled("external_hooks"):
         from clawagents.hooks.external import load_hooks_config, ExternalHookRunner
         hooks_cfg = load_hooks_config()
         if hooks_cfg:
             ext_hook_runner = ExternalHookRunner(hooks_cfg)
             emit("context", {"message": "external hooks: loaded"})
+
+    taxonomy_dispatcher = None
+    try:
+        from clawagents.hooks.external import build_taxonomy_dispatcher
+
+        taxonomy_dispatcher = build_taxonomy_dispatcher(hooks_cfg)
+        if taxonomy_dispatcher is not None:
+            emit("context", {"message": "hook taxonomy: loaded"})
+    except Exception:
+        logger.debug("hook taxonomy load failed", exc_info=True)
+
+    if taxonomy_dispatcher is not None and isinstance(
+        getattr(run_context, "_metadata", None), dict
+    ):
+        run_context._metadata["taxonomy_dispatcher"] = taxonomy_dispatcher
+
+    _base_emit = emit
+
+    async def _fire_taxonomy(
+        event: Any,
+        payload: dict[str, Any] | None = None,
+        *,
+        blocking: bool = False,
+    ) -> None:
+        if taxonomy_dispatcher is None:
+            return
+        try:
+            from clawagents.hooks.external import dispatch_taxonomy_hook
+
+            await dispatch_taxonomy_hook(
+                taxonomy_dispatcher,
+                event,
+                payload or {},
+                blocking=blocking,
+            )
+        except Exception:
+            pass
+
+    async def _tax_permission_denied(
+        tool: str, reason: str, *, source: str,
+    ) -> None:
+        from clawagents.hooks.taxonomy import HookEvent
+
+        await _fire_taxonomy(
+            HookEvent.PERMISSION_DENIED,
+            {"tool": tool, "reason": reason, "source": source},
+        )
+
+    def emit(kind: EventKind, data: dict[str, Any] | None = None) -> None:
+        payload = data or {}
+        _base_emit(kind, payload)
+        if kind == "warn" and taxonomy_dispatcher is not None:
+            from clawagents.hooks.taxonomy import HookEvent
+
+            msg = str(payload.get("message") or payload)
+            try:
+                asyncio.get_running_loop().create_task(
+                    _fire_taxonomy(
+                        HookEvent.NOTIFICATION,
+                        {"message": msg, "kind": "warn"},
+                    )
+                )
+            except RuntimeError:
+                pass
 
     token_multiplier = 1.0
     resolved_model_name: Optional[str] = None
@@ -2113,6 +2843,30 @@ async def run_agent_graph(
             dynamic_parts.append(preamble)
             emit("context", {"message": "PTRL: injected lessons from past runs"})
 
+    # Goal autopilot standing reminder (preferred long-horizon gate).
+    # Wrapped in markers so mid-run start_goal can refresh it each turn.
+    try:
+        from clawagents.config.features import is_enabled as _feat_goal_sys
+        from clawagents.goal import get_goal_tracker, goal_system_reminder
+
+        _goal_mode_on = bool(
+            isinstance(run_context._metadata, dict)
+            and run_context._metadata.get("goal_mode")
+        )
+        if _goal_mode_on and _feat_goal_sys("goal_autopilot"):
+            _gt_sys = get_goal_tracker(run_context)
+            _rem = goal_system_reminder(_gt_sys.state if _gt_sys else None)
+            if _rem:
+                dynamic_parts.append(
+                    "<!--claw:goal-reminder-->\n"
+                    + _rem
+                    + "\n<!--/claw:goal-reminder-->"
+                )
+                emit("context", {"message": "goal: injected active goal reminder"})
+    except Exception:
+        logger.debug("goal system reminder failed", exc_info=True)
+
+    # Dynamic context packs
     # Dynamic context packs (after cache boundary) — local only.
     if not getattr(run_context, "skip_memory", False):
         from clawagents.config.features import is_enabled
@@ -2164,7 +2918,10 @@ async def run_agent_graph(
         tool_description=tool_desc,
         lesson_preamble=lesson_preamble,
     )
-    # Attach images/files (if any) to the first user message as content blocks.
+    # Attach images/files (if any) to the first user message as content
+    # blocks so the model sees pixels/documents. ``current_task`` stays the
+    # plain string, so compaction/events/session paths that expect text are
+    # unaffected.
     if image_blocks or file_blocks:
         first_user_content: Any = (
             ([{"type": "text", "text": task}] if task else [])
@@ -2192,6 +2949,14 @@ async def run_agent_graph(
         _cached_sys_tokens = _estimate_tokens(messages[0].content)
         emit("context", {"message": f"system prompt: ~{_cached_sys_tokens} tokens (cached for budget calc)"})
 
+    def _budget_tokens(msgs: list[LLMMessage], mult: float | None = None) -> int:
+        return _estimate_messages_tokens(
+            msgs,
+            mult if mult is not None else token_multiplier,
+            resolved_model_name,
+            cached_system_tokens=_cached_sys_tokens or None,
+        )
+
     state = AgentState(
         messages=messages,
         current_task=task,
@@ -2203,6 +2968,68 @@ async def run_agent_graph(
         usage=usage,
         run_context=run_context,
     )
+
+    if taxonomy_dispatcher is not None:
+        try:
+            from clawagents.hooks.external import dispatch_taxonomy_hook
+            from clawagents.hooks.taxonomy import HookEvent
+
+            await dispatch_taxonomy_hook(
+                taxonomy_dispatcher,
+                HookEvent.SESSION_START,
+                {"task": task[:500] if task else ""},
+                blocking=False,
+            )
+            await dispatch_taxonomy_hook(
+                taxonomy_dispatcher,
+                HookEvent.USER_PROMPT_SUBMIT,
+                {"prompt": task[:2000] if task else ""},
+                blocking=False,
+            )
+        except Exception:
+            logger.debug("taxonomy session_start hook failed", exc_info=True)
+
+    # Session rewind: snapshot workspace-touched files at prompt boundary
+    try:
+        from clawagents.config.features import is_enabled as _feat_rw
+
+        if _feat_rw("session_rewind") or _feat_rw("hunk_watcher"):
+            from clawagents.memory.hunk_watcher import get_watcher
+
+            _ws_rw = None
+            if run_context is not None and isinstance(run_context._metadata, dict):
+                _ws_rw = run_context._metadata.get("workspace")
+            w = get_watcher(_ws_rw)
+            meta_rw = (
+                run_context._metadata
+                if run_context is not None and isinstance(run_context._metadata, dict)
+                else None
+            )
+            idx = int((meta_rw or {}).get("prompt_index") or 0) + 1
+            # RunContext is recreated every VS Code turn, so metadata alone always
+            # yields idx=1 and overwrites prompt_0001.json. Prefer the watcher.
+            idx = max(idx, int(getattr(w, "_prompt_index", 0) or 0) + 1)
+            if meta_rw is not None:
+                meta_rw["prompt_index"] = idx
+            _conv_marker: list[dict[str, str]] = []
+            for _m in messages[-6:]:
+                if _m.role in ("user", "assistant"):
+                    _preview = (
+                        _m.content
+                        if isinstance(_m.content, str)
+                        else str(_m.content)
+                    )
+                    _conv_marker.append(
+                        {"role": _m.role, "preview": _preview[:120]}
+                    )
+            w.snapshot_turn(
+                idx,
+                user_text=(task or "")[:2000],
+                message_count=len(messages),
+                conversation_marker=_conv_marker,
+            )
+    except Exception:
+        logger.debug("rewind snapshot failed", exc_info=True)
 
     # Session protocol — hydrate history before first LLM call (non-destructive).
     _session_preloaded_count = 0
@@ -2354,6 +3181,31 @@ async def run_agent_graph(
             # reported "1 iteration" in events and the session writer.
             state.iterations += 1
 
+            # Mid-turn user redirect — each entry is its own synthetic user turn.
+            try:
+                from clawagents.config.features import is_enabled as _feat_ij
+
+                if _feat_ij("mid_turn_interject"):
+                    _ij_msgs = _drain_interject_messages(run_context)
+                    if _ij_msgs:
+                        messages.extend(_ij_msgs)
+                        emit(
+                            "context",
+                            {
+                                "message": (
+                                    f"mid-turn interjection applied ({len(_ij_msgs)} turn(s))"
+                                )
+                            },
+                        )
+            except Exception:
+                logger.debug("mid-turn interject drain failed", exc_info=True)
+
+            # Refresh Goal standing reminder if start_goal fired mid-run.
+            try:
+                _sync_goal_reminder_into_system(messages, run_context)
+            except Exception:
+                logger.debug("goal reminder sync failed", exc_info=True)
+
             # Session: mark turn start
             if session_writer:
                 session_writer.write_turn_started(round_idx)
@@ -2394,7 +3246,7 @@ async def run_agent_graph(
                 else _MICRO_COMPACT_MIN_USAGE_RATIO
             )
             if (
-                _estimate_messages_tokens(messages, token_multiplier)
+                _budget_tokens(messages)
                 > context_window * _mc_ratio
             ):
                 messages = _micro_compact_tool_results(messages, keep_recent=_mc_keep)
@@ -2403,6 +3255,7 @@ async def run_agent_graph(
                 messages, context_window, llm, emit, token_multiplier, resolved_model_name, run_context,
                 fire_hook=_fire_hook,
                 savings_history=_compaction_savings,
+                taxonomy_dispatcher=taxonomy_dispatcher,
             )
             # Compaction / trim can still leave pairs inconsistent — sanitize again.
             messages = _patch_dangling_tool_calls(messages)
@@ -2459,8 +3312,37 @@ async def run_agent_graph(
             if active_hooks:
                 await _fire_hook("on_llm_start", resolved_model_name or "", messages)
             try:
+                # Native structured output (json_schema → provider wire formats)
+                try:
+                    from clawagents.config.features import is_enabled as _feat_so
+                    from clawagents.structured_output import schema_from_output_type
+
+                    if _feat_so("structured_output") and output_type is not None:
+                        _schema = schema_from_output_type(output_type)
+                        setattr(llm, "_structured_json_schema", _schema)
+                    else:
+                        setattr(llm, "_structured_json_schema", None)
+                except Exception:
+                    pass
+                # Doom-loop recovery: force a non-thinking response channel.
+                chat_messages = messages
+                if (
+                    run_context is not None
+                    and isinstance(run_context._metadata, dict)
+                    and run_context._metadata.get("doom_force_response")
+                ):
+                    chat_messages = list(messages) + [
+                        LLMMessage(
+                            role="user",
+                            content=(
+                                "CRITICAL recovery instruction: Do NOT emit any "
+                                "<think>...</think> blocks or private chain-of-thought. "
+                                "Respond with the next tool call or final answer only."
+                            ),
+                        )
+                    ]
                 response = await llm.chat(
-                    messages,
+                    chat_messages,
                     on_chunk=on_chunk if streaming else None,
                     cancel_event=cancel_event,
                     tools=native_schemas,
@@ -2527,7 +3409,7 @@ async def run_agent_graph(
                         state.result = str(err)
                         break
                     observed_ratio = context_window / max(
-                        _estimate_messages_tokens(messages, 1.0), 1,
+                        _budget_tokens(messages, 1.0), 1,
                     )
                     token_multiplier = min(observed_ratio * 1.1, 3.0)
                     # Also shrink the effective window: the multiplier is
@@ -2548,6 +3430,7 @@ async def run_agent_graph(
                         messages, context_window, llm, emit, token_multiplier, resolved_model_name, run_context,
                         fire_hook=_fire_hook,
                         savings_history=_compaction_savings,
+                        taxonomy_dispatcher=taxonomy_dispatcher,
                     )
                     # Don't persist recovery-compaction artifacts to the session.
                     _session_note_messages(track=False)
@@ -2576,6 +3459,84 @@ async def run_agent_graph(
                     tool_calls=response.tool_calls,
                     gemini_parts=response.gemini_parts,
                 )
+            # Provider-native thinking field (Anthropic/Gemini) when no <think> tags.
+            if not _thinking_content and getattr(response, "thinking", None):
+                _thinking_content = str(response.thinking)
+
+            # Doom-loop: thinking OR response tail-repetition → resample with temp bump
+            try:
+                from clawagents.config.features import is_enabled as _feat_doom
+                from clawagents.doom_loop import (
+                    DoomLoopRecoveryPolicy,
+                    DoomLoopState,
+                    detect_tail_repetition,
+                    note_trigger,
+                    should_resample,
+                )
+
+                if _feat_doom("doom_loop"):
+                    sig = None
+                    if _thinking_content:
+                        sig = detect_tail_repetition(
+                            _thinking_content, channel="thinking"
+                        )
+                    if sig is None and response.content:
+                        sig = detect_tail_repetition(
+                            str(response.content), channel="response"
+                        )
+                    if sig is not None:
+                        meta = (
+                            run_context._metadata
+                            if run_context is not None
+                            and isinstance(run_context._metadata, dict)
+                            else {}
+                        )
+                        doom_state = meta.get("doom_loop_state")
+                        if not isinstance(doom_state, DoomLoopState):
+                            doom_state = DoomLoopState()
+                            if meta is not None:
+                                meta["doom_loop_state"] = doom_state
+                        note_trigger(doom_state, sig)
+                        pol = DoomLoopRecoveryPolicy()
+                        if should_resample(sig, doom_state, pol):
+                            doom_state.retry_count += 1
+                            # Bump temperature so resample is not a deterministic repeat.
+                            try:
+                                cur_t = float(getattr(llm, "_temperature", 0.0) or 0.0)
+                                setattr(llm, "_temperature", min(1.0, max(0.4, cur_t + 0.4)))
+                            except Exception:
+                                pass
+                            # Force next attempt onto the response channel (no think tags).
+                            if meta is not None:
+                                meta["doom_force_response"] = True
+                            emit(
+                                "warn",
+                                {
+                                    "message": (
+                                        f"doom-loop {sig.label} — resampling "
+                                        f"({doom_state.retry_count}/{pol.max_retries}, "
+                                        "force response channel)"
+                                    )
+                                },
+                            )
+                            continue
+                        if (
+                            meta is not None
+                            and meta.get("doom_force_response")
+                            and sig.channel == "thinking"
+                        ):
+                            # Forced-response attempt still thought — keep forcing.
+                            meta["doom_force_response"] = True
+            except Exception:
+                logger.debug("doom-loop check failed", exc_info=True)
+
+            # Clear force-response once we got a usable non-doom turn.
+            if (
+                run_context is not None
+                and isinstance(run_context._metadata, dict)
+                and run_context._metadata.pop("doom_force_response", None)
+            ):
+                pass
 
             # Use exclusively native or text-based tool calls based on user-provided mode
             native_tool_call_objects: list[NativeToolCall] | None = None
@@ -2587,6 +3548,7 @@ async def run_agent_graph(
                 ]
             else:
                 tool_calls = registry.parse_tool_calls(response.content)
+
 
             if not tool_calls:
                 # Check if the response is a truncated JSON tool call (hit max_tokens)
@@ -2617,7 +3579,7 @@ async def run_agent_graph(
 
                         def _run_async(coro: Any) -> Any:
                             try:
-                                loop = asyncio.get_running_loop()
+                                asyncio.get_running_loop()
                             except RuntimeError:
                                 return asyncio.run(coro)
                             import concurrent.futures
@@ -2667,6 +3629,53 @@ async def run_agent_graph(
                     last_msg = messages[-1] if messages else None
                     if last_msg and isinstance(last_msg.content, str) and last_msg.content.startswith("[Advisor Guidance]"):
                         continue
+
+
+                # ── Goal autopilot final gate ──
+                try:
+                    from clawagents.config.features import is_enabled as _feat_goal
+                    from clawagents.goal import GoalOrchestrator, get_goal_tracker
+
+                    _goal_mode_on = bool(
+                        isinstance(run_context._metadata, dict)
+                        and run_context._metadata.get("goal_mode")
+                    )
+                    _goal_tracker = get_goal_tracker(run_context) if _goal_mode_on else None
+                    if (
+                        _goal_mode_on
+                        and _feat_goal("goal_autopilot")
+                        and _goal_tracker is not None
+                        and _goal_tracker.is_active()
+                        and _goal_tracker.state is not None
+                        and _goal_tracker.state.status.value
+                        not in ("done", "failed", "paused")
+                    ):
+                        if not _final_assistant_appended:
+                            messages.append(LLMMessage(
+                                role="assistant",
+                                content=response.content,
+                                thinking=_thinking_content,
+                            ))
+                            _final_assistant_appended = True
+                        evidence = (response.content or "")[:6000]
+                        orch = GoalOrchestrator(
+                            _goal_tracker,
+                            _goal_llm_complete(run_context, llm),
+                        )
+                        ok, gst = await orch.verify(evidence)
+                        if not ok:
+                            inject = (
+                                "[Goal Verifier] Completion rejected. Continue the plan.\n"
+                                f"Consecutive misses: {gst.consecutive_not_achieved}.\n"
+                            )
+                            if gst.strategy_text:
+                                inject += f"Strategy note:\n{gst.strategy_text[:2000]}\n"
+                            messages.append(LLMMessage(role="user", content=inject))
+                            emit("context", {"message": "goal verifier rejected completion"})
+                            continue
+                        emit("context", {"message": "goal verifier accepted — DONE"})
+                except Exception:
+                    logger.debug("goal final gate failed", exc_info=True)
 
                 if recorder:
                     recorder.record_turn(
@@ -2851,6 +3860,7 @@ async def run_agent_graph(
                                 run_context=run_context,
                                 session=_TransientSession(preload) if preload else None,
                                 on_stream_event=on_stream_event,
+                                session_end_tail=False,
                             )
                         except Exception as run_err:
                             emit("warn", {"message": f"handoff target raised: {run_err}"})
@@ -2960,12 +3970,17 @@ async def run_agent_graph(
                 native_tc = native_tool_call_objects[0] if native_tool_call_objects else None
                 emit("tool_call", {"name": call.tool_name})
 
-                # External pre_tool_use hook
-                if ext_hook_runner:
+                # External / taxonomy pre_tool_use hook
+                if ext_hook_runner and taxonomy_dispatcher is None:
                     try:
                         ext_allowed, ext_args = await ext_hook_runner.pre_tool_use(call.tool_name, call.args)
                         if not ext_allowed:
                             emit("tool_skipped", {"name": call.tool_name, "reason": "blocked by external hook"})
+                            await _tax_permission_denied(
+                                call.tool_name,
+                                "blocked by external hook",
+                                source="external_hook",
+                            )
                             if use_native_tools and native_tc and native_tc.tool_call_id:
                                 messages.append(LLMMessage(
                                     role="assistant",
@@ -2993,6 +4008,49 @@ async def run_agent_graph(
                     except Exception as hook_err:
                         emit("warn", {"message": f"external pre_tool_use hook error: {hook_err}"})
 
+                if taxonomy_dispatcher is not None:
+                    try:
+                        from clawagents.hooks.external import dispatch_taxonomy_hook
+                        from clawagents.hooks.taxonomy import HookEvent
+
+                        tax_allowed, tax_reason = await dispatch_taxonomy_hook(
+                            taxonomy_dispatcher,
+                            HookEvent.PRE_TOOL_USE,
+                            {"tool": call.tool_name, "args": call.args},
+                            blocking=True,
+                        )
+                        if not tax_allowed:
+                            reason = tax_reason or "blocked by taxonomy hook"
+                            emit("tool_skipped", {"name": call.tool_name, "reason": reason})
+                            await _tax_permission_denied(
+                                call.tool_name, reason, source="taxonomy",
+                            )
+                            if use_native_tools and native_tc and native_tc.tool_call_id:
+                                messages.append(LLMMessage(
+                                    role="assistant",
+                                    content=response.content or "",
+                                    tool_calls_meta=[{
+                                        "id": native_tc.tool_call_id,
+                                        "name": call.tool_name,
+                                        "args": call.args,
+                                    }],
+                                    gemini_parts=getattr(response, "gemini_parts", None),
+                                    thinking=_thinking_content,
+                                ))
+                                messages.append(LLMMessage(
+                                    role="tool",
+                                    content=f"[Tool Skipped] {call.tool_name} was not approved: {reason}",
+                                    tool_call_id=native_tc.tool_call_id,
+                                ))
+                            else:
+                                messages.append(LLMMessage(
+                                    role="user",
+                                    content=f"[Tool Skipped] {call.tool_name} was not approved: {reason}",
+                                ))
+                            continue
+                    except Exception as hook_err:
+                        emit("warn", {"message": f"taxonomy pre_tool_use hook error: {hook_err}"})
+
                 if before_tool:
                     hook_approved = True
                     hook_reason = "rejected by before_tool hook"
@@ -3013,6 +4071,9 @@ async def run_agent_graph(
                         hook_approved = False
                     if not hook_approved:
                         emit("tool_skipped", {"name": call.tool_name, "reason": hook_reason})
+                        await _tax_permission_denied(
+                            call.tool_name, hook_reason, source="before_tool",
+                        )
                         # Close the native tool pair so Gemini sees
                         # model(function_call) → user(function_response), not a bare
                         # "[Tool Skipped]" user turn that breaks turn alternation.
@@ -3165,9 +4226,17 @@ async def run_agent_graph(
                         str(tool_result.output)[:2000] if tool_result.output else "",
                         tool_result.error if not tool_result.success else None,
                     )
+                    if not tool_result.success:
+                        await _fire_hook(
+                            "on_tool_failure",
+                            call.tool_name,
+                            native_tc_id,
+                            tool_result.error or str(tool_result.output)[:500],
+                        )
 
-                # External post_tool_use hook
-                if ext_hook_runner:
+
+                # External / taxonomy post_tool_use hook
+                if ext_hook_runner and taxonomy_dispatcher is None:
                     try:
                         ext_result = await ext_hook_runner.post_tool_use(
                             call.tool_name, call.args,
@@ -3181,6 +4250,36 @@ async def run_agent_graph(
                             )
                     except Exception as hook_err:
                         emit("warn", {"message": f"external post_tool_use hook error: {hook_err}"})
+
+                if taxonomy_dispatcher is not None:
+                    try:
+                        from clawagents.hooks.external import dispatch_taxonomy_hook
+                        from clawagents.hooks.taxonomy import HookEvent
+
+                        await dispatch_taxonomy_hook(
+                            taxonomy_dispatcher,
+                            HookEvent.POST_TOOL_USE,
+                            {
+                                "tool": call.tool_name,
+                                "args": call.args,
+                                "success": tool_result.success,
+                                "output": str(tool_result.output)[:1000],
+                            },
+                            blocking=False,
+                        )
+                        if not tool_result.success:
+                            await dispatch_taxonomy_hook(
+                                taxonomy_dispatcher,
+                                HookEvent.POST_TOOL_USE_FAILURE,
+                                {
+                                    "tool": call.tool_name,
+                                    "args": call.args,
+                                    "error": tool_result.error or str(tool_result.output)[:500],
+                                },
+                                blocking=False,
+                            )
+                    except Exception as hook_err:
+                        emit("warn", {"message": f"taxonomy post_tool_use hook error: {hook_err}"})
 
                 if after_tool:
                     try:
@@ -3221,6 +4320,7 @@ async def run_agent_graph(
                     tool_result.success,
                     tool_output,
                     emit=emit,
+                    run_context=run_context,
                 )
                 if isinstance(tool_output, str):
                     preview = tool_output[:preview_chars]
@@ -3337,13 +4437,18 @@ async def run_agent_graph(
                 # Mirror the single-call path: an external policy gate must not
                 # be bypassable by batching a forbidden call with another one.
                 _candidate_pairs: list[tuple[int, ParsedToolCall]] = list(enumerate(tool_calls))
-                if ext_hook_runner:
+                if ext_hook_runner and taxonomy_dispatcher is None:
                     _ext_pairs: list[tuple[int, ParsedToolCall]] = []
                     for _orig_i, _c in _candidate_pairs:
                         try:
                             ext_allowed, ext_args = await ext_hook_runner.pre_tool_use(_c.tool_name, _c.args)
                             if not ext_allowed:
                                 emit("tool_skipped", {"name": _c.tool_name, "reason": "blocked by external hook"})
+                                await _tax_permission_denied(
+                                    _c.tool_name,
+                                    "blocked by external hook",
+                                    source="external_hook",
+                                )
                                 messages.append(LLMMessage(role="user", content=f"[Tool Skipped] {_c.tool_name} was blocked by external hook."))
                                 continue
                             _c = ParsedToolCall(tool_name=_c.tool_name, args=ext_args)
@@ -3351,6 +4456,39 @@ async def run_agent_graph(
                             emit("warn", {"message": f"external pre_tool_use hook error: {hook_err}"})
                         _ext_pairs.append((_orig_i, _c))
                     _candidate_pairs = _ext_pairs
+                    if not _candidate_pairs:
+                        continue
+
+                if taxonomy_dispatcher is not None:
+                    from clawagents.hooks.external import dispatch_taxonomy_hook
+                    from clawagents.hooks.taxonomy import HookEvent
+
+                    _tax_pairs: list[tuple[int, ParsedToolCall]] = []
+                    for _orig_i, _c in _candidate_pairs:
+                        try:
+                            tax_allowed, tax_reason = await dispatch_taxonomy_hook(
+                                taxonomy_dispatcher,
+                                HookEvent.PRE_TOOL_USE,
+                                {"tool": _c.tool_name, "args": _c.args},
+                                blocking=True,
+                            )
+                            if not tax_allowed:
+                                reason = tax_reason or "blocked by taxonomy hook"
+                                emit("tool_skipped", {"name": _c.tool_name, "reason": reason})
+                                await _tax_permission_denied(
+                                    _c.tool_name, reason, source="taxonomy",
+                                )
+                                messages.append(
+                                    LLMMessage(
+                                        role="user",
+                                        content=f"[Tool Skipped] {_c.tool_name} was not approved: {reason}",
+                                    )
+                                )
+                                continue
+                        except Exception as hook_err:
+                            emit("warn", {"message": f"taxonomy pre_tool_use hook error: {hook_err}"})
+                        _tax_pairs.append((_orig_i, _c))
+                    _candidate_pairs = _tax_pairs
                     if not _candidate_pairs:
                         continue
 
@@ -3386,6 +4524,9 @@ async def run_agent_graph(
                         result_call, reason = _apply_hook(c)
                         if result_call is None:
                             emit("tool_skipped", {"name": c.tool_name, "reason": reason})
+                            await _tax_permission_denied(
+                                c.tool_name, reason, source="before_tool",
+                            )
                         else:
                             approved_calls.append(result_call)
                             _approved_orig_indices.append(_orig_i)
@@ -3480,10 +4621,17 @@ async def run_agent_graph(
                             str(_r.output)[:2000] if _r.output else "",
                             _r.error if not _r.success else None,
                         )
+                        if not _r.success:
+                            await _fire_hook(
+                                "on_tool_failure",
+                                _c.tool_name,
+                                _cid,
+                                _r.error or str(_r.output)[:500],
+                            )
 
-                # External post_tool_use hook (parallel) — parity with the
-                # single-call path so result-rewriting policy hooks apply.
-                if ext_hook_runner:
+
+                # External / taxonomy post_tool_use hook (parallel)
+                if ext_hook_runner and taxonomy_dispatcher is None:
                     _ext_results: list[ToolResult] = []
                     for _c, _r in zip(approved_calls, results):
                         try:
@@ -3501,6 +4649,37 @@ async def run_agent_graph(
                             emit("warn", {"message": f"external post_tool_use hook error: {hook_err}"})
                         _ext_results.append(_r)
                     results = _ext_results
+
+                if taxonomy_dispatcher is not None:
+                    from clawagents.hooks.external import dispatch_taxonomy_hook
+                    from clawagents.hooks.taxonomy import HookEvent
+
+                    for _c, _r in zip(approved_calls, results):
+                        try:
+                            await dispatch_taxonomy_hook(
+                                taxonomy_dispatcher,
+                                HookEvent.POST_TOOL_USE,
+                                {
+                                    "tool": _c.tool_name,
+                                    "args": _c.args,
+                                    "success": _r.success,
+                                    "output": str(_r.output)[:1000],
+                                },
+                                blocking=False,
+                            )
+                            if not _r.success:
+                                await dispatch_taxonomy_hook(
+                                    taxonomy_dispatcher,
+                                    HookEvent.POST_TOOL_USE_FAILURE,
+                                    {
+                                        "tool": _c.tool_name,
+                                        "args": _c.args,
+                                        "error": _r.error or str(_r.output)[:500],
+                                    },
+                                    blocking=False,
+                                )
+                        except Exception as hook_err:
+                            emit("warn", {"message": f"taxonomy post_tool_use hook error: {hook_err}"})
 
                 if after_tool:
                     safe_results: list[ToolResult] = []
@@ -3564,6 +4743,7 @@ async def run_agent_graph(
                         result.success,
                         output,
                         emit=emit,
+                        run_context=run_context,
                     )
                     if isinstance(output, str):
                         preview = output[:preview_chars]
@@ -3762,6 +4942,7 @@ async def run_agent_graph(
         state.trajectory_file = run_summary.trajectory_file
         emit("context", {"message": f"trajectory saved to {run_summary.trajectory_file}"})
 
+
     # ── Feature G: LLM-as-Judge verification ──
     if learn and recorder and run_summary:
         try:
@@ -3913,10 +5094,127 @@ async def run_agent_graph(
     if active_hooks:
         await _fire_hook("on_run_end", state.result)
 
+    # Dream consolidation + session-end taxonomy (non-blocking with timeout)
+    try:
+        from clawagents.config.features import is_enabled as _feat_dream
+
+        _ws = None
+        if run_context is not None and isinstance(run_context._metadata, dict):
+            _ws = run_context._metadata.get("workspace")
+        if _ws is None:
+            import os as _os
+
+            _ws = _os.getcwd()
+
+        # Nested runs (handoff children, subagents, forks) are not session
+        # ends: they must not append session logs or trigger dream — a dream
+        # here burns an extra LLM call per child and rewrites MEMORY.md from
+        # subagent context mid-parent-run.
+        if session_end_tail and (_feat_dream("memory_dream") or _feat_dream("smart_memory")):
+            from clawagents.memory.dream import (
+                append_session_log,
+                check_dream_gates,
+                run_dream,
+            )
+
+            _stem = None
+            if session_writer is not None:
+                _stem = getattr(session_writer, "session_id", None)
+            _log_body = f"## Task\n{(task or '')[:4000]}\n\n## Outcome\n{state.status}\n\n## Result\n{(state.result or '')[:8000]}"
+            append_session_log(_log_body, workspace=_ws, stem=_stem)
+
+        if session_end_tail and _feat_dream("memory_dream"):
+            _gate = check_dream_gates(_ws)
+            if not isinstance(_gate, str):
+
+                async def _dream_llm(prompt: str) -> str:
+                    resp = await llm.chat(
+                        [LLMMessage(role="user", content=prompt)],
+                    )
+                    return str(getattr(resp, "content", "") or "")
+
+                try:
+                    dream_out = await asyncio.wait_for(
+                        run_dream(_dream_llm, workspace=_ws),
+                        timeout=90.0,
+                    )
+                    if dream_out.ok:
+                        emit("context", {"message": f"dream: {dream_out.reason}"})
+                    else:
+                        emit("context", {"message": f"dream skipped: {dream_out.reason}"})
+                except asyncio.TimeoutError:
+                    # Do not orphan a second task while the cancelled coroutine
+                    # still holds dream.lock — run_dream's finally releases it.
+                    emit("context", {"message": "dream: timed out (lock released)"})
+    except Exception:
+        logger.debug("dream scheduling failed", exc_info=True)
+
+    if taxonomy_dispatcher is not None:
+        try:
+            from clawagents.hooks.external import dispatch_taxonomy_hook
+            from clawagents.hooks.taxonomy import HookEvent
+
+            await dispatch_taxonomy_hook(
+                taxonomy_dispatcher,
+                HookEvent.SESSION_END,
+                {
+                    "status": state.status,
+                    "result_preview": (state.result or "")[:500],
+                    "tool_calls": state.tool_calls,
+                },
+                blocking=False,
+            )
+            _result_text = state.result or ""
+            _stop_failed = (
+                state.status in ("error", "max_iterations")
+                or _result_text.startswith("[cancelled]")
+                or _result_text.startswith("[interrupted]")
+            )
+            if _stop_failed:
+                await dispatch_taxonomy_hook(
+                    taxonomy_dispatcher,
+                    HookEvent.STOP_FAILURE,
+                    {
+                        "status": state.status,
+                        "message": _result_text or state.status,
+                    },
+                    blocking=False,
+                )
+                await dispatch_taxonomy_hook(
+                    taxonomy_dispatcher,
+                    HookEvent.NOTIFICATION,
+                    {
+                        "message": _result_text or state.status,
+                        "kind": "stop_failure",
+                    },
+                    blocking=False,
+                )
+            await dispatch_taxonomy_hook(
+                taxonomy_dispatcher,
+                HookEvent.STOP,
+                {"status": state.status},
+                blocking=False,
+            )
+        except Exception:
+            logger.debug("taxonomy session_end hook failed", exc_info=True)
+
     emit("agent_done", {
         "tool_calls": state.tool_calls,
         "iterations": state.iterations,
         "elapsed": elapsed,
         "usage": usage.to_dict(),
     })
+
+    # Stranded interjects (arrived after last drain / on cancel) → host queues them.
+    try:
+        from clawagents.interjection import take_stranded_interjects
+
+        stranded = take_stranded_interjects(run_context)
+        if stranded:
+            if run_context is not None and isinstance(getattr(run_context, "_metadata", None), dict):
+                run_context._metadata["stranded_interjects"] = list(stranded)
+            emit("stranded_interject", {"prompts": stranded, "count": len(stranded)})
+    except Exception:
+        logger.debug("stranded interject flush failed", exc_info=True)
+
     return state

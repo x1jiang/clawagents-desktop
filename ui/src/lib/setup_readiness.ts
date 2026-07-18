@@ -3,7 +3,7 @@ import type { GatewayDiagnostics, ProviderCatalogEntry } from "./gateway";
 export type SetupReadinessStatus = "ready" | "needs-action" | "warning";
 
 export interface SetupReadinessItem {
-  id: "provider" | "project" | "documents";
+  id: "provider" | "project" | "documents" | "companions";
   label: string;
   status: SetupReadinessStatus;
   detail: string;
@@ -39,6 +39,17 @@ export function buildSetupReadiness(
   const hasProviderKey = diagnostics.providers_with_env_keys.length > 0 || hasSavedKey(apiKeys);
   const models = availableModelCount(providers);
   const missingDocumentTools = DOCUMENT_TOOLS.filter((tool) => !diagnostics.external_tools[tool]);
+  const companions = diagnostics.companions || [];
+  const companionsOk =
+    companions.length > 0
+      ? companions.every((c) => c.ok)
+      : Boolean(diagnostics.external_tools["context-mode"] && diagnostics.external_tools.rtk);
+  const companionDetail =
+    companions.length > 0
+      ? companions.map((c) => c.detail || c.name).join(" · ")
+      : companionsOk
+        ? "context-mode and rtk are on PATH."
+        : "Install context-mode (npm -g) and rtk (brew) for full tooling.";
 
   return [
     {
@@ -64,6 +75,12 @@ export function buildSetupReadiness(
       detail: missingDocumentTools.length === 0
         ? "PDF and image text extraction tools are available."
         : missingToolsDetail(missingDocumentTools),
+    },
+    {
+      id: "companions",
+      label: "Companions",
+      status: companionsOk ? "ready" : "warning",
+      detail: companionDetail,
     },
   ];
 }

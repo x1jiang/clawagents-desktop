@@ -52,6 +52,8 @@ export function SettingsModal({ onClose }: Props) {
   const [mcpEnabled, setMcpEnabled] = useState(false);
   const [mcpTrust, setMcpTrust] = useState(false);
   const [contextMode, setContextMode] = useState(true);
+  const [ensureCompanions, setEnsureCompanions] = useState(true);
+  const [companionBusy, setCompanionBusy] = useState(false);
   const [browserTools, setBrowserTools] = useState(false);
   const [trajectory, setTrajectory] = useState(false);
   const [learn, setLearn] = useState(false);
@@ -88,6 +90,7 @@ export function SettingsModal({ onClose }: Props) {
         setMcpEnabled(Boolean(s.mcp_enabled));
         setMcpTrust(Boolean(s.mcp_trust_workspace));
         setContextMode(s.context_mode !== false);
+        setEnsureCompanions(s.ensure_companions !== false);
         setBrowserTools(Boolean(s.browser_tools));
         setTrajectory(Boolean(s.trajectory));
         setLearn(Boolean(s.learn));
@@ -202,6 +205,7 @@ export function SettingsModal({ onClose }: Props) {
           mcp_enabled: mcpEnabled,
           mcp_trust_workspace: mcpTrust,
           context_mode: contextMode,
+          ensure_companions: ensureCompanions,
           browser_tools: browserTools,
           trajectory,
           learn,
@@ -657,6 +661,7 @@ export function SettingsModal({ onClose }: Props) {
                       [mcpEnabled, setMcpEnabled, "Enable MCP servers (~/.clawagents/mcp.json)"],
                       [mcpTrust, setMcpTrust, "Trust workspace .clawagents/mcp.json"],
                       [contextMode, setContextMode, "Context Mode tools"],
+                      [ensureCompanions, setEnsureCompanions, "Ensure companions on Doctor (context-mode / rtk)"],
                       [browserTools, setBrowserTools, "Browser tools (Playwright)"],
                       [trajectory, setTrajectory, "Trajectory logging"],
                       [learn, setLearn, "Learn from trajectories"],
@@ -677,6 +682,26 @@ export function SettingsModal({ onClose }: Props) {
                       {label}
                     </label>
                   ))}
+                  <button
+                    type="button"
+                    disabled={!client || companionBusy}
+                    onClick={() => {
+                      if (!client) return;
+                      setCompanionBusy(true);
+                      void client
+                        .ensureCompanions(true)
+                        .then((r) => {
+                          const after = r.after || r.companions || [];
+                          const summary = after.map((c) => c.detail || c.name).join("; ") || (r.reason || "done");
+                          pushToast(r.ok ? `Companions OK — ${summary}` : `Companions incomplete — ${summary}`, r.ok ? "success" : "error");
+                        })
+                        .catch((e) => pushToast((e as Error).message, "error"))
+                        .finally(() => setCompanionBusy(false));
+                    }}
+                    className="px-3 py-1.5 text-xs border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-800 disabled:opacity-50"
+                  >
+                    {companionBusy ? "Ensuring companions…" : "Ensure companions now"}
+                  </button>
                   <div className="grid grid-cols-2 gap-2 pt-1">
                     <label className="text-xs text-gray-500 dark:text-gray-400">
                       Action mode

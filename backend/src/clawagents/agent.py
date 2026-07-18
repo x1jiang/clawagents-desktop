@@ -3,6 +3,7 @@ import re
 import asyncio
 import difflib
 import unicodedata
+import warnings
 from pathlib import Path
 from typing import Callable, Optional, List, Dict, Any, Union
 
@@ -70,6 +71,7 @@ class ClawAgent:
         llm: LLMProvider,
         tools: ToolRegistry,
         system_prompt: Optional[str] = None,
+        instruction: Optional[str] = None,
         streaming: bool = True,
         use_native_tools: bool = True,
         context_window: int = 1_000_000,
@@ -80,10 +82,13 @@ class ClawAgent:
         trajectory: bool = False,
         rethink: bool = False,
         learn: bool = False,
+        atlas: bool = False,
+        atlas_config: Optional[Any] = None,
         max_iterations: int = 200,
         preview_chars: int = 120,
         response_chars: int = 500,
         features: Optional[dict[str, bool]] = None,
+        workspace: Optional[Union[str, os.PathLike]] = None,
         advisor_llm: Optional[LLMProvider] = None,
         advisor_max_calls: int = 3,
         # ── New, backward-compatible surfaces (OpenAI-Agents-inspired) ──
@@ -108,17 +113,22 @@ class ClawAgent:
         Args:
             llm: The initialized LLM provider
             tools: The registry containing all available tools
-            system_prompt: Optional base system instruction
+            system_prompt: Optional base system instruction (alias: ``instruction``)
+            instruction: Alias for ``system_prompt`` (factory-style naming)
             streaming: Whether to stream responses from the LLM
             use_native_tools: Instruct the LLM to use native structured tool calls (if supported)
             context_window: Maximum allowed tokens before oldest messages are compacted
             trajectory: Whether to log full trajectory data
             rethink: Enables logic to backtrack on consecutive execution failures
             learn: Whether to use post-trajectory reflection to extract permanent lessons
+            atlas: Deprecated no-op (ATLAS removed; use goal_mode / start_goal)
+            atlas_config: Deprecated no-op
             max_iterations: Maximum loop turns before returning early
             preview_chars: Number of characters to log in console output for tool results
             response_chars: Number of characters to log from LLM free-text response
             features: Dictionary to override global architectural variables (e.g. {"micro_compact": False, "wal": True})
+            workspace: Project root for workspace-scoped side effects (``.clawagents/``,
+                filesystem watcher, cwd-scoped tools). Does not ``chdir`` the process.
             advisor_llm: Optional stronger model for strategic guidance (consulted 2-3 times per task)
             advisor_max_calls: Maximum advisor consultations per task (default: 3)
             action_mode: ``tools`` (default) or ``code`` (CodeAct Python actions)
@@ -127,7 +137,7 @@ class ClawAgent:
         """
         self.llm = llm
         self.tools = tools
-        self.system_prompt = system_prompt
+        self.system_prompt = _resolve_system_prompt(system_prompt, instruction)
         self.streaming = streaming
         self.use_native_tools = use_native_tools
         self.context_window = context_window
@@ -138,10 +148,15 @@ class ClawAgent:
         self.trajectory = trajectory
         self.rethink = rethink
         self.learn = learn
+        self.atlas = False  # ATLAS removed
+        self.atlas_config = None
         self.max_iterations = max_iterations
         self.preview_chars = preview_chars
         self.response_chars = response_chars
         self.features = features
+        self.workspace = (
+            str(Path(workspace).expanduser().resolve()) if workspace is not None else None
+        )
         self.advisor_llm = advisor_llm
         self.advisor_max_calls = advisor_max_calls
         self.hooks = hooks
@@ -157,6 +172,7 @@ class ClawAgent:
         self.action_mode = action_mode if action_mode in ("tools", "code") else "tools"
         self.approval_handler = approval_handler
         self.require_approval_tools = list(require_approval_tools or [])
+        self.goal_mode = False
 
     async def invoke(
         self,
@@ -177,11 +193,12 @@ class ClawAgent:
         session_preload_limit: Optional[int] = None,
         on_stream_event: Optional[Callable[[StreamEvent], None]] = None,
         handoffs: Optional[list[Handoff]] = None,
+        images: Optional[list[dict]] = None,
+        files: Optional[list[dict]] = None,
+        session_end_tail: bool = True,
         session_id: Optional[str] = None,
         session_dir: Optional[Path] = None,
         permission_callback: Optional[Callable[[dict], Any]] = None,
-        images: Optional[list[dict]] = None,
-        files: Optional[list[dict]] = None,
     ) -> AgentState:
         """Start the ReAct agent loop for ``task``.
 
@@ -189,8 +206,15 @@ class ClawAgent:
         ``output_type``, ``session``, ``on_stream_event`` …) override the
         values supplied to ``ClawAgent.__init__`` for just this invocation.
 
-        ``images`` / ``files`` attach multimodal content to the first user message
-        (vision pixels / native PDF / DOCX text extraction).
+        ``images`` attaches image content to the first user message so a vision
+        model sees pixels, not a path. Each item is ``{"data": <base64 or
+        data-URL>, "media_type": "image/png"}``; images are sanitized
+        (resized/recompressed to provider limits) before sending.
+
+        ``files`` attaches documents the same way. Each item is
+        ``{"data": <base64 or data-URL>, "media_type": "application/pdf",
+        "name": "report.pdf"}``. PDFs reach the model natively; DOCX is
+        text-extracted; anything else degrades to a short text note.
         """
         image_blocks: Optional[list[dict]] = None
         if images:
@@ -230,9 +254,21 @@ class ClawAgent:
             run_context = RunContext(context=user_context)
         elif user_context is not None and run_context.context is None:
             run_context.context = user_context
+        ws = getattr(self, "workspace", None)
+        if ws:
+            if not isinstance(run_context._metadata, dict):
+                run_context._metadata = {}
+            run_context._metadata.setdefault("workspace", ws)
         default_pm = getattr(self, "_default_permission_mode", None)
         if default_pm is not None:
             run_context.permission_mode = default_pm
+        if permission_callback is not None:
+            run_context.permission_callback = permission_callback
+        store = getattr(self, "skill_store", None)
+        if store is not None:
+            run_context._metadata["skill_store"] = store
+        # Gate Goal reminder + final verifier on this turn's mode (Act ≠ Goal).
+        run_context._metadata["goal_mode"] = bool(getattr(self, "goal_mode", False))
 
         return await run_agent_graph(
             task=task,
@@ -250,6 +286,8 @@ class ClawAgent:
             trajectory=self.trajectory,
             rethink=self.rethink,
             learn=self.learn,
+            atlas=self.atlas,
+            atlas_config=self.atlas_config,
             preview_chars=self.preview_chars,
             response_chars=self.response_chars,
             timeout_s=timeout_s,
@@ -281,30 +319,70 @@ class ClawAgent:
             action_mode=self.action_mode,
             approval_handler=self.approval_handler,
             require_approval_tools=self.require_approval_tools,
+            image_blocks=image_blocks,
+            file_blocks=file_blocks,
+            session_end_tail=session_end_tail,
             session_id=session_id,
             session_dir=session_dir,
             permission_callback=permission_callback,
-            image_blocks=image_blocks,
-            file_blocks=file_blocks,
         )
 
     # ── Convenience hook methods ──────────────────────────────────────
 
+    def _convenience_gate_base(self):
+        """The before_tool gate to preserve underneath convenience filters.
+
+        Captured once, on the first convenience-method call — by then
+        ``create_claw_agent`` has already installed its permission + plan-mode
+        gate as ``self.before_tool``. Subsequent convenience calls (e.g.
+        ``block_tools`` then ``allow_only_tools``) replace each other's filter
+        but always recompose against this same base, so the security gate is
+        never dropped while the documented "last filter wins" behavior among
+        the convenience methods is preserved. A bare ``ClawAgent`` with no gate
+        captures ``None``; ``compose_before_tool`` then returns the lone filter
+        unchanged (so it keeps returning plain booleans).
+        """
+        if not hasattr(self, "_before_tool_base"):
+            self._before_tool_base = self.before_tool
+        return self._before_tool_base
+
     def block_tools(self, *tool_names: str):
         """Block specific tools from being executed.
 
+        Composes with (does not replace) the permission/plan-mode gate that
+        ``create_claw_agent`` installs — blocking a tool must never widen what
+        the other gates allow.
+
         Example: agent.block_tools("execute", "write_file")
         """
+        from clawagents.modes import compose_before_tool
+
+        base = self._convenience_gate_base()
         blocked = set(tool_names)
-        self.before_tool = lambda name, args: name not in blocked
+
+        def _block(name, args):
+            return name not in blocked
+
+        self.before_tool = compose_before_tool(_block, base)
 
     def allow_only_tools(self, *tool_names: str):
         """Only allow specific tools to be executed. All others blocked.
 
+        Composes with the existing gate (see :meth:`block_tools`): an allowed
+        tool still passes through the permission/plan-mode gate rather than
+        bypassing it.
+
         Example: agent.allow_only_tools("read_file", "ls", "grep")
         """
+        from clawagents.modes import compose_before_tool
+
+        base = self._convenience_gate_base()
         allowed = set(tool_names)
-        self.before_tool = lambda name, args: name in allowed
+
+        def _allow(name, args):
+            return name in allowed
+
+        self.before_tool = compose_before_tool(_allow, base)
 
     def inject_context(self, text: str):
         """Inject additional context into every LLM call.
@@ -397,7 +475,12 @@ class ClawAgent:
 
         Example: agent.truncate_output(3000)
         """
+        existing = self.after_tool
+
         def hook(name, args, result):
+            # Chain any existing after_tool hook first, then truncate.
+            if existing is not None:
+                result = existing(name, args, result)
             if len(result.output) > max_chars:
                 from clawagents.tools.registry import ToolResult
                 return ToolResult(
@@ -529,12 +612,14 @@ def create_claw_agent(
     base_url: Optional[str] = None,
     api_version: Optional[str] = None,
     instruction: Optional[str] = None,
+    system_prompt: Optional[str] = None,
     tools: Optional[List] = None,
     skills: Union[str, List[Union[str, os.PathLike]], None] = None,
     skills_exclude: Optional[List[str]] = None,
     fallback_models: Optional[List[str]] = None,
     memory: Union[str, List[Union[str, os.PathLike]], None] = None,
     sandbox: Any = None,
+    sandbox_profile: str | None = None,
     streaming: bool = True,
     context_window: Optional[int] = None,
     max_tokens: Optional[int] = None,
@@ -547,6 +632,8 @@ def create_claw_agent(
     trajectory: Optional[bool] = None,
     rethink: Optional[bool] = None,
     learn: Optional[bool] = None,
+    atlas: Optional[bool] = None,
+    atlas_config: Optional[Any] = None,
     max_iterations: Optional[int] = None,
     preview_chars: Optional[int] = None,
     response_chars: Optional[int] = None,
@@ -563,6 +650,11 @@ def create_claw_agent(
     action_mode: str = "tools",
     approval_handler: Any = None,
     require_approval_tools: Optional[List[str]] = None,
+    on_exit_plan_mode: Any = None,
+    permission_rules: list | None = None,
+    goal_mode: bool = False,
+    features: Optional[dict[str, bool]] = None,
+    workspace: Optional[Union[str, os.PathLike]] = None,
 ) -> ClawAgent:
     """
     Create a ClawAgent with full-stack capabilities.
@@ -579,7 +671,8 @@ def create_claw_agent(
                         Default: from OPENAI_BASE_URL env / None (uses api.openai.com).
         api_version:    API version string. Required for Azure OpenAI (e.g. "2024-12-01-preview").
                         Default: from OPENAI_API_VERSION env / None.
-        instruction:    What the agent should do / how it should behave.
+        instruction:    What the agent should do / how it should behave (alias: ``system_prompt``).
+        system_prompt:  Alias for ``instruction`` (class-style naming).
         tools:          Additional tools. Built-in tools always included.
         skills:         Skill directories (default: auto-discovers ./skills). Bundled skills (e.g. OpenViking) are included when present.
         memory:         AGENTS.md paths (default: auto-discovers ./AGENTS.md, ./CLAWAGENTS.md).
@@ -587,6 +680,16 @@ def create_claw_agent(
         context_window:  Max context window in tokens (default: from CONTEXT_WINDOW env / 1000000).
         max_tokens:     Max output tokens per call (default: from MAX_TOKENS env / 8192).
         temperature:    Sampling temperature (default: from TEMPERATURE env / 0.0).
+        reasoning_effort:
+                        OpenAI reasoning effort for o-series / GPT-5.5+ models
+                        (``none``|``low``|``medium``|``high``|``xhigh``|``max``).
+                        UI aliases: Light→low, Extra High→xhigh. Empty = provider
+                        default. On Responses API, effort is kept with tools.
+        wire_api:       OpenAI transport: ``auto`` | ``responses`` | ``chat_completions``.
+                        Use ``responses`` for Responses-only OpenAI-compatible
+                        proxies (e.g. Codex gateways that 404 ``/chat/completions``).
+        ssl_verify:     TLS verify for custom ``base_url`` hosts. Set ``False`` for
+                        corporate proxies with private CAs.
         trajectory:     Enable trajectory logging to .clawagents/trajectories/.
                         Records every turn for debugging and analysis.
                         Default: from CLAW_TRAJECTORY env / False.
@@ -601,6 +704,8 @@ def create_claw_agent(
                         over time — without model fine-tuning.
                         Automatically enables trajectory when True.
                         Default: from CLAW_LEARN env / False.
+        atlas:          Deprecated no-op (ATLAS removed in 6.16). Use ``goal_mode``.
+        atlas_config:   Deprecated no-op.
         max_iterations: Max tool rounds before the agent stops.
                         Default: from MAX_ITERATIONS env / 200.
         preview_chars:  Max chars for tool-output previews in trajectory logs.
@@ -625,6 +730,16 @@ def create_claw_agent(
         tool_discovery: Register compact tool discovery helpers by default.
         tool_discovery_max_results: Default result cap for tool_discover.
         tool_discovery_max_profile: Maximum profile exposed through discovery helpers.
+        sandbox_profile: Named OS sandbox profile (``workspace``, ``strict``,
+                        ``seatbelt``, ``bwrap``, …). Default: ``CLAW_SANDBOX_PROFILE``
+                        or ``workspace`` (path-confined; upgrades to seatbelt/bwrap
+                        when available). Pass ``sandbox=`` to inject a custom backend.
+        permission_rules: Extra declarative allow/deny/ask rules (deny wins).
+                        Defaults load from ``.clawagents/permissions.json`` when
+                        ``permission_rules`` feature is on.
+        goal_mode:      Inject GOAL autopilot instruction (``start_goal`` /
+                        ``update_goal`` nudge). Goal tools register when
+                        ``goal_autopilot`` is enabled.
 
     Examples:
         # Zero-config (uses env vars)
@@ -660,12 +775,27 @@ def create_claw_agent(
         agent.before_tool = lambda name, args: name != "execute"
     """
     # ── Resolve opt-in flags ────────────────────────────────────────────
+    resolved_instruction = _resolve_system_prompt(system_prompt, instruction)
+    from clawagents.paths import resolve_workspace_root
+
+    workspace_root = str(resolve_workspace_root(workspace))
+
     if trajectory is None:
         trajectory = os.environ.get("CLAW_TRAJECTORY", "").lower() in ("1", "true", "yes")
     if rethink is None:
         rethink = os.environ.get("CLAW_RETHINK", "").lower() in ("1", "true", "yes")
     if learn is None:
         learn = os.environ.get("CLAW_LEARN", "").lower() in ("1", "true", "yes")
+    # ATLAS removed (6.16+): kwargs / CLAW_ATLAS are ignored.
+    if atlas or atlas_config or os.environ.get("CLAW_ATLAS", "").lower() in ("1", "true", "yes"):
+        warnings.warn(
+            "ATLAS was removed in clawagents 6.16; use goal_mode / start_goal instead. "
+            "atlas= and CLAW_ATLAS are ignored.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    atlas = False
+    atlas_config = None
     if learn:
         trajectory = True
     if max_iterations is None:
@@ -701,8 +831,8 @@ def create_claw_agent(
 
     # ── Resolve model → LLMProvider ────────────────────────────────────
     llm = _resolve_model(
-        model, streaming, api_key, context_window, max_tokens, temperature, base_url, api_version,
-        reasoning_effort=reasoning_effort, wire_api=wire_api, ssl_verify=ssl_verify,
+        model, streaming, api_key, context_window, max_tokens, temperature,
+        base_url, api_version, reasoning_effort, wire_api, ssl_verify,
     )
 
     # ── Resolve fallback providers ──────────────────────────────────────
@@ -726,13 +856,36 @@ def create_claw_agent(
         resolved_advisor_llm = _resolve_model(advisor_spec, streaming, adv_key, context_window)
 
     # ── Resolve sandbox backend ────────────────────────────────────────
-    if sandbox is None:
-        from clawagents.sandbox.local import LocalBackend
-        sb = LocalBackend()
-    else:
+    if sandbox is not None:
         sb = sandbox
+    else:
+        from clawagents.sandbox.profiles import resolve_sandbox
+
+        # Default workspace confinement when profiles enabled; honor explicit profile.
+        env_profile = (os.environ.get("CLAW_SANDBOX_PROFILE") or "").strip() or None
+        chosen = sandbox_profile or env_profile
+        sb = resolve_sandbox(
+            chosen,
+            workspace=workspace_root,
+            default="workspace",
+        )
 
     registry = ToolRegistry()
+
+    # Declarative permission rules (deny wins) — attach to registry metadata.
+    from clawagents.tools.permissions import PermissionRule, load_permission_engine
+
+    _perm_engine = load_permission_engine(workspace_root)
+    if permission_rules:
+        for row in permission_rules:
+            if isinstance(row, PermissionRule):
+                _perm_engine.add_rule(row)
+            elif isinstance(row, dict):
+                _perm_engine.add_rule(PermissionRule(**{
+                    k: v for k, v in row.items()
+                    if k in PermissionRule.__dataclass_fields__
+                }))
+    registry._permission_engine = _perm_engine  # type: ignore[attr-defined]
 
     # ── Built-in tools (lazy where possible) ─────────────────────────
     # Eager: cheap, no sandbox dependency
@@ -817,9 +970,20 @@ def create_claw_agent(
 
     # ── Auto-discover skills from default locations ─────────────────────
     skill_summaries: Optional[str] = None
-    base_skill_dirs = _to_list(skills) if skills is not None else _auto_discover_skills()
+    skill_store = None
+    base_skill_dirs = _to_list(skills) if skills is not None else _auto_discover_skills(workspace_root)
     _bundled = _get_bundled_skills_dir()
+    # Bundled skills go FIRST: SkillStore gives later directories precedence on
+    # name collisions, so user/workspace skills must override bundled ones
+    # (openclaw/deepagents precedence order), not the other way around.
     skill_dirs = ([_bundled] + base_skill_dirs) if (_bundled and os.path.isdir(_bundled)) else base_skill_dirs
+    if _bundled:
+        try:
+            from clawagents.skills.best_of_n import ensure_best_of_n_skill
+
+            ensure_best_of_n_skill(Path(_bundled))
+        except Exception:
+            pass
     if skill_dirs:
         from clawagents.tools.skills import SkillStore, create_skill_tools
 
@@ -839,29 +1003,23 @@ def create_claw_agent(
             asyncio.run(skill_store.load_all())
 
         if skills_exclude:
-            for _name in skills_exclude:
-                if _name:
-                    skill_store.skills.pop(str(_name), None)
+            from clawagents.tools.skills import _norm_skill_key
+
+            _excluded_keys = {_norm_skill_key(str(n)) for n in skills_exclude if n}
+            for _name in list(skill_store.skills):
+                if _norm_skill_key(_name) in _excluded_keys:
+                    skill_store.skills.pop(_name, None)
+            for _name in list(skill_store.ineligible):
+                if _norm_skill_key(_name) in _excluded_keys:
+                    skill_store.ineligible.pop(_name, None)
 
         loaded_skills = skill_store.list()
         if loaded_skills:
-            lines = [f"- **{s.name}**: {s.description or '(no description)'}" for s in loaded_skills]
-            skill_summaries = "## Available Skills\nUse the `use_skill` tool to load full instructions.\n" + "\n".join(lines)
-
-        # Skill prompt budget limits
-        MAX_SKILLS_PROMPT_CHARS = 4000
-        MAX_SKILLS_IN_PROMPT = 20
-
-        if skill_summaries:
-            skill_lines = [line for line in skill_summaries.split("\n") if line.startswith("- **")]
-            if len(skill_lines) > MAX_SKILLS_IN_PROMPT:
-                truncated = skill_lines[:MAX_SKILLS_IN_PROMPT]
-                skill_summaries = ("## Available Skills\nUse the `use_skill` tool to load full instructions.\n"
-                    + "\n".join(truncated)
-                    + f"\n\n({len(skill_lines) - MAX_SKILLS_IN_PROMPT} more skills available — use list_skills to see all)")
-            if len(skill_summaries) > MAX_SKILLS_PROMPT_CHARS:
-                skill_summaries = (skill_summaries[:MAX_SKILLS_PROMPT_CHARS]
-                    + "\n\n...(skill list truncated — use list_skills to see all)")
+            # Initial catalog (no user turn yet); before_llm re-ranks each round.
+            skill_summaries = _build_skill_catalog_prompt(
+                loaded_skills,
+                context_window=context_window,
+            )
 
         for skill_tool in create_skill_tools(
             skill_store,
@@ -875,47 +1033,77 @@ def create_claw_agent(
 
     from clawagents.tools.skill_workshop import create_skill_workshop_tool
 
-    registry.register(create_skill_workshop_tool(workspace=os.getcwd()))
+    registry.register(
+        create_skill_workshop_tool(
+            workspace=workspace_root,
+            on_reload=(skill_store.reload if skill_store is not None else None),
+        )
+    )
 
     from clawagents.tools.search_history import create_search_history_tool
 
-    registry.register(create_search_history_tool(workspace=os.getcwd()))
+    registry.register(create_search_history_tool(workspace=workspace_root))
 
     from clawagents.tools.retrieve_tool_result import create_retrieve_tool_result_tool
 
-    registry.register(create_retrieve_tool_result_tool(workspace=os.getcwd()))
+    registry.register(create_retrieve_tool_result_tool(workspace=workspace_root))
 
     from clawagents.tools.context_tools import create_context_tools
 
-    for t in create_context_tools(workspace=os.getcwd()):
+    for t in create_context_tools(workspace=workspace_root):
         registry.register(t)
 
     from clawagents.tools.git_tools import create_git_tools
 
-    for t in create_git_tools(workspace=os.getcwd()):
+    for t in create_git_tools(workspace=workspace_root):
         registry.register(t)
 
     from clawagents.tools.plan_mode import create_plan_mode_tools
 
-    for t in create_plan_mode_tools():
+    for t in create_plan_mode_tools(on_exit_plan_mode=on_exit_plan_mode):
         if registry.get(t.name) is None:
             registry.register(t)
 
     from clawagents.tools.worktree_tools import create_worktree_tools
 
-    for t in create_worktree_tools(workspace=os.getcwd()):
+    for t in create_worktree_tools(workspace=workspace_root):
         registry.register(t)
+
+    from clawagents.tools.hunk_review import create_hunk_review_tools
+
+    for t in create_hunk_review_tools(workspace=workspace_root):
+        if registry.get(t.name) is None:
+            registry.register(t)
+
+    from clawagents.tools.marketplace_tools import create_marketplace_tools
+
+    for t in create_marketplace_tools(workspace=workspace_root):
+        if registry.get(t.name) is None:
+            registry.register(t)
+
+    from clawagents.config.features import is_enabled as _feat_on
+    from clawagents.goal.tools import create_goal_tools
+
+    # Goal tools + verifier only when UI/API explicitly enables Goal mode.
+    # Otherwise Act/Plan turns still saw start_goal / final-gate verify because
+    # goal_autopilot defaults on and an active `.clawagents/goal/state.json`
+    # from a prior Goal run kept hijacking the loop.
+    if goal_mode and _feat_on("goal_autopilot"):
+        for t in create_goal_tools():
+            if registry.get(t.name) is None:
+                registry.register(t)
 
     # ── Auto-discover memory from default locations ────────────────────
     memory_paths = _to_list(memory) if memory is not None else _auto_discover_memory()
     composed_before_llm = _compose_before_llm(
         memory_paths=memory_paths,
         skill_summaries=skill_summaries,
+        skill_store=skill_store,
+        context_window=context_window,
     )
 
     # ── Custom mode (instruction + tool gate + permission) ────────────
     mode_before: Optional[BeforeToolHook] = None
-    resolved_instruction = instruction
     permission_mode_override = None
     if mode:
         from clawagents.modes import (
@@ -947,21 +1135,65 @@ def create_claw_agent(
             (resolved_instruction or "") + "\n\n" + CODEACT_SYSTEM_ADDENDUM
         ).strip() or CODEACT_SYSTEM_ADDENDUM
 
+    if goal_mode:
+        _goal_nudge = (
+            "You are in GOAL mode (planner→verify→strategist autopilot). For any "
+            "multi-step objective, call `start_goal` first to write a verifier "
+            "contract, then work the plan and report via `update_goal`. Do not "
+            "claim the goal is done until the verifier accepts."
+        )
+        if resolved_instruction and str(resolved_instruction).strip():
+            resolved_instruction = (
+                _goal_nudge.rstrip() + "\n\n" + str(resolved_instruction).lstrip()
+            )
+        else:
+            resolved_instruction = _goal_nudge
+
+    # Wire permission "ask" → approval_handler when the host provides one.
+    if approval_handler is not None and callable(approval_handler):
+        def _perm_ask(tool_name: str, args: dict, message: str) -> bool:
+            try:
+                result = approval_handler(tool_name, args, "")
+                if hasattr(result, "__await__"):
+                    # Sync gate cannot await; fall through as deny.
+                    return False
+                return bool(result)
+            except Exception:
+                return False
+
+        _perm_engine.ask_handler = _perm_ask
+
     agent = ClawAgent(
         llm=llm, tools=registry, system_prompt=resolved_instruction,
         streaming=streaming, use_native_tools=use_native_tools,
         context_window=context_window, on_event=on_event,
         before_llm=composed_before_llm, trajectory=trajectory,
-        rethink=rethink, learn=learn, max_iterations=max_iterations,
+        rethink=rethink, learn=learn, atlas=False,
+        atlas_config=None, max_iterations=max_iterations,
         preview_chars=preview_chars, response_chars=response_chars,
+        features=features,
+        workspace=workspace_root,
         advisor_llm=resolved_advisor_llm, advisor_max_calls=resolved_advisor_max_calls,
         handoffs=handoffs, name=name,
         action_mode=action_mode_norm,
         approval_handler=approval_handler,
         require_approval_tools=require_approval_tools,
     )
-    if mode_before is not None:
-        agent.before_tool = mode_before
+    agent.goal_mode = bool(goal_mode)
+    if skill_store is not None:
+        agent.skill_store = skill_store  # type: ignore[attr-defined]
+    agent._permission_engine = _perm_engine  # type: ignore[attr-defined]
+    agent._sandbox_backend = sb  # type: ignore[attr-defined]
+
+    # Compose permission deny-gate with mode before_tool (HookResult-aware).
+    from clawagents.graph.agent_loop import HookResult
+    from clawagents.modes import compose_before_tool
+
+    def _perm_before(tool_name: str, args: dict):
+        ok, msg = _perm_engine.gate(tool_name, args if isinstance(args, dict) else {})
+        return HookResult(allowed=ok, reason=msg or ("denied" if not ok else ""))
+
+    agent.before_tool = compose_before_tool(_perm_before, mode_before)
     if permission_mode_override is not None:
         agent._default_permission_mode = permission_mode_override  # type: ignore[attr-defined]
 
@@ -974,7 +1206,42 @@ def create_claw_agent(
 
     # ── Sub-agent tool (always available) ──────────────────────────────
     from clawagents.tools.subagent import create_task_tool
-    registry.register(create_task_tool(llm, registry))
+    registry.register(create_task_tool(llm, registry, workspace=workspace_root))
+
+    # v6.17: PTY sessions + rewind tools
+    try:
+        from clawagents.config.features import is_enabled as _feat617
+        if _feat617("pty_sessions"):
+            from clawagents.tools.pty_session import create_pty_tools
+            for t in create_pty_tools():
+                if registry.get(t.name) is None:
+                    registry.register(t)
+        if _feat617("session_rewind"):
+            from clawagents.memory.hunk_watcher import create_rewind_tools, get_watcher
+            for t in create_rewind_tools():
+                if registry.get(t.name) is None:
+                    registry.register(t)
+            try:
+                get_watcher(workspace_root).start()
+            except Exception:
+                pass
+        if _feat617("hashline_tools"):
+            from clawagents.tools.hashline import create_hashline_tools
+            for t in create_hashline_tools(sb):
+                if registry.get(t.name) is None:
+                    registry.register(t)
+    except Exception:
+        pass
+
+    # v6.17: hybrid smart-memory recall
+    try:
+        from clawagents.config.features import is_enabled as _feat_mem
+        if _feat_mem("smart_memory") or _feat_mem("hybrid_memory_search"):
+            from clawagents.tools.memory_search import create_memory_search_tool
+            if registry.get("memory_search") is None:
+                registry.register(create_memory_search_tool(workspace=workspace_root))
+    except Exception:
+        pass
 
     # ── MCP server integration (v6.4, optional) ────────────────────────
     if mcp_servers:
@@ -1105,6 +1372,20 @@ def _resolve_model(
     return provider
 
 
+def _resolve_system_prompt(
+    system_prompt: Optional[str],
+    instruction: Optional[str],
+) -> Optional[str]:
+    """Resolve ``system_prompt`` / ``instruction`` aliases (mutually compatible)."""
+    if system_prompt is not None and instruction is not None and system_prompt != instruction:
+        raise ValueError(
+            "Cannot specify both system_prompt and instruction with different values"
+        )
+    if system_prompt is not None:
+        return system_prompt
+    return instruction
+
+
 def _to_list(value) -> list:
     """Convert None, string, or list to a list."""
     if value is None:
@@ -1191,7 +1472,23 @@ def _clamp_skill_description(text: str, max_chars: int) -> str:
     return cleaned[: max_chars - 1].rstrip() + "…"
 
 
-def _format_skill_line(name: str, description: str, desc_cap: int) -> str:
+def _format_skill_line(
+    name: str,
+    description: str,
+    desc_cap: int,
+    *,
+    when_to_use: str = "",
+) -> str:
+    from clawagents.config.features import is_enabled
+    from clawagents.skills.strategy import format_skill_catalog_line
+
+    if is_enabled("skill_when_to_use") and when_to_use:
+        return format_skill_catalog_line(
+            name,
+            description,
+            when_to_use=when_to_use,
+            desc_cap=desc_cap if desc_cap > 0 else 10_000,
+        )
     desc = _clamp_skill_description(description, desc_cap)
     if desc:
         return f"- **{name}**: {desc}"
@@ -1360,6 +1657,7 @@ def _skill_relevance_score(skill: Any, query: str) -> float:
     aliases = _phrases("aliases")
     triggers = _phrases("triggers")
     anti_triggers = _phrases("anti_triggers")
+    when_to_use = str(getattr(skill, "when_to_use", "") or "").strip().lower()
 
     def _phrase_matches(phrase: str) -> bool:
         phrase_tokens = _skill_core_tokens(phrase)
@@ -1388,6 +1686,12 @@ def _skill_relevance_score(skill: Any, query: str) -> float:
     for phrase in triggers:
         if _phrase_matches(phrase):
             score += 70.0
+    if when_to_use and _phrase_matches(when_to_use):
+        score += 75.0
+    elif when_to_use:
+        when_tokens = _skill_core_tokens(when_to_use)
+        when_overlap = _skill_core_tokens(q) & when_tokens
+        score += 12.0 * len(when_overlap)
 
     if explicit_name:
         score += 120.0
@@ -1402,7 +1706,7 @@ def _skill_relevance_score(skill: Any, query: str) -> float:
     query_words = re.findall(r"[a-z0-9+#]{4,}", q)
     searchable_words = re.findall(
         r"[a-z0-9+#]{4,}",
-        " ".join([name_l, *aliases, *triggers]),
+        " ".join([name_l, *aliases, *triggers, when_to_use]),
     )
     fuzzy = max(
         (
@@ -1463,6 +1767,7 @@ def _build_skill_catalog_prompt(
     *,
     context_window: int | None = None,
     query: str | None = None,
+    touched_paths: list[str] | None = None,
 ) -> str:
     """Build a bounded name/description catalog (Claude/Codex-style).
 
@@ -1476,7 +1781,13 @@ def _build_skill_catalog_prompt(
     if not loaded_skills:
         return ""
 
-    ranked = _rank_skills_for_query(loaded_skills, query)
+    from clawagents.skills.strategy import auto_suggest_lines, filter_skills_for_catalog
+
+    gated = filter_skills_for_catalog(loaded_skills, touched_paths=touched_paths)
+    if not gated:
+        return ""
+
+    ranked = _rank_skills_for_query(gated, query)
     max_desc = SKILL_LISTING_MAX_DESC_CHARS
     env_desc = (os.environ.get("CLAW_SKILL_LISTING_MAX_DESC_CHARS") or "").strip()
     if env_desc.isdigit():
@@ -1484,9 +1795,17 @@ def _build_skill_catalog_prompt(
 
     budget = skill_listing_budget_chars(context_window)
     name_index = _compact_skill_name_index(
-        loaded_skills,
+        gated,
         max_chars=max(800, min(2400, budget // 2)),
     )
+
+    def _line(skill: Any, desc_cap: int) -> str:
+        return _format_skill_line(
+            str(getattr(skill, "name", "") or "skill"),
+            str(getattr(skill, "description", "") or ""),
+            desc_cap,
+            when_to_use=str(getattr(skill, "when_to_use", "") or ""),
+        )
 
     # Normal LLM rounds have a current user query. Prefer recall over saving a
     # small prompt suffix: include all confident candidates up to a generous
@@ -1525,13 +1844,9 @@ def _build_skill_catalog_prompt(
 
         lines = [_SKILL_CATALOG_HEADER.rstrip(), name_index, heading]
         for skill, _score in relevant:
-            lines.append(
-                _format_skill_line(
-                    str(getattr(skill, "name", "") or "skill"),
-                    str(getattr(skill, "description", "") or ""),
-                    min(max_desc, 240),
-                )
-            )
+            lines.append(_line(skill, min(max_desc, 240)))
+        for nudge in auto_suggest_lines(relevant):
+            lines.append(nudge)
         lines.append(
             "Choose by task fit, not rank alone. Call `use_skill` and read every page "
             "before acting."
@@ -1546,11 +1861,7 @@ def _build_skill_catalog_prompt(
         if len(text) > budget:
             compact = [_SKILL_CATALOG_HEADER.rstrip(), name_index, heading]
             for skill, _score in relevant:
-                line = _format_skill_line(
-                    str(getattr(skill, "name", "") or "skill"),
-                    str(getattr(skill, "description", "") or ""),
-                    100,
-                )
+                line = _line(skill, 100)
                 if len("\n".join([*compact, line])) > budget - 160:
                     break
                 compact.append(line)
@@ -1564,10 +1875,14 @@ def _build_skill_catalog_prompt(
     body_budget = max(200, budget - len(_SKILL_CATALOG_HEADER) - reserve)
 
     entries = [
-        (str(getattr(s, "name", "") or "skill"), str(getattr(s, "description", "") or ""))
+        (
+            str(getattr(s, "name", "") or "skill"),
+            str(getattr(s, "description", "") or ""),
+            str(getattr(s, "when_to_use", "") or ""),
+        )
         for s in ranked
     ]
-    entries = [(n, d) for n, d in entries if n.strip()]
+    entries = [(n, d, w) for n, d, w in entries if n.strip()]
     if not entries:
         return ""
 
@@ -1583,12 +1898,12 @@ def _build_skill_catalog_prompt(
         shown = []
         used = 0
         omitted = 0
-        for i, (name, desc) in enumerate(entries):
+        for i, (name, desc, when) in enumerate(entries):
             if i >= MAX_SKILLS_IN_PROMPT and desc_cap > 0:
                 # Beyond soft count: name-only for the rest of this pass.
-                line = _format_skill_line(name, desc, 0)
+                line = _format_skill_line(name, desc, 0, when_to_use=when)
             else:
-                line = _format_skill_line(name, desc, desc_cap)
+                line = _format_skill_line(name, desc, desc_cap, when_to_use=when)
             add = len(line) + (1 if shown else 0)
             if used + add > body_budget:
                 omitted = len(entries) - len(shown)
@@ -1610,7 +1925,6 @@ def _build_skill_catalog_prompt(
     return text
 
 
-# Default locations for auto-discovery
 _DEFAULT_MEMORY_FILES = ["AGENTS.md", "CLAWAGENTS.md", "CLAUDE.md"]
 _DEFAULT_SKILL_DIRS = [
     "skills",
@@ -1631,11 +1945,31 @@ def _auto_discover_memory() -> list:
     return [str(p) for p in discover_rule_paths()]
 
 
-def _auto_discover_skills() -> list:
-    """Auto-discover skill directories in common locations."""
+def _auto_discover_skills(workspace: str | os.PathLike | None = None) -> list:
+    """Auto-discover skill directories in common locations.
+
+    Returned lowest-precedence first (SkillStore gives later dirs precedence):
+    personal skill homes, then workspace dirs. Personal homes
+    (`~/.clawagents/skills`, `~/.agents/skills`) are opt-in via
+    ``CLAW_USER_SKILL_HOMES=1`` so library consumers and tests stay hermetic;
+    the VS Code extension resolves homes itself and passes them explicitly.
+    """
+    from clawagents.paths import resolve_workspace_root
+
+    ws = str(resolve_workspace_root(workspace))
     found = []
+    if (os.environ.get("CLAW_USER_SKILL_HOMES") or "").strip() == "1":
+        from clawagents.paths import get_clawagents_home
+
+        home_candidates = [
+            str(get_clawagents_home(create=False) / "skills"),
+            os.path.expanduser("~/.agents/skills"),
+        ]
+        for path in home_candidates:
+            if os.path.isdir(path):
+                found.append(path)
     for name in _DEFAULT_SKILL_DIRS:
-        path = os.path.join(os.getcwd(), name)
+        path = os.path.join(ws, name)
         if os.path.isdir(path):
             found.append(path)
     return found
@@ -1689,10 +2023,13 @@ def _apply_fallback_providers(
 def _compose_before_llm(
     memory_paths: list,
     skill_summaries: Optional[str],
+    skill_store: Any = None,
+    context_window: Optional[int] = None,
 ) -> Optional[BeforeLLMHook]:
     """Compose memory/rules + skill injection into one before_llm hook.
 
     Reloads rule files every LLM round so always-on rules survive compaction.
+    Re-ranks the skill catalog against the latest user turn when a store is set.
     """
     from clawagents.prompts import append_prompt_injection, build_prompt_injection
 
@@ -1707,12 +2044,39 @@ def _compose_before_llm(
                 from clawagents.memory.loader import load_memory_files
 
                 memory_content = load_memory_files(memory_paths)
-        if not memory_content and not skill_summaries:
+
+        summaries = skill_summaries
+        discovery = ""
+        if skill_store is not None:
+            try:
+                skill_store.maybe_hot_reload()
+            except Exception:
+                pass
+            loaded = skill_store.list()
+            if loaded:
+                touched = list(getattr(skill_store, "session_touched_paths", []) or [])
+                summaries = _build_skill_catalog_prompt(
+                    loaded,
+                    context_window=context_window,
+                    query=_latest_user_text(messages),
+                    touched_paths=touched,
+                )
+            try:
+                discovery = skill_store.consume_discovery_announcement() or ""
+            except Exception:
+                discovery = ""
+
+        if discovery and summaries:
+            summaries = discovery + "\n\n" + summaries
+        elif discovery:
+            summaries = discovery
+
+        if not memory_content and not summaries:
             return messages
-        injection = build_prompt_injection(memory_content, skill_summaries)
+        injection = build_prompt_injection(memory_content, summaries)
         return list(append_prompt_injection(messages, injection))
 
     # Always return a hook when we have paths or skills so rounds re-read disk.
-    if memory_paths or skill_summaries:
+    if memory_paths or skill_summaries or skill_store is not None:
         return hook
     return None

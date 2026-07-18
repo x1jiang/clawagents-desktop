@@ -176,10 +176,85 @@ def _check(label: str, ok: bool, detail: str = "") -> bool:
     return ok
 
 
+def _probe_other_interpreters(current_exe: str, current_ver: str) -> list[str]:
+    """Find other python* binaries on PATH with a different clawagents version."""
+    import shutil
+
+    warnings: list[str] = []
+    seen: set[str] = set()
+    try:
+        seen.add(os.path.realpath(current_exe))
+    except OSError:
+        seen.add(current_exe)
+
+    names = ("python3", "python", "python3.13", "python3.12", "python3.11")
+    for name in names:
+        resolved = shutil.which(name)
+        if not resolved:
+            continue
+        try:
+            real = os.path.realpath(resolved)
+        except OSError:
+            real = resolved
+        if real in seen:
+            continue
+        seen.add(real)
+        try:
+            import subprocess
+
+            out = subprocess.run(
+                [
+                    resolved,
+                    "-c",
+                    "import clawagents,sys; "
+                    "print(getattr(clawagents,'__version__','?')); "
+                    "print(getattr(clawagents,'__file__','?'))",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=12,
+            )
+        except Exception as exc:
+            warnings.append(f"{resolved}: probe failed ({exc})")
+            continue
+        if out.returncode != 0:
+            continue
+        lines = [ln.strip() for ln in (out.stdout or "").splitlines() if ln.strip()]
+        other_ver = lines[0] if lines else "?"
+        if other_ver == current_ver:
+            continue
+        warnings.append(f"{resolved}: clawagents {other_ver} (this process: {current_ver})")
+    return warnings
+
+
 def cmd_doctor():
     """Check configuration health and report issues."""
     sys.stderr.write("\nClawAgents Doctor\n" + "=" * 40 + "\n\n")
     issues = 0
+
+    # 0. Install identity (catches multi-Python drift)
+    import clawagents as _pkg
+
+    pkg_ver = getattr(_pkg, "__version__", "?")
+    pkg_file = getattr(_pkg, "__file__", "?")
+    _check("Installed package", True, f"clawagents {pkg_ver}")
+    _check("Interpreter", True, sys.executable)
+    _check("Package path", True, str(pkg_file))
+    if pkg_file and pkg_file != "?" and "site-packages" not in str(pkg_file) and "/src/clawagents/" in str(pkg_file).replace("\\", "/"):
+        _check(
+            "Editable / source checkout",
+            True,
+            "importing from a source tree — shell `python3` may still use a different install",
+        )
+    for warn in _probe_other_interpreters(sys.executable, str(pkg_ver)):
+        _check("PATH interpreter drift", False, warn)
+        issues += 1
+        sys.stderr.write(
+            "      Fix: upgrade that interpreter, or set VS Code clawagents.pythonPath "
+            "to this executable and Restart Sidecar.\n"
+            f"      Example: \"{warn.split(':', 1)[0]}\" -m pip install -U "
+            f"'clawagents[gemini,anthropic,bedrock,mcp]>={pkg_ver},<7'\n"
+        )
 
     # 1. Load config first (triggers .env discovery)
     import clawagents.config.config as _cfg
@@ -288,6 +363,20 @@ def cmd_doctor():
     catalog = _build_builtin_tool_catalog()
     _check("Tool catalog", bool(catalog), f"{len(catalog)} built-in tools inspectable")
 
+    # 12. Companion CLIs (context-mode, rtk) — version floors
+    sys.stderr.write("\n  Companions:\n")
+    try:
+        from clawagents.companions import probe_companions
+
+        for status in probe_companions():
+            _check(status.name, status.ok_vs_floor, status.summary())
+            if not status.ok_vs_floor:
+                issues += 1
+                sys.stderr.write(f"      Fix: {status.hint}\n")
+    except Exception as exc:  # noqa: BLE001
+        _check("companions", False, str(exc))
+        issues += 1
+
     # Summary
     sys.stderr.write("\n" + "=" * 40 + "\n")
     if issues == 0:
@@ -308,6 +397,8 @@ def _build_builtin_tool_catalog() -> list[dict[str, Any]]:
     from clawagents.tools.interactive import interactive_tools
     from clawagents.tools.tool_program import create_tool_program_tool
     from clawagents.tools.background_task import create_background_task_tools
+    from clawagents.config.features import is_enabled
+    from clawagents.tools.hashline import create_hashline_tools
 
     sb = LocalBackend()
     registry = ToolRegistry()
@@ -320,6 +411,7 @@ def _build_builtin_tool_catalog() -> list[dict[str, Any]]:
         *create_advanced_fs_tools(sb),
         *web_tools,
         *create_background_task_tools(),
+        *(create_hashline_tools(sb) if is_enabled("hashline_tools") else ()),
     ]:
         registry.register(tool)
     registry.register(create_tool_program_tool(registry))
@@ -522,7 +614,7 @@ def cmd_serve(port: int):
         gateway_api_key = os.getenv("GATEWAY_API_KEY", "")
         auth_status = "enabled" if gateway_api_key else "disabled (set GATEWAY_API_KEY to enable)"
         sys.stderr.write(f"   Auth: {auth_status}\n")
-        sys.stderr.write(f"   Endpoints: POST /chat | POST /chat/stream | WS /ws | GET /queue | GET /health\n\n")
+        sys.stderr.write("   Endpoints: POST /chat | POST /chat/stream | WS /ws | GET /queue | GET /health\n\n")
         asyncio.run(_run())
     else:
         sys.stderr.write(f"{banner} | gateway on port {port}\n")

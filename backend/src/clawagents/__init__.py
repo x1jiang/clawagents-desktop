@@ -1,4 +1,4 @@
-__version__ = "6.12.13"
+__version__ = "6.20.8"
 
 from clawagents.agent import ClawAgent, create_claw_agent
 from clawagents.run_result import RunResult
@@ -119,6 +119,9 @@ from clawagents.commands import (
 )
 
 # ── Mid-run nudges (v6.5) ──────────────────────────────────────────────
+from clawagents.interjection import (
+    enqueue_interject, drain_interjects, take_stranded_interjects,
+)
 from clawagents.steer import (
     SteerMessage, SteerQueue, NextTurnQueue, SteerHook,
     steer, queue_message,
@@ -192,6 +195,10 @@ from clawagents.media.images import (
 from clawagents.permissions import (
     PermissionMode, WRITE_CLASS_TOOLS,
     is_write_class_tool, permission_mode_from_string,
+)
+from clawagents.permissions.plan_approval import (
+    PlanApprovalAction, PlanApprovalDecision,
+    await_plan_approval, normalize_plan_decision,
 )
 from clawagents.tools.bash_validator import (
     BashDecision, CommandCategory, Decision, validate_bash,
@@ -314,3 +321,39 @@ from clawagents.rl import (
     TRL_AVAILABLE,
     ATROPOS_AVAILABLE,
 )
+
+# run_goal is lazy via __getattr__ (see below) so goal.product is not imported
+# at package import time.
+
+# ── Grok-Build parity (v6.14+) ─────────────────────────────────────────
+from clawagents.autopilot.loop import run_autopilot
+from clawagents.marketplace import install_from_source, list_installed
+from clawagents.sandbox.profiles import (
+    OSSandboxProfile,
+    get_profile,
+    list_profiles,
+    resolve_sandbox,
+)
+from clawagents.tools.subagent_resolve import resolve_subagent, ResolvedSubAgent
+from clawagents.memory.attributed_hunks import (
+    list_hunks,
+    accept_hunk,
+    reject_hunk,
+    refresh_file_hunks,
+)
+from clawagents.memory.scope_graph import ScopeGraph, build_repo_map_incremental
+from clawagents.memory.full_replace_compaction import (
+    assemble_compacted_history,
+    apply_full_replace_compaction,
+    format_compact_summary,
+    is_degenerate_summary,
+)
+
+
+def __getattr__(name: str):
+    if name == "run_goal":
+        from clawagents.goal.product import run_goal as _run_goal
+
+        return _run_goal
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
