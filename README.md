@@ -34,9 +34,9 @@ xcrun notarytool store-credentials clawagents-notary \
 SKIP_NOTARIZE=1 ./build.sh
 ```
 
-## Features (0.4.2)
+## Features (0.4.3)
 
-- **Engine 6.20.21:** nested array-of-object tool schemas (Gemini 400 fix); model-identity system line; prior skill/crush/sandbox fixes
+- **Engine 6.20.22:** Responses retry de-nest; `$ref`/`anyOf` schemas; model-prefix classifiers; call_id stream keys
 - **Settings / providers:** concurrent settings-save hardening; Mantle/catalog fixes; connection-banner reliability
 - **VS Code parity carry-forward:** skill capabilities, project-scoped runtime trust, rewind / companions / plan-approval
 - Local projects and **SSH remote** projects (`~/.ssh/config`, including `ProxyJump`)
