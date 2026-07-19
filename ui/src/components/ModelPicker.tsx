@@ -1,9 +1,16 @@
 import { useEffect, useState } from "react";
-import { useProjects } from "../stores/projects";
+import { useProjectGateway } from "../lib/project_client";
 
 interface Props {
   value: string;
   onChange: (model: string) => void;
+  // Which project's provider catalog / settings to read. undefined/null =
+  // the projectless (global) scope. Without this, every caller read the
+  // LOCAL machine's catalog even for an SSH-connected project with its own
+  // independently-configured remote gateway — models actually usable on the
+  // remote showed disabled (or vice versa), so a selection could fail at
+  // send time with a provider error.
+  projectId?: string | null;
 }
 
 interface ProviderRow {
@@ -13,20 +20,20 @@ interface ProviderRow {
   models: Array<{ id: string; label: string; available: boolean }>;
 }
 
-export function ModelPicker({ value, onChange }: Props) {
-  const client = useProjects((s) => s.client);
+export function ModelPicker({ value, onChange, projectId }: Props) {
+  const client = useProjectGateway(projectId);
   const [providers, setProviders] = useState<ProviderRow[]>([]);
   const [defaultModel, setDefaultModel] = useState<string>("");
 
   useEffect(() => {
     if (!client) return;
-    client.listProviders().then(setProviders);
+    client.listProviders(projectId ?? null, projectId == null).then(setProviders);
     // The workspace default — surfaced in the (default) option label so
     // users know what "default" actually picks. Best-effort.
-    client.getAppSettings()
+    client.getAppSettings(projectId ?? null, projectId == null)
       .then((s) => setDefaultModel(s.default_model || ""))
       .catch(() => { /* ignore */ });
-  }, [client]);
+  }, [client, projectId]);
 
   return (
     <select

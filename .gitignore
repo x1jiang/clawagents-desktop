@@ -35,3 +35,7 @@ ui/pnpm-workspace.yaml
 *.p12
 *.cer
 *.certSigningRequest
+
+# Local fork snapshots — never ship
+backend/.fork_backup*/
+**/.fork_backup*/

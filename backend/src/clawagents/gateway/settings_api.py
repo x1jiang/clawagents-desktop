@@ -20,7 +20,11 @@ from clawagents.desktop_stores.provider_catalog import _has_aws_credentials
 from clawagents.desktop_stores.app_paths import projectless_scratch_dir
 from clawagents.desktop_stores.project_store import ProjectNotFoundError, ProjectStore
 from clawagents.desktop_stores.runtime_trust import RuntimeTrustStore
-from clawagents.desktop_stores.settings_store import SettingsStore, effective_settings
+from clawagents.desktop_stores.settings_store import (
+    SettingsStore,
+    effective_settings,
+    settings_store_lock,
+)
 from clawagents.desktop_stores.url_trust import is_trusted_base_url
 from clawagents.gateway.desktop_router import require_auth
 
@@ -178,83 +182,87 @@ def patch_app_settings(
                 detail="runtime trust requires project_id or projectless scope",
             )
         requested_runtime = set()
-    store = SettingsStore()
-    settings = store.load()
-    if "default_model" in sent and body.default_model is not None:
-        settings.default_model = body.default_model
-    if "default_mode" in sent and body.default_mode is not None:
-        settings.default_mode = body.default_mode
-    if "theme" in sent and body.theme is not None:
-        settings.theme = body.theme
-    if "workspace_system_prompt" in sent:
-        settings.workspace_system_prompt = body.workspace_system_prompt or ""
-    if "provider" in sent and body.provider is not None:
-        allowed = {"auto", "openai", "anthropic", "gemini", "bedrock", "ollama"}
-        settings.provider = body.provider if body.provider in allowed else "auto"
-    if "base_url" in sent and body.base_url is not None:
-        base = body.base_url.strip()
-        trust_store = RuntimeTrustStore()
-        approved_now = bool(root) and bool(body.trust_custom_base_url)
-        already_approved = bool(root) and trust_store.is_url_trusted(root, base)
-        if base and not is_trusted_base_url(base) and not (approved_now or already_approved):
-            raise HTTPException(
-                status_code=400,
-                detail="Untrusted base_url — set trust_custom_base_url=true to confirm",
-            )
-        settings.base_url = base
-    if "aws_region" in sent and body.aws_region is not None:
-        settings.aws_region = body.aws_region.strip()
-    if "aws_profile" in sent and body.aws_profile is not None:
-        settings.aws_profile = body.aws_profile.strip()
-    if "mcp_enabled" in sent and body.mcp_enabled is not None:
-        settings.mcp_enabled = bool(body.mcp_enabled)
-    if "context_mode" in sent and body.context_mode is not None:
-        settings.context_mode = bool(body.context_mode)
-    if "browser_tools" in sent and body.browser_tools is not None:
-        settings.browser_tools = bool(body.browser_tools)
-    if "trajectory" in sent and body.trajectory is not None:
-        settings.trajectory = bool(body.trajectory)
-    if "learn" in sent and body.learn is not None:
-        settings.learn = bool(body.learn)
-    if "action_mode" in sent and body.action_mode is not None:
-        settings.action_mode = body.action_mode if body.action_mode in ("tools", "code") else "tools"
-    if "agent_mode" in sent and body.agent_mode is not None:
-        settings.agent_mode = body.agent_mode
-    if "reasoning_effort" in sent and body.reasoning_effort is not None:
-        effort = body.reasoning_effort.strip().lower()
-        allowed_effort = {"", "none", "low", "medium", "high", "xhigh", "max"}
-        settings.reasoning_effort = effort if effort in allowed_effort else "medium"
-    if "wire_api" in sent and body.wire_api is not None:
-        wire = body.wire_api.strip().lower()
-        allowed_wire = {"auto", "responses", "chat_completions"}
-        settings.wire_api = wire if wire in allowed_wire else "auto"
-    if "ssl_verify" in sent and body.ssl_verify is not None:
-        settings.ssl_verify = bool(body.ssl_verify)
-    if "skill_dirs" in sent and body.skill_dirs is not None:
-        settings.skill_dirs = [str(x).strip() for x in body.skill_dirs if str(x).strip()]
-    if "skill_auto_discover" in sent and body.skill_auto_discover is not None:
-        settings.skill_auto_discover = bool(body.skill_auto_discover)
-    if "skill_ignore_dirs" in sent and body.skill_ignore_dirs is not None:
-        settings.skill_ignore_dirs = [str(x).strip() for x in body.skill_ignore_dirs if str(x).strip()]
-    if "skill_exclude" in sent and body.skill_exclude is not None:
-        settings.skill_exclude = [str(x).strip() for x in body.skill_exclude if str(x).strip()]
-    if "skill_user_homes" in sent and body.skill_user_homes is not None:
-        settings.skill_user_homes = bool(body.skill_user_homes)
-    if "ensure_companions" in sent and body.ensure_companions is not None:
-        settings.ensure_companions = bool(body.ensure_companions)
-    if root and requested_runtime:
-        changes = {field: getattr(body, field) for field in requested_runtime}
-        if "trust_custom_base_url" in requested_runtime:
-            changes["base_url"] = body.base_url if "base_url" in sent else settings.base_url
-        RuntimeTrustStore().update(root, changes)
-    store.save(settings)
-    # Push AWS region/profile into process env for native Bedrock turns.
-    if settings.aws_region:
-        os.environ["AWS_REGION"] = settings.aws_region
-        os.environ.setdefault("AWS_DEFAULT_REGION", settings.aws_region)
-    if settings.aws_profile:
-        os.environ["AWS_PROFILE"] = settings.aws_profile
-    return get_app_settings(project_id=project_id, projectless=projectless)
+    # Guard the whole load -> mutate -> save sequence: two concurrent
+    # PATCH requests must not both load() the same snapshot and have
+    # whichever save()s last silently discard the other's changes.
+    with settings_store_lock:
+        store = SettingsStore()
+        settings = store.load()
+        if "default_model" in sent and body.default_model is not None:
+            settings.default_model = body.default_model
+        if "default_mode" in sent and body.default_mode is not None:
+            settings.default_mode = body.default_mode
+        if "theme" in sent and body.theme is not None:
+            settings.theme = body.theme
+        if "workspace_system_prompt" in sent:
+            settings.workspace_system_prompt = body.workspace_system_prompt or ""
+        if "provider" in sent and body.provider is not None:
+            allowed = {"auto", "openai", "anthropic", "gemini", "bedrock", "ollama"}
+            settings.provider = body.provider if body.provider in allowed else "auto"
+        if "base_url" in sent and body.base_url is not None:
+            base = body.base_url.strip()
+            trust_store = RuntimeTrustStore()
+            approved_now = bool(root) and bool(body.trust_custom_base_url)
+            already_approved = bool(root) and trust_store.is_url_trusted(root, base)
+            if base and not is_trusted_base_url(base) and not (approved_now or already_approved):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Untrusted base_url — set trust_custom_base_url=true to confirm",
+                )
+            settings.base_url = base
+        if "aws_region" in sent and body.aws_region is not None:
+            settings.aws_region = body.aws_region.strip()
+        if "aws_profile" in sent and body.aws_profile is not None:
+            settings.aws_profile = body.aws_profile.strip()
+        if "mcp_enabled" in sent and body.mcp_enabled is not None:
+            settings.mcp_enabled = bool(body.mcp_enabled)
+        if "context_mode" in sent and body.context_mode is not None:
+            settings.context_mode = bool(body.context_mode)
+        if "browser_tools" in sent and body.browser_tools is not None:
+            settings.browser_tools = bool(body.browser_tools)
+        if "trajectory" in sent and body.trajectory is not None:
+            settings.trajectory = bool(body.trajectory)
+        if "learn" in sent and body.learn is not None:
+            settings.learn = bool(body.learn)
+        if "action_mode" in sent and body.action_mode is not None:
+            settings.action_mode = body.action_mode if body.action_mode in ("tools", "code") else "tools"
+        if "agent_mode" in sent and body.agent_mode is not None:
+            settings.agent_mode = body.agent_mode
+        if "reasoning_effort" in sent and body.reasoning_effort is not None:
+            effort = body.reasoning_effort.strip().lower()
+            allowed_effort = {"", "none", "low", "medium", "high", "xhigh", "max"}
+            settings.reasoning_effort = effort if effort in allowed_effort else "medium"
+        if "wire_api" in sent and body.wire_api is not None:
+            wire = body.wire_api.strip().lower()
+            allowed_wire = {"auto", "responses", "chat_completions"}
+            settings.wire_api = wire if wire in allowed_wire else "auto"
+        if "ssl_verify" in sent and body.ssl_verify is not None:
+            settings.ssl_verify = bool(body.ssl_verify)
+        if "skill_dirs" in sent and body.skill_dirs is not None:
+            settings.skill_dirs = [str(x).strip() for x in body.skill_dirs if str(x).strip()]
+        if "skill_auto_discover" in sent and body.skill_auto_discover is not None:
+            settings.skill_auto_discover = bool(body.skill_auto_discover)
+        if "skill_ignore_dirs" in sent and body.skill_ignore_dirs is not None:
+            settings.skill_ignore_dirs = [str(x).strip() for x in body.skill_ignore_dirs if str(x).strip()]
+        if "skill_exclude" in sent and body.skill_exclude is not None:
+            settings.skill_exclude = [str(x).strip() for x in body.skill_exclude if str(x).strip()]
+        if "skill_user_homes" in sent and body.skill_user_homes is not None:
+            settings.skill_user_homes = bool(body.skill_user_homes)
+        if "ensure_companions" in sent and body.ensure_companions is not None:
+            settings.ensure_companions = bool(body.ensure_companions)
+        if root and requested_runtime:
+            changes = {field: getattr(body, field) for field in requested_runtime}
+            if "trust_custom_base_url" in requested_runtime:
+                changes["base_url"] = body.base_url if "base_url" in sent else settings.base_url
+            RuntimeTrustStore().update(root, changes)
+        store.save(settings)
+        # Push AWS region/profile into process env for native Bedrock turns.
+        if settings.aws_region:
+            os.environ["AWS_REGION"] = settings.aws_region
+            os.environ.setdefault("AWS_DEFAULT_REGION", settings.aws_region)
+        if settings.aws_profile:
+            os.environ["AWS_PROFILE"] = settings.aws_profile
+        return get_app_settings(project_id=project_id, projectless=projectless)
 
 
 class VerifyKeyBody(BaseModel):

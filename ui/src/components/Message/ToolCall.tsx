@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import clsx from "clsx";
 import { ToolResultPreview } from "./ToolResultPreview";
+import { equalIgnoringFunctionProps } from "../../lib/memo_ignoring_callbacks";
 
 const READ_ONLY_TOOLS = new Set(["read_file", "list_dir", "stat", "glob", "search_files"]);
 
@@ -41,7 +42,7 @@ function formatElapsed(ms: number): string {
   return `${m}m${Math.round(s - m * 60)}s`;
 }
 
-export function ToolCall({ name, args, running, success, result, startedAt, elapsedMs, pinned, onPinToggle, projectId = null }: Props) {
+function ToolCallImpl({ name, args, running, success, result, startedAt, elapsedMs, pinned, onPinToggle, projectId = null }: Props) {
   const isReadOnly = READ_ONLY_TOOLS.has(name);
   const [open, setOpen] = useState(running || !isReadOnly);
 
@@ -128,3 +129,8 @@ export function ToolCall({ name, args, running, success, result, startedAt, elap
     </div>
   );
 }
+
+// See lib/memo_ignoring_callbacks. The component's own internal tick timer
+// (setInterval above) still re-renders itself normally — memo only gates
+// re-renders triggered by the parent, not a component's own state updates.
+export const ToolCall = memo(ToolCallImpl, equalIgnoringFunctionProps);

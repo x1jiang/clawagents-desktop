@@ -249,6 +249,18 @@ def search_tool_artifacts(
 _AGGRESSIVE_CRUSH_THRESHOLD = 1_200
 _AGGRESSIVE_TARGET_CHARS = 2_000
 _AGGRESSIVE_INLINE_LIMIT = 6_000
+# Exact-match edits (apply_patch / hashline) need verbatim code/log views.
+# Crushing 2.5K→2.0K is all risk; keep a higher floor for those kinds.
+_CODEISH_CRUSH_FLOOR = 4_000
+_CODEISH_KINDS = frozenset({"code", "log", "diff"})
+# Skill pages / catalogs / archived restores are control-plane: the model must
+# never operate on a crushed fraction of its instructions (auto-drain pages
+# also flow through this path since v6.20.15).
+_CONTROL_PLANE_NO_CRUSH = frozenset({
+    "use_skill",
+    "list_skills",
+    "retrieve_tool_result",
+})
 
 
 def prepare_tool_output_for_context(
@@ -260,6 +272,7 @@ def prepare_tool_output_for_context(
     crush_threshold: int | None = None,
     inline_limit: int | None = None,
     target_chars: int | None = None,
+    success: bool | None = None,
 ) -> tuple[str, Optional[str]]:
     """Crush oversized outputs and store full text when crushed or huge.
 
@@ -267,17 +280,50 @@ def prepare_tool_output_for_context(
 
     When ``CLAW_FEATURE_AGGRESSIVE_TOOL_CRUSH=1`` (default), uses tighter
     thresholds unless the caller overrides ``crush_threshold`` /
-    ``inline_limit`` / ``target_chars``.
+    ``inline_limit`` / ``target_chars``. Code/log/diff outputs use a higher
+    floor (~4K) so edit tools are not fed compressed views.
+
+    Control-plane tools (``use_skill``, ``list_skills``, ``retrieve_tool_result``)
+    are never crushed — skill instructions must stay verbatim.
+
+    Failed tool results (``success=False``) are never aggressively crushed —
+    denial paths (e.g. credentials.db EPERM) must stay verbatim for diagnosis.
     """
     if not isinstance(output, str):
         output = str(output)
+
+    if tool_name in _CONTROL_PLANE_NO_CRUSH:
+        return output, None
+
+    # Failures: keep full text in context (still archive if enormous).
+    if success is False:
+        hard_cap = 48_000
+        if len(output) <= hard_cap:
+            return output, None
+        artifact_id, _path = store_tool_artifact(
+            tool_name=tool_name,
+            tool_use_id=tool_use_id,
+            output=output,
+            kind="prose",
+            workspace=workspace,
+            extra_meta={"did_crush": False, "failed_tool_verbatim": True},
+        )
+        preview = output[:12_000]
+        header = (
+            f"[Failed tool output archived id={artifact_id}]\n"
+            f"Original: {len(output)} chars (not crushed). "
+            f"Call retrieve_tool_result(id=\"{artifact_id}\") for the remainder.\n\n"
+        )
+        return header + preview, artifact_id
 
     thresh = crush_threshold
     inline = inline_limit
     target = target_chars
     try:
         from clawagents.config.features import is_enabled
+        from clawagents.memory.content_crush import detect_content_kind
 
+        kind = detect_content_kind(output, tool_name=tool_name)
         if is_enabled("aggressive_tool_crush"):
             if thresh is None:
                 thresh = _AGGRESSIVE_CRUSH_THRESHOLD
@@ -285,6 +331,10 @@ def prepare_tool_output_for_context(
                 inline = _AGGRESSIVE_INLINE_LIMIT
             if target is None:
                 target = _AGGRESSIVE_TARGET_CHARS
+        if kind in _CODEISH_KINDS and thresh is not None:
+            thresh = max(thresh, _CODEISH_CRUSH_FLOOR)
+        if kind in _CODEISH_KINDS and target is not None:
+            target = max(target, _CODEISH_CRUSH_FLOOR)
     except Exception:
         pass
     if thresh is None:

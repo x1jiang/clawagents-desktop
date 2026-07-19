@@ -36,6 +36,17 @@ export function NewProjectModal({ onClose }: Props) {
     void reloadHosts();
   }, [tab]);
 
+  useEffect(() => {
+    function onKey(e: KeyboardEvent): void {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        onClose();
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
   async function openSshConfig() {
     setError(null);
     try {
@@ -100,9 +111,13 @@ export function NewProjectModal({ onClose }: Props) {
   }
 
   return (
-    <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50">
+    <div
+      className="fixed inset-0 bg-black/30 flex items-center justify-center z-50"
+      onClick={onClose}
+    >
       <form
         onSubmit={submit}
+        onClick={(e) => e.stopPropagation()}
         className="bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg shadow-xl p-5 w-[26rem] space-y-3"
       >
         <h2 className="text-base font-semibold text-gray-800 dark:text-gray-100">New project</h2>

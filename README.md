@@ -34,20 +34,15 @@ xcrun notarytool store-credentials clawagents-notary \
 SKIP_NOTARIZE=1 ./build.sh
 ```
 
-## Features (0.4.0)
+## Features (0.4.1)
 
-- **VS Code parity:** library **6.20.8**, enforced skill capabilities, project-scoped runtime trust, and quarantine-aware skill previews
-- **Rewind / companions:** `/rewind` panel, companion doctor (context-mode + rtk), plan-approval prompts, mid-turn interject
-- **Native attachments:** images + PDF/DOCX via `invoke(images=/files=)` (not just OCR text)
-- **Keychain-safe keys:** sidecar skips dotenv override so Settings keys win
-- **Reliable Stop:** Cancel clears the send queue; SSE keep-alive + 60s idle watchdog
-- **Provider catalog:** live `/v1/models` probe for custom base URLs; Bedrock not unlocked by OpenAI key alone
+- **Engine 6.20.19:** control-plane tool outputs never crushed; post-edit syntax gate; chat-mode ↔ sandbox contract (incl. `/dev/null`)
+- **Settings / providers:** concurrent settings-save hardening; Mantle/catalog fixes; connection-banner reliability
+- **VS Code parity carry-forward:** skill capabilities, project-scoped runtime trust, rewind / companions / plan-approval
 - Local projects and **SSH remote** projects (`~/.ssh/config`, including `ProxyJump`)
-- Chat UI with Export (Markdown) and Fork
-- File tree + **right-side file editor** (edit + autosave)
-- Providers: OpenAI / Anthropic / Gemini / **AWS Bedrock** (native IAM or gateway) / Ollama
-- Settings UI: sectioned Providers · Defaults · Agent · Data cards
-- **Developer ID signed** release builds (`./build.sh` signs after embedding Python)
+- Chat UI with Export (Markdown) and Fork; file tree + right-side editor
+- Providers: OpenAI / Anthropic / Gemini / **AWS Bedrock** (IAM / Mantle / gateway) / Ollama
+- **Developer ID signed** + notarized release builds (`./build.sh`)
 
 ## Develop
 

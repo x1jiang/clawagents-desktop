@@ -623,6 +623,58 @@ def _resolve_temperature(model: str, requested: float) -> float:
     return requested
 
 
+def openai_model_rejects_temperature(model: str) -> bool:
+    """True when OpenAI / Mantle Responses reject an explicit ``temperature``.
+
+    GPT-5.5 / 5.6 (incl. ``openai.gpt-5.6-luna``), o-series, and similar
+    reasoning models return 400 if ``temperature`` is present. Omit the field.
+    """
+    m = (model or "").strip().lower()
+    if m.startswith("openai."):
+        m = m[len("openai.") :]
+    if m.startswith(("o1", "o3", "o4")):
+        return True
+    if m.startswith(("gpt-5.3", "gpt-5.4", "gpt-5.5", "gpt-5.6")):
+        return True
+    if m.startswith("gpt-5") and "codex" in m:
+        return True
+    return False
+
+
+def _with_temperature(
+    kwargs: dict[str, Any], model: str, temperature: float | None
+) -> dict[str, Any]:
+    """Attach ``temperature`` only when the model accepts it."""
+    if temperature is None:
+        return kwargs
+    if openai_model_rejects_temperature(model):
+        kwargs.pop("temperature", None)
+        return kwargs
+    kwargs["temperature"] = temperature
+    return kwargs
+
+
+def anthropic_model_rejects_sampling_params(model: str) -> bool:
+    """True when the Anthropic API rejects ``temperature`` / ``top_p`` / ``top_k``.
+
+    Claude Opus 4.7+ (including Mantle ``anthropic.claude-opus-4-8``) return
+    HTTP 400 ``temperature is deprecated for this model`` if those fields are
+    present. Omit them and guide behavior via prompting instead.
+    """
+    import re
+
+    m = (model or "").strip().lower().replace("_", "-")
+    # Collapse dotted minors: opus-4.8 → opus-4-8; keep geo/FM prefixes intact.
+    m = re.sub(r"(opus-4)\.(\d+)", r"\1-\2", m)
+    hit = re.search(r"opus-4-(\d+)", m)
+    if hit:
+        return int(hit.group(1)) >= 7
+    # Future Opus 5+ generations inherit the same restriction.
+    if re.search(r"opus-([5-9]|[1-9]\d+)(?:-|\b)", m):
+        return True
+    return False
+
+
 def _chat_completions_needs_reasoning_none(model: str) -> bool:
     """True when Chat Completions rejects tools + default reasoning_effort.
 
@@ -1165,8 +1217,8 @@ class OpenAIProvider(LLMProvider):
             "model": self.model,
             "messages": messages,
             "max_completion_tokens": self._max_tokens,
-            "temperature": self._temperature,
         }
+        _with_temperature(kwargs, self.model, self._temperature)
         if oai_tools:
             kwargs["tools"] = oai_tools
         schema = getattr(self, "_structured_json_schema", None)
@@ -1217,9 +1269,9 @@ class OpenAIProvider(LLMProvider):
             "model": self.model,
             "input": input_items,
             "max_output_tokens": self._max_tokens,
-            "temperature": self._temperature,
             "store": False,
         }
+        _with_temperature(kwargs, self.model, self._temperature)
         if instructions:
             kwargs["instructions"] = instructions
         resp_tools = _chat_tools_to_responses_tools(oai_tools)
@@ -1500,10 +1552,10 @@ class OpenAIProvider(LLMProvider):
                     "model": self.model,
                     "messages": messages,
                     "max_completion_tokens": self._max_tokens,
-                    "temperature": self._temperature,
                     "stream": True,
                     "stream_options": {"include_usage": True},
                 }
+                _with_temperature(kwargs, self.model, self._temperature)
                 if oai_tools:
                     kwargs["tools"] = oai_tools
                 _apply_tool_reasoning_compat(
@@ -2502,7 +2554,12 @@ class AnthropicProvider(LLMProvider):
         # dropped ``temperature=0`` — the config default — so Anthropic silently
         # sampled at the API default of 1.0 while OpenAI/Gemini honoured 0,
         # making "temperature: 0" runs non-deterministic only on Claude.
-        if self._temperature is not None and self._temperature >= 0:
+        # Opus 4.7+ reject the field entirely (400) — omit it for those models.
+        if (
+            not anthropic_model_rejects_sampling_params(self.model)
+            and self._temperature is not None
+            and self._temperature >= 0
+        ):
             kwargs["temperature"] = self._temperature
         schema = getattr(self, "_structured_json_schema", None)
         if isinstance(schema, dict) and schema and not tools:
@@ -3061,41 +3118,77 @@ def mantle_openai_base_url(url: str) -> str:
 
 def is_mantle_anthropic_model(model: str) -> bool:
     """Claude IDs that must use Mantle ``/anthropic/v1/messages`` (not chat)."""
-    m = (model or "").strip().lower()
-    if m.startswith("bedrock/"):
-        m = m[len("bedrock/") :]
-    for prefix in ("us.", "eu.", "ap.", "global."):
-        if m.startswith(prefix):
-            m = m[len(prefix) :]
-            break
+    from clawagents.providers.model_classify import (
+        parse_model_ref,
+        strip_bedrock_geo_prefix,
+    )
+
+    m = parse_model_ref(model or "").bare_id.strip().lower()
+    m = strip_bedrock_geo_prefix(m).lower()
     return m.startswith("anthropic.") or m.startswith("claude")
 
 
 def is_mantle_openai_responses_model(model: str) -> bool:
     """Frontier OpenAI IDs on Mantle that need ``/openai/v1/responses``.
 
-    ``openai.gpt-oss-*`` stays on chat completions; GPT-5.4/5.5/5.6 do not.
+    ``openai.gpt-oss-*`` stays on chat completions; GPT-5.3/5.4/5.5/5.6 do not.
+    Accepts bare ``gpt-5.6-luna`` as well as ``openai.gpt-5.6-luna``.
     """
     m = (model or "").strip().lower()
-    if not m.startswith("openai."):
-        return False
+    if m.startswith("openai."):
+        m = m[len("openai.") :]
     if "gpt-oss" in m:
         return False
     return any(token in m for token in ("gpt-5.3", "gpt-5.4", "gpt-5.5", "gpt-5.6"))
 
 
-def create_provider(model_name: str, config: EngineConfig) -> LLMProvider:
+def _mantle_openai_model_id(model: str) -> str:
+    """Ensure Mantle Responses models use the ``openai.`` catalog prefix."""
+    m = (model or "").strip()
+    if not m:
+        return m
+    if m.lower().startswith("openai."):
+        return m
+    if is_mantle_openai_responses_model(m):
+        return f"openai.{m}"
+    return m
+
+
+def create_provider(
+    model_name: str,
+    config: EngineConfig,
+    *,
+    provider_hint: str | None = None,
+) -> LLMProvider:
     """Create a single LLM provider inferred from model name.
 
     Clones ``config`` before mutating provider-specific fields so callers
     can safely reuse one ``EngineConfig`` across providers (e.g. main +
     advisor) or in concurrent flows without cross-talk.
+
+    LiteLLM-style ``provider/model`` prefixes are stripped before the SDK
+    sees the model id. Optional ``provider_hint`` (profile / settings)
+    overrides id-shape inference.
     """
-    from clawagents.config.config import is_bedrock_model_id, strip_bedrock_prefix
+    from clawagents.providers.model_classify import (
+        classify_model,
+        is_bedrock_model_id,
+        parse_model_ref,
+        strip_bedrock_prefix,
+    )
 
     config = config.model_copy()
+    ref = parse_model_ref(model_name)
+    # Never send ``anthropic/…`` / ``openai/…`` / ``bedrock/…`` literals to SDKs.
+    model_name = ref.bare_id
     lower = model_name.lower()
-    if lower.startswith("gemini"):
+    kind = classify_model(
+        ref.raw or model_name,
+        base_url=config.openai_base_url,
+        provider_hint=provider_hint or ref.prefix_hint,
+    )
+
+    if kind == "gemini" or lower.startswith("gemini"):
         if not _HAS_GEMINI:
             raise ImportError(
                 "google-genai package not installed. Install with: pip install clawagents[gemini]"
@@ -3107,9 +3200,8 @@ def create_provider(model_name: str, config: EngineConfig) -> LLMProvider:
     # Prefer OpenAI-compatible gateway when openai_base_url is set (BAG / LiteLLM).
     # Otherwise route Bedrock model IDs to AsyncAnthropicBedrock (Claude) or
     # Converse (Nova / Llama / GPT-OSS / …).
-    explicit_bedrock = lower.startswith("bedrock/")
-    bedrock_id = is_bedrock_model_id(model_name)
-    if (explicit_bedrock or bedrock_id) and not config.openai_base_url:
+    bedrock_id = kind == "bedrock" or is_bedrock_model_id(model_name)
+    if bedrock_id and not config.openai_base_url:
         model_id = strip_bedrock_prefix(model_name)
         config.bedrock_model = model_id
         if _is_bedrock_claude_model(model_id):
@@ -3139,13 +3231,14 @@ def create_provider(model_name: str, config: EngineConfig) -> LLMProvider:
             # These models reject /v1/chat/completions even when wire_api was
             # saved as chat_completions from an older Mantle default.
             config.openai_wire_api = "responses"
-            config.openai_model = model_name
+            # Mantle catalog requires ``openai.gpt-5.6-*`` (bare ids 404 /v1).
+            config.openai_model = _mantle_openai_model_id(model_name)
             return OpenAIProvider(config)
         # Chat-completions catalog: keep …/v1 (or normalize to it).
         if _normalize_wire_api(config.openai_wire_api) == "auto":
             config.openai_wire_api = "chat_completions"
 
-    if lower.startswith("claude") or lower.startswith("anthropic"):
+    if kind == "anthropic" or lower.startswith("claude") or lower.startswith("anthropic"):
         # Bedrock Access Gateway / LiteLLM / other OpenAI-compatible proxies set
         # openai_base_url and speak the OpenAI protocol — do not send those
         # requests to Anthropic's native API (model IDs look like
@@ -3159,9 +3252,9 @@ def create_provider(model_name: str, config: EngineConfig) -> LLMProvider:
         # Fully-qualified Bedrock IDs without base_url already handled above.
         config.anthropic_model = model_name
         return AnthropicProvider(config)
-    if _looks_like_ollama(model_name):
-        # Strip the explicit ``ollama/`` routing prefix; Ollama serves the bare tag.
-        tag = model_name[len("ollama/"):] if lower.startswith("ollama/") else model_name
+    if kind == "ollama" or _looks_like_ollama(model_name) or ref.prefix_hint == "ollama":
+        # ``ollama/`` already stripped via parse_model_ref.
+        tag = model_name
         if not config.openai_base_url:
             config.openai_base_url = _OLLAMA_DEFAULT_BASE_URL
         if not config.openai_api_key:

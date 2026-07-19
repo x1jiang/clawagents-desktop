@@ -3,12 +3,9 @@ import ReactDOM from "react-dom/client";
 import { RouterProvider, createRouter } from "@tanstack/react-router";
 import "./style.css";
 
-import { GatewayClient } from "./lib/gateway";
-import { tauriApi } from "./lib/tauri";
-import { useProjects } from "./stores/projects";
+import { connectGateway } from "./lib/gateway_connection";
 import { useSettings } from "./stores/settings";
 import { useCustomCommands } from "./stores/custom_commands";
-import { startHealthMonitor } from "./lib/health_monitor";
 import { getLastPath } from "./lib/recent_chats";
 // Side-effect: theme store reads stored preference and applies `dark` class
 // on the html element when imported.
@@ -46,23 +43,17 @@ declare module "@tanstack/react-router" {
 function Bootstrap() {
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const setClient = useProjects((s) => s.setClient);
   const loadSettings = useSettings((s) => s.load);
 
   useEffect(() => {
     (async () => {
       try {
-        const info = await tauriApi.getGatewayInfo();
-        const client = new GatewayClient(info.url, info.token);
-        setClient(client);
+        const client = await connectGateway();
         await loadSettings();
         // Custom commands are a best-effort load; if the dir is missing or
         // the endpoint errors, we just have an empty list — the built-in
         // slash commands still work.
         await useCustomCommands.getState().load(() => client.listCustomCommands());
-        // Background poller keeps the connection store fresh — the banner
-        // reacts to it.
-        startHealthMonitor(info.url);
         setReady(true);
         // Resume the last-visited chat path if the user had one open
         // before quitting. Skipped when the user is already on a
@@ -78,7 +69,7 @@ function Bootstrap() {
         setError((e as Error).message);
       }
     })();
-  }, [setClient, loadSettings]);
+  }, [loadSettings]);
 
   if (error) {
     return (

@@ -6,11 +6,20 @@ Atomic writes via atomic_write_text. Corrupt JSON returns defaults.
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from clawagents.desktop_stores.app_paths import settings_file
 from clawagents.utils.atomic_write import atomic_write_text
+
+# Guards read-modify-write sequences (load() -> mutate -> save()) against
+# concurrent FastAPI requests. `def` routes run on the threadpool, so two
+# overlapping PATCH /settings calls can otherwise both load() the same base
+# snapshot, mutate independently, and save() -- whichever finishes last wins
+# and silently discards the other's changes. Mirrors
+# desktop_stores.runtime_trust.RuntimeTrustStore's existing lock pattern.
+settings_store_lock = threading.RLock()
 
 
 @dataclass

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "@tanstack/react-router";
 import { useUI } from "../stores/ui";
 import { useProjects } from "../stores/projects";
+import { useProjectGateway } from "../lib/project_client";
 import { useChats } from "../stores/chats";
 import { useTheme } from "../stores/theme";
 import { pushToast } from "../stores/toasts";
@@ -39,19 +40,34 @@ export function CommandPalette() {
   const [active, setActive] = useState(0);
   const [availableModels, setAvailableModels] = useState<string[]>([]);
 
+  // The current project id is determined from the URL (/project/:id/...).
+  // Without this, listProviders() below always read the LOCAL machine's
+  // catalog — wrong for an SSH-connected project with its own
+  // independently-configured remote gateway (models shown as available
+  // could be unusable on the remote, or vice versa).
+  const currentProjectId = (() => {
+    const m = window.location.pathname.match(/\/project\/([^/]+)/);
+    return m ? m[1] : null;
+  })();
+  const projectClient = useProjectGateway(currentProjectId) ?? client;
+
   useEffect(() => {
     if (open) {
       setQuery(""); setActive(0);
       // Lazy-load available models so the palette can offer per-model switches
       // for whichever chat happens to be on screen.
-      if (client) {
-        void client.listProviders().then((providers) => {
-          const models = providers.flatMap((p) => p.models.filter((m) => m.available).map((m) => m.id));
-          setAvailableModels(models);
-        }).catch(() => setAvailableModels([]));
+      if (projectClient) {
+        void projectClient
+          .listProviders(currentProjectId, currentProjectId == null)
+          .then((providers) => {
+            const models = providers.flatMap((p) => p.models.filter((m) => m.available).map((m) => m.id));
+            setAvailableModels(models);
+          })
+          .catch(() => setAvailableModels([]));
       }
     }
-  }, [open, client]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, projectClient, currentProjectId]);
 
   // The current chat id is determined from the URL.
   const currentChatId = (() => {

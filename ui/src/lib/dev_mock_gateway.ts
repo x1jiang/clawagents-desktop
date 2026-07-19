@@ -248,6 +248,7 @@ export function installDevMockGateway(): GatewayInfo {
 export function devMockInvoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   switch (command) {
     case "get_gateway_info":
+    case "restart_gateway":
       return Promise.resolve(installDevMockGateway() as T);
     case "keyring_get":
     case "pick_folder":

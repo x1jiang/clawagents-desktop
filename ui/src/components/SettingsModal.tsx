@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useSettings } from "../stores/settings";
+import { useSettingsSaveStatus } from "../stores/settings_save";
 import { useProjects } from "../stores/projects";
 import { BackupPanel } from "./BackupPanel";
 import { clearAllDrafts } from "../lib/drafts";
@@ -73,10 +74,18 @@ export function SettingsModal({ onClose }: Props) {
 
   useEffect(() => {
     if (!client) return;
+    // Rapidly switching Security scope (projectless -> Project A -> Project
+    // B) can let Project A's response resolve AFTER Project B's if IPC/
+    // network timing works out that way; without this guard it silently
+    // repopulates the form with Project A's settings while the dropdown
+    // already shows Project B, and hitting Save then persists A's settings
+    // onto B.
+    let cancelled = false;
     void (async () => {
       try {
         const projectId = securityScope === "projectless" ? null : securityScope;
         const s = await client.getAppSettings(projectId, securityScope === "projectless");
+        if (cancelled) return;
         setLoaded(s);
         setWorkspacePrompt(s.workspace_system_prompt || "");
         setDefaultMode(s.default_mode || "auto");
@@ -107,7 +116,11 @@ export function SettingsModal({ onClose }: Props) {
       }
     })();
     const projectId = securityScope === "projectless" ? null : securityScope;
-    void client.listProviders(projectId, securityScope === "projectless").then(setCatalog).catch(() => setCatalog([]));
+    void client
+      .listProviders(projectId, securityScope === "projectless")
+      .then((rows) => { if (!cancelled) setCatalog(rows); })
+      .catch(() => { if (!cancelled) setCatalog([]); });
+    return () => { cancelled = true; };
   }, [client, securityScope]);
 
   useEffect(() => {
@@ -143,30 +156,42 @@ export function SettingsModal({ onClose }: Props) {
     }
   }
 
+  // Per-provider generation counter: two "Test" clicks in quick succession
+  // for the same provider (with different draft key values in between) can
+  // resolve out of order over the network. Without this, the FIRST (now
+  // stale) response can land after the second and silently overwrite the
+  // newer, correct verdict.
+  const testGenRef = useRef<Record<string, number>>({});
+
   async function testProvider(id: ProviderId) {
     if (!client) return;
     const key = (drafts[id] ?? "").trim();
+    const myGen = (testGenRef.current[id] ?? 0) + 1;
+    testGenRef.current[id] = myGen;
+    const isStale = () => testGenRef.current[id] !== myGen;
+
     setVerifying((v) => ({ ...v, [id]: true }));
     try {
       const v = await client.verifyApiKey(id, key);
+      if (isStale()) return;
       setVerdicts((prev) => ({ ...prev, [id]: v }));
-      if (v.ok && key && id !== "bedrock") {
-        await persistKey(id, key);
-      } else if (v.ok && key && id === "bedrock") {
+      if (v.ok && key) {
         await persistKey(id, key);
       }
       if (id === "bedrock" && v.ok) {
         const projectId = securityScope === "projectless" ? null : securityScope;
         const s = await client.getAppSettings(projectId, securityScope === "projectless");
+        if (isStale()) return;
         setHasAwsCreds(Boolean(s.has_aws_credentials));
       }
     } catch (e) {
+      if (isStale()) return;
       setVerdicts((prev) => ({
         ...prev,
         [id]: { ok: false, status: 0, message: (e as Error).message, model_count: null },
       }));
     } finally {
-      setVerifying((v) => ({ ...v, [id]: false }));
+      if (!isStale()) setVerifying((v) => ({ ...v, [id]: false }));
     }
   }
 
@@ -193,7 +218,12 @@ export function SettingsModal({ onClose }: Props) {
           setTrustBaseUrl(true);
         }
         const projectId = securityScope === "projectless" ? null : securityScope;
-        await client.patchAppSettings({
+        // Registered in useSettingsSaveStatus so a chat left on "Auto" model
+        // (ChatSurface sends no model_override, letting the backend resolve
+        // the model from these saved settings) can await this save before
+        // dispatching a send, instead of possibly running against the
+        // about-to-be-overwritten prior settings.
+        const patchPromise = client.patchAppSettings({
           workspace_system_prompt: workspacePrompt,
           default_model: defaultModel,
           default_mode: defaultMode,
@@ -218,6 +248,14 @@ export function SettingsModal({ onClose }: Props) {
           ssl_verify: sslVerify,
           skill_user_homes: skillUserHomes,
         }, projectId, securityScope === "projectless");
+        useSettingsSaveStatus.getState().setInFlight(patchPromise);
+        try {
+          await patchPromise;
+        } finally {
+          if (useSettingsSaveStatus.getState().inFlight === patchPromise) {
+            useSettingsSaveStatus.getState().setInFlight(null);
+          }
+        }
         // Refresh catalog so custom base_url model probes show up.
         void client.listProviders(projectId, securityScope === "projectless").then(setCatalog).catch(() => undefined);
       }

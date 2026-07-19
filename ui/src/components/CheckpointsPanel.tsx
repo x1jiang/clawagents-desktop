@@ -37,6 +37,15 @@ export function CheckpointsPanel({ chatId, projectId = null, open, onClose }: Pr
 
   async function restore(sha: string, mode: "files" | "conversation" | "both") {
     if (!client || !sha) return;
+    const scope =
+      mode === "files" ? "workspace files" : mode === "conversation" ? "the conversation" : "workspace files and the conversation";
+    if (
+      !window.confirm(
+        `Restore ${scope} from checkpoint ${sha.slice(0, 12)}? This overwrites current state.`,
+      )
+    ) {
+      return;
+    }
     try {
       await client.restoreCheckpoint(chatId, sha, mode);
       pushToast(`Restored checkpoint (${mode})`, "success");

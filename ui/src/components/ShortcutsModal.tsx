@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import { useUI } from "../stores/ui";
 
 const SHORTCUTS: Array<{ keys: string[]; description: string }> = [
@@ -25,6 +26,18 @@ const SHORTCUTS: Array<{ keys: string[]; description: string }> = [
 export function ShortcutsModal() {
   const open = useUI((s) => s.shortcutsModalOpen);
   const close = useUI((s) => s.closeShortcutsModal);
+
+  useEffect(() => {
+    if (!open) return;
+    function onKey(e: KeyboardEvent): void {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        close();
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, close]);
 
   if (!open) return null;
 

@@ -36,6 +36,13 @@ export function BackupPanel() {
 
   async function importChosen(file: File) {
     if (!client) return;
+    if (
+      !window.confirm(
+        `Import "${file.name}"? Chats with matching ids in the current state will be overwritten.`,
+      )
+    ) {
+      return;
+    }
     setBusy(true);
     setStatus(null);
     try {

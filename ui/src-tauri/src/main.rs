@@ -46,6 +46,43 @@ struct GatewayInfo {
     token: String,
 }
 
+/// Shuts down the current sidecar (if any) and boots a fresh one in its
+/// place. The Python gateway is spawned once in `.setup()` with no
+/// supervisor/respawn loop; if it dies mid-session (unhandled exception,
+/// OOM), the UI's health monitor just polls a dead port forever with no way
+/// to recover short of quitting the whole app. This command gives the UI an
+/// explicit recovery action instead.
+#[tauri::command]
+async fn restart_gateway(state: State<'_, AppState>) -> Result<GatewayInfo, String> {
+    {
+        let mut guard = state.inner.lock().map_err(|e| e.to_string())?;
+        if let Some(mut info) = guard.take() {
+            info.sidecar.shutdown(Duration::from_secs(3));
+        }
+    }
+    if let Ok(mut err) = state.boot_error.lock() {
+        *err = None;
+    }
+    match start_gateway() {
+        Ok(info) => {
+            let gw = GatewayInfo {
+                url: info.url.clone(),
+                token: info.token.clone(),
+            };
+            let mut guard = state.inner.lock().map_err(|e| e.to_string())?;
+            *guard = Some(info);
+            Ok(gw)
+        }
+        Err(err) => {
+            boot_debug(&format!("restart_gateway failed: {err}"));
+            if let Ok(mut slot) = state.boot_error.lock() {
+                *slot = Some(err.clone());
+            }
+            Err(err)
+        }
+    }
+}
+
 #[tauri::command]
 fn get_gateway_info(state: State<'_, AppState>) -> Result<GatewayInfo, String> {
     if let Ok(err) = state.boot_error.lock() {
@@ -521,6 +558,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             get_gateway_info,
+            restart_gateway,
             pick_folder,
             keyring_set,
             keyring_get,

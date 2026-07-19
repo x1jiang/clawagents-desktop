@@ -7,6 +7,7 @@ import { ensureProjectClient, useProjectGateway } from "../lib/project_client";
 import { formatErr } from "../lib/format_err";
 import { streamMessages } from "../lib/stream";
 import { pushToast } from "../stores/toasts";
+import { awaitPendingSettingsSave } from "../stores/settings_save";
 import { Composer } from "./Composer";
 import { ModeChip } from "./ModeChip";
 import { ModelPicker } from "./ModelPicker";
@@ -581,6 +582,16 @@ export function ChatSurface({ projectId, chatId }: Props) {
     // via the agent; we filter that echo out below to avoid duplicates.
     appendEvent(chatId, { kind: "user_message", content: userVisibleContent, attachments: sentAttachments });
 
+    // "Auto" (empty model_override below) makes the backend resolve the
+    // model from its saved app settings. A Settings save that's still in
+    // flight (e.g. switching the default provider/model) hasn't landed on
+    // disk yet, so without this the turn could silently run against the
+    // about-to-be-overwritten prior settings. A pinned model_override isn't
+    // affected — it's sent explicitly regardless of what Settings has saved.
+    if (!model) {
+      await awaitPendingSettingsSave();
+    }
+
     const startedAt = Date.now();
     setTurnStartedAt(startedAt);
     const ctrl = new AbortController();
@@ -904,6 +915,7 @@ export function ChatSurface({ projectId, chatId }: Props) {
           )}
           <ModelPicker
             value={model}
+            projectId={projectId}
             onChange={(next) => {
               if (next === model) return;
               setModel(next);

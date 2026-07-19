@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { useProjects } from "../stores/projects";
+import { useProjectGateway } from "../lib/project_client";
 
 interface Props {
   projectId: string;
@@ -11,7 +12,11 @@ interface Props {
  * blank to fall back to the workspace setting.
  */
 export function ProjectDefaultsPanel({ projectId }: Props) {
+  // patchProject/refresh are project-registry operations and always go
+  // through the local gateway; only the provider catalog needs to reflect
+  // an SSH-connected project's own remote gateway (see ModelPicker).
   const client = useProjects((s) => s.client);
+  const providerClient = useProjectGateway(projectId) ?? client;
   const project = useProjects((s) => s.projects.find((p) => p.id === projectId));
   const refresh = useProjects((s) => s.refresh);
   const [mode, setMode] = useState<string>("");
@@ -26,13 +31,13 @@ export function ProjectDefaultsPanel({ projectId }: Props) {
   }, [project?.default_mode, project?.default_model, projectId]);
 
   useEffect(() => {
-    if (!client) return;
-    void client.listProviders()
+    if (!providerClient) return;
+    void providerClient.listProviders(projectId, false)
       .then((providers) => setAvailableModels(
         providers.flatMap((p) => p.models.filter((m) => m.available).map((m) => m.id)),
       ))
       .catch(() => setAvailableModels([]));
-  }, [client]);
+  }, [providerClient, projectId]);
 
   if (!project) return null;
 

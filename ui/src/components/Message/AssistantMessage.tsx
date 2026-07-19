@@ -1,6 +1,8 @@
+import { memo } from "react";
 import { Markdown } from "../../lib/markdown";
 import { ThinkingBlock } from "./ThinkingBlock";
 import { CopyButton } from "../CopyButton";
+import { equalIgnoringFunctionProps } from "../../lib/memo_ignoring_callbacks";
 
 function TypingDots() {
   return (
@@ -20,7 +22,7 @@ interface Props {
   onRegenerate?: () => void;
 }
 
-export function AssistantMessage({ content, thinking, projectId, onRegenerate }: Props) {
+function AssistantMessageImpl({ content, thinking, projectId, onRegenerate }: Props) {
   return (
     <div className="mb-5 group">
       <div className="text-xs text-gray-500 dark:text-gray-400 mb-1 flex items-center justify-between">
@@ -47,3 +49,8 @@ export function AssistantMessage({ content, thinking, projectId, onRegenerate }:
     </div>
   );
 }
+
+// See lib/memo_ignoring_callbacks — Markdown re-parsing is the expensive
+// part here; without this, every prior assistant message re-parses on every
+// streamed token of the CURRENT message.
+export const AssistantMessage = memo(AssistantMessageImpl, equalIgnoringFunctionProps);

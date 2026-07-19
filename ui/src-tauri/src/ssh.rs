@@ -424,6 +424,7 @@ fn push_api_keys(local_port: u16, token: &str, keys: &[(String, String)]) {
             "OPENAI_API_KEY" => "openai",
             "ANTHROPIC_API_KEY" => "anthropic",
             "GEMINI_API_KEY" => "gemini",
+            "BEDROCK_API_KEY" => "bedrock",
             _ => continue,
         };
         let url = format!("http://127.0.0.1:{local_port}/settings/api-keys");

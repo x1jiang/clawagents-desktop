@@ -648,9 +648,31 @@ class ToolRegistry:
                 execute_awaitable,
                 timeout=self._tool_timeout_s,
             )
+            output = result.output
+            if (
+                result.success
+                and tool_name in _WRITE_TOOLS
+                and isinstance(output, str)
+            ):
+                try:
+                    from clawagents.tools.syntax_gate import append_syntax_gate
+
+                    ws = None
+                    if run_context is not None:
+                        ws = getattr(run_context, "workspace", None) or getattr(
+                            run_context, "cwd", None
+                        )
+                    output = append_syntax_gate(
+                        tool_name,
+                        effective_args if isinstance(effective_args, dict) else {},
+                        output,
+                        workspace=ws,
+                    )
+                except Exception:
+                    pass
             truncated = ToolResult(
                 success=result.success,
-                output=truncate_tool_output(result.output),
+                output=truncate_tool_output(output),
                 error=result.error,
             )
 

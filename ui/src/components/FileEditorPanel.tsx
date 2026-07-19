@@ -28,6 +28,13 @@ export function FileEditorPanel() {
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const contentRef = useRef(content);
   contentRef.current = content;
+  // Mirrors saveStatus/baseline for synchronous reads inside the effect
+  // cleanup below (cleanup runs before the closure's own state updates are
+  // visible, and can't safely depend on the render that scheduled it).
+  const dirtyRef = useRef(false);
+  dirtyRef.current = saveStatus === "dirty";
+  const baselineRef = useRef(baseline);
+  baselineRef.current = baseline;
 
   useEffect(() => {
     if (!viewer || !client) {
@@ -65,16 +72,45 @@ export function FileEditorPanel() {
         if (!cancelled) setLoading(false);
       }
     })();
+    // `viewer`/`client` here are THIS closure's file identity (captured at
+    // effect-run time) — even after React state has moved on to a new file,
+    // these still correctly name the file being left. A pending autosave
+    // timer means the debounce hadn't fired yet; without flushing here,
+    // switching files (or the panel unmounting) within the 800ms window
+    // silently discarded the edit with zero warning. Fire-and-forget: a
+    // cleanup function can't be async/awaited, but the write's own promise
+    // still completes against the correct (old) file path regardless of
+    // what the component does afterward.
     return () => {
       cancelled = true;
-      if (saveTimer.current) clearTimeout(saveTimer.current);
+      if (saveTimer.current) {
+        clearTimeout(saveTimer.current);
+        saveTimer.current = null;
+        if (dirtyRef.current && contentRef.current !== baselineRef.current) {
+          void client
+            .writeProjectFile(viewer.projectId, viewer.path, contentRef.current)
+            .catch(() => {
+              // Best-effort: the panel has already moved on to a different
+              // file/closed, so there's no UI left to surface this error to.
+            });
+        }
+      }
     };
   }, [viewer, client]);
+
+  async function requestClose() {
+    if (saveTimer.current) {
+      clearTimeout(saveTimer.current);
+      saveTimer.current = null;
+      await flushSave();
+    }
+    close();
+  }
 
   useEffect(() => {
     if (!viewer) return;
     function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape") close();
+      if (e.key === "Escape") void requestClose();
       if ((e.metaKey || e.ctrlKey) && e.key === "s") {
         e.preventDefault();
         void flushSave();
@@ -161,7 +197,7 @@ export function FileEditorPanel() {
         <CopyButton text={viewer.path} title="Copy file path" label="Path" />
         <button
           type="button"
-          onClick={close}
+          onClick={() => void requestClose()}
           className="text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 text-lg leading-none shrink-0 px-1"
           aria-label="Close file panel"
         >

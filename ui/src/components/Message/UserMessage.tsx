@@ -1,5 +1,6 @@
-import { useState } from "react";
+import { memo, useState } from "react";
 import type { ChatAttachment } from "../../lib/gateway";
+import { equalIgnoringFunctionProps } from "../../lib/memo_ignoring_callbacks";
 
 interface Props {
   content: string;
@@ -19,7 +20,7 @@ function formatBytes(size: number): string {
   return `${(size / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-export function UserMessage({
+function UserMessageImpl({
   content,
   onRetry,
   bookmarked,
@@ -170,3 +171,8 @@ export function UserMessage({
     </div>
   );
 }
+
+// See lib/memo_ignoring_callbacks — ChatSurface hands every row a fresh
+// inline callback per render; a plain memo would re-render (and, indirectly
+// via list re-flow, cost) every row on every streamed token.
+export const UserMessage = memo(UserMessageImpl, equalIgnoringFunctionProps);

@@ -26,6 +26,7 @@ function invokeDesktop<T>(command: string, args?: Record<string, unknown>): Prom
 
 export const tauriApi = {
   getGatewayInfo: () => invokeDesktop<GatewayInfo>("get_gateway_info"),
+  restartGateway: () => invokeDesktop<GatewayInfo>("restart_gateway"),
   pickFolder: () => invokeDesktop<string | null>("pick_folder"),
   keyringSet: (service: string, account: string, secret: string) =>
     invokeDesktop<void>("keyring_set", { service, account, secret }),
