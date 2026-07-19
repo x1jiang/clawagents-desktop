@@ -48,7 +48,7 @@ import {
   type OwnedComposerAttachment,
 } from "../lib/chat_attachments";
 
-const DEFAULT_AUTO_APPROVE: AutoApprove = { edit: false, execute: false, web: false, browser: false };
+const DEFAULT_AUTO_APPROVE: AutoApprove = { edit: true, execute: true, web: false, browser: false };
 
 function loadAutoApprove(chatId: string): AutoApprove {
   try {
