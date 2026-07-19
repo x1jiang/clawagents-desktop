@@ -36,7 +36,7 @@ SKIP_NOTARIZE=1 ./build.sh
 
 ## Features (0.4.3)
 
-- **Engine 6.20.23:** skill tool filtering + aliases, apply_patch matching, MCP reconnect/timeout, compaction tool_calls_meta fix; circuit breaker on by default
+- **Engine 6.20.24:** skill tool filtering + aliases, apply_patch matching, MCP reconnect/timeout, compaction tool_calls_meta fix; circuit breaker on by default
 - **Settings / providers:** concurrent settings-save hardening; Mantle/catalog fixes; connection-banner reliability
 - **VS Code parity carry-forward:** skill capabilities, project-scoped runtime trust, rewind / companions / plan-approval
 - Local projects and **SSH remote** projects (`~/.ssh/config`, including `ProxyJump`)
