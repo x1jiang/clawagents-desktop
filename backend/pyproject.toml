@@ -3,8 +3,8 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "clawagents-desktop-backend"
-version = "6.20.20"
+name = "clawagents"
+version = "6.20.21"
 description = "Lean, full-stack agentic AI framework with PTRL (Prompt-Time Reinforcement Learning)"
 readme = "README.md"
 license = "MIT"
@@ -38,15 +38,17 @@ accurate-tokens = ["tiktoken>=0.5.0"]
 media = ["Pillow>=10.0"]
 # Optional MCP (Model Context Protocol) client. Required only when wiring
 # external MCP servers via ``MCPServerStdio`` / ``MCPServerSse`` /
-# ``MCPServerStreamableHttp``. Install with ``pip install -e 'backend[mcp]'``.
+# ``MCPServerStreamableHttp``. Install with ``pip install 'clawagents[mcp]'``.
 mcp = ["mcp>=1.0.0"]
-# Browser automation tools. ``pip install -e 'backend[browser]'`` then
+# Browser automation tools. ``pip install 'clawagents[browser]'`` then
 # ``playwright install chromium`` to fetch the runtime.
 browser = ["playwright>=1.40.0"]
 # Cloud browser provider stubs (real implementations land later — these
 # extras exist so cloud-provider users have a stable extras name today).
 browser-browserbase = ["playwright>=1.40.0"]
 browser-cloud = ["playwright>=1.40.0"]
+pty = ["pexpect>=4.8", "pyte>=0.8"]
+watch = ["watchfiles>=0.21"]
 # Cron expressions. Interval and one-shot schedules work without this.
 cron = ["croniter>=1.4"]
 # Reinforcement-learning fine-tuning hooks (TRL adapter, Atropos export).
@@ -55,15 +57,17 @@ rl = ["trl>=0.7.0"]
 # Agent Communication Protocol adapter.
 acp = ["agent-client-protocol>=0.1.0"]
 all = [
-    "boto3>=1.34.0",
-
     "google-genai>=0.1.0",
     "anthropic>=0.40.0",
+    "boto3>=1.34.0",
     "tiktoken>=0.5.0",
     "Pillow>=10.0",
     "mcp>=1.0.0",
     "playwright>=1.40.0",
     "croniter>=1.4",
+    "pexpect>=4.8",
+    "pyte>=0.8",
+    "watchfiles>=0.21",
 ]
 dev = [
     "pytest>=7.0",
@@ -75,20 +79,23 @@ dev = [
     "tiktoken>=0.5.0",
     "google-genai>=0.1.0",
     "anthropic>=0.40.0",
+    "boto3>=1.34.0",
     "mcp>=1.0.0",
 ]
 
-[project.scripts]
-clawagents-desktop-backend = "clawagents.__main__:main"
+[project.urls]
+Homepage = "https://github.com/x1jiang/clawagents_py"
+Repository = "https://github.com/x1jiang/clawagents_py"
+Issues = "https://github.com/x1jiang/clawagents_py/issues"
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/clawagents"]
+[project.scripts]
+clawagents = "clawagents.__main__:main"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-# Pin the async-fixture loop scope explicitly. pytest-asyncio warns on every
-# run while this is unset and will change its default in a future release;
-# "function" matches the current implicit behavior (a fresh loop per test).
+# Pin the async-fixture loop scope: pytest-asyncio warns on every run while
+# unset and will change its default in a future release. "function" matches
+# the current implicit behavior (a fresh loop per test).
 asyncio_default_fixture_loop_scope = "function"
 markers = ["benchmark: performance benchmark tests (deselect with -m 'not benchmark')"]
 # Make the in-tree `src/clawagents` win over any globally-installed `clawagents`
@@ -109,3 +116,10 @@ ignore_missing_imports = true
 warn_redundant_casts = true
 warn_unused_ignores = true
 # Per-module overrides go here when needed (e.g. relaxing for vendored code).
+
+[tool.ruff.lint]
+# Keep defaults (E4/E7/E9/F). The public API re-exports live in __init__.py
+# files by convention — don't flag them as unused imports.
+
+[tool.ruff.lint.per-file-ignores]
+"**/__init__.py" = ["F401"]

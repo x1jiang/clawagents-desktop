@@ -57,7 +57,7 @@ from clawagents.stream_events import (
 )
 from clawagents.context.carryover import get_compaction_carryover
 from clawagents.handoffs import Handoff, HandoffInputData
-from clawagents.prompts import build_system_prompt
+from clawagents.prompts import append_model_identity, build_system_prompt
 from clawagents.tokenizer import (
     count_messages_tokens as _count_messages_tokens,
     count_tokens_content,
@@ -217,12 +217,16 @@ def _evict_large_tool_result(tool_name: str, output: str) -> str:
 
 
 def _tool_observation(result: ToolResult) -> str | list[dict[str, Any]]:
+    """Observation text for the model — prefers full ``raw_output`` when present."""
+    payload = getattr(result, "raw_output", None)
+    if payload is None:
+        payload = result.output
     if result.success:
-        return result.output
+        return payload
     error = f"Error: {result.error}" if result.error else "Error: Tool failed"
-    if isinstance(result.output, list):
-        return [{"type": "text", "text": error}, *result.output]
-    output = str(result.output or "").strip()
+    if isinstance(payload, list):
+        return [{"type": "text", "text": error}, *payload]
+    output = str(payload or "").strip()
     return f"{error}\nOutput:\n{output}" if output else error
 
 
@@ -2279,9 +2283,6 @@ async def run_agent_graph(
     image_blocks: Optional[list[dict]] = None,
     file_blocks: Optional[list[dict]] = None,
     session_end_tail: bool = True,
-    session_id: Optional[str] = None,
-    session_dir: Optional[Path] = None,
-    permission_callback: Optional[Callable[[dict], Any]] = None,
 ) -> AgentState:
     """Single ReAct loop: LLM → tools → LLM → tools → ... → final answer."""
     if features is not None:
@@ -2329,9 +2330,6 @@ async def run_agent_graph(
                 image_blocks=image_blocks,
                 file_blocks=file_blocks,
                 session_end_tail=session_end_tail,
-                session_id=session_id,
-                session_dir=session_dir,
-                permission_callback=permission_callback,
             )
     return await _run_agent_graph_core(
         task=task,
@@ -2374,9 +2372,6 @@ async def run_agent_graph(
         image_blocks=image_blocks,
         file_blocks=file_blocks,
         session_end_tail=session_end_tail,
-        session_id=session_id,
-        session_dir=session_dir,
-        permission_callback=permission_callback,
     )
 
 
@@ -2423,9 +2418,6 @@ async def _run_agent_graph_core(
     image_blocks: Optional[list[dict]] = None,
     file_blocks: Optional[list[dict]] = None,
     session_end_tail: bool = True,
-    session_id: Optional[str] = None,
-    session_dir: Optional[Path] = None,
-    permission_callback: Optional[Callable[[dict], Any]] = None,
 ) -> AgentState:
     """Internal ReAct loop body (feature overrides applied by :func:`run_agent_graph`)."""
     registry = tools or ToolRegistry()
@@ -2485,11 +2477,6 @@ async def _run_agent_graph_core(
         run_context = RunContext(context=user_context)
     elif user_context is not None and run_context.context is None:
         run_context.context = user_context
-    # Wire the permission_callback into run_context so that execute_tool
-    # can consult it at the decision site (registry.py) without needing
-    # an extra parameter threaded through every intermediate call.
-    if permission_callback is not None:
-        run_context.permission_callback = permission_callback
     # Tools (execute streaming, skills) read callbacks/metadata from run_context.
     run_context.on_event = emit
     # Ephemeral id for ${SESSION_ID} skill substitutions when persistence is off.
@@ -2630,7 +2617,7 @@ async def _run_agent_graph_core(
     from clawagents.config.features import is_enabled as _feat_enabled
     if _feat_enabled("session_persistence"):
         from clawagents.session.persistence import SessionWriter
-        session_writer = SessionWriter(session_id=session_id, session_dir=session_dir)
+        session_writer = SessionWriter()
         run_context.session_id = session_writer.session_id
         run_context._metadata["session_id"] = session_writer.session_id
         emit("context", {"message": f"session: {session_writer.session_id} → {session_writer.path}"})
@@ -2735,7 +2722,11 @@ async def _run_agent_graph_core(
         except Exception as err:
             emit("warn", {"message": f"advisor consultation failed: {err}"})
 
-    prompt_to_use = system_prompt or BASE_SYSTEM_PROMPT
+    prompt_to_use = append_model_identity(
+        system_prompt or BASE_SYSTEM_PROMPT,
+        getattr(llm, "name", None),
+        getattr(llm, "model", None),
+    )
     lesson_preamble = ""
     dynamic_parts: list[str] = []
 
@@ -2809,6 +2800,40 @@ async def _run_agent_graph_core(
                 if rm:
                     dynamic_parts.append(rm)
                     emit("context", {"message": "injected ranked repo map"})
+            # Workspace facts models need before inventing git /tmp paths.
+            try:
+                import tempfile
+                from pathlib import Path as _P
+
+                from clawagents.tools.git_tools import is_git_work_tree
+
+                ws = str(getattr(run_context, "workspace", None) or _P.cwd())
+                git_ok = is_git_work_tree(ws)
+                scratch = tempfile.gettempdir()
+                meta = getattr(run_context, "_metadata", None)
+                sb_name = "workspace"
+                if isinstance(meta, dict):
+                    sb_name = str(meta.get("sandbox_profile") or sb_name)
+                dynamic_parts.append(
+                    "## Workspace env\n"
+                    f"- workspace: `{ws}`\n"
+                    f"- is_git_repo: {'true' if git_ok else 'false'}\n"
+                    f"- sandbox: `{sb_name}`\n"
+                    f"- scratch_dir: `{scratch}` (also /tmp when sandbox allows)\n"
+                    + (
+                        "- Prefer `snapshot_diff` to review edits (no git).\n"
+                        if not git_ok
+                        else "- Prefer `git_status` / `git_diff` to review edits.\n"
+                    )
+                    + "- Do not chain `&& git …` after syntax checks when is_git_repo is false.\n"
+                    + (
+                        "- OS sandbox is off — home config CLIs (gcloud/aws/docker) may run.\n"
+                        if sb_name == "off"
+                        else ""
+                    )
+                )
+            except Exception:
+                logger.debug("workspace env preamble failed", exc_info=True)
         except Exception:
             logger.debug("dynamic context pack failed", exc_info=True)
 
@@ -3597,15 +3622,6 @@ async def _run_agent_graph_core(
                 })
                 if not _final_assistant_appended:
                     messages.append(LLMMessage(role="assistant", content=response.content, thinking=_thinking_content))
-                # Persist the final answer to the session JSONL. The tool-call
-                # branch already writes assistant_message when the response
-                # includes tool_calls; this mirror handles the plain-text
-                # final-answer path so desktop replay can see it too.
-                if session_writer:
-                    session_writer.write_assistant_message(
-                        response.content or "",
-                        thinking=_thinking_content,
-                    )
                 break
 
             # ── Handoff dispatch (v6.4) ──────────────────────────────
