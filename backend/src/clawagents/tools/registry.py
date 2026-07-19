@@ -15,12 +15,22 @@ from typing import Any, Dict, List, Optional, Protocol
 
 
 class ToolResult:
-    __slots__ = ("success", "output", "error")
+    __slots__ = ("success", "output", "error", "raw_output")
 
-    def __init__(self, success: bool, output: str | list[dict[str, Any]], error: Optional[str] = None):
+    def __init__(
+        self,
+        success: bool,
+        output: str | list[dict[str, Any]],
+        error: Optional[str] = None,
+        *,
+        raw_output: str | list[dict[str, Any]] | None = None,
+    ):
         self.success = success
         self.output = output
         self.error = error
+        # Full pre-truncation payload for artifact archival / retrieve_tool_result.
+        # ``output`` may be a UI/model preview; ``raw_output`` keeps the original.
+        self.raw_output = output if raw_output is None else raw_output
 
 
 def _tool_error_debug_enabled() -> bool:
@@ -341,6 +351,9 @@ class ToolRegistry:
         self._description_cache: Optional[str] = None
         self._tool_timeout_s = tool_timeout_s
         self._validate_args = validate_args
+        # None = all registered tools are active (legacy / full surface).
+        # When set, list()/to_native_schemas()/execute only expose that set.
+        self._active_tools: Optional[set[str]] = None
 
         if result_cache is not None:
             self._result_cache = result_cache
@@ -355,6 +368,8 @@ class ToolRegistry:
     def register(self, tool: Tool) -> None:
         self.tools[tool.name] = tool
         self._description_cache = None
+        # Newly registered tools join the active set when a profile is in effect
+        # only if they are control-plane activators (handled by callers).
 
     def register_lazy(
         self,
@@ -378,10 +393,42 @@ class ToolRegistry:
     def get(self, name: str) -> Optional[Tool]:
         return self.tools.get(name)
 
+    def set_active_tools(self, names: set[str] | frozenset[str] | None) -> None:
+        """Restrict schemas/execution to ``names``. ``None`` restores full surface."""
+        if names is None:
+            self._active_tools = None
+        else:
+            self._active_tools = {str(n) for n in names if n}
+        self._description_cache = None
+
+    def activate_tools(self, names: list[str] | set[str] | frozenset[str]) -> None:
+        """Add tools to the active set (no-op when already fully open)."""
+        if self._active_tools is None:
+            return
+        self._active_tools |= {str(n) for n in names if n}
+        self._description_cache = None
+
+    def active_tool_names(self) -> Optional[set[str]]:
+        if self._active_tools is None:
+            return None
+        return set(self._active_tools)
+
+    def is_tool_active(self, name: str) -> bool:
+        if self._active_tools is None:
+            return True
+        return name in self._active_tools
+
+    def list_registered(self) -> List[Tool]:
+        """All registered tools, ignoring the active profile."""
+        return sorted(self.tools.values(), key=lambda t: (t.name or "").lower())
+
     def list(self) -> List[Tool]:
         # Alphabetical order keeps native schemas / text descriptions stable
         # for provider prompt-prefix caching across registration churn.
-        return sorted(self.tools.values(), key=lambda t: (t.name or "").lower())
+        tools = self.list_registered()
+        if self._active_tools is None:
+            return tools
+        return [t for t in tools if t.name in self._active_tools]
 
     def inspect_tools(self) -> List[Dict[str, Any]]:
         return [
@@ -481,6 +528,93 @@ class ToolRegistry:
 
         return []
 
+    async def _auto_drain_pending_skill(
+        self, run_context: Any
+    ) -> tuple[str, str | None]:
+        """Synthesize remaining ``use_skill`` pages until EOF or failure.
+
+        Returns ``(combined_pages, error)``. On success ``error`` is ``None``
+        and pending skill state is cleared via normal ``record_skill_page`` EOF.
+        Parallel callers share a lock so only one drain runs.
+        """
+        if run_context is None:
+            return "", "No run context; cannot finish pending skill."
+
+        lock = getattr(run_context, "_skill_drain_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            run_context._skill_drain_lock = lock
+
+        async with lock:
+            skill_name = getattr(run_context, "pending_skill_name", None)
+            if not skill_name:
+                return "", None
+
+            use_tool = self.get("use_skill")
+            if use_tool is None:
+                return "", (
+                    f"use_skill is not registered; cannot finish pending skill "
+                    f"'{skill_name}'."
+                )
+
+            pages: list[str] = []
+            try:
+                for _ in range(64):
+                    pending = getattr(run_context, "pending_skill_name", None)
+                    if not pending:
+                        break
+                    offset = getattr(run_context, "pending_skill_next_offset", None)
+                    expected_hash = getattr(
+                        run_context, "pending_skill_content_hash", None
+                    )
+                    if offset is None or not expected_hash:
+                        break
+                    page_args = {
+                        "name": pending,
+                        "continue": True,
+                    }
+                    result = await asyncio.wait_for(
+                        _call_tool_execute(use_tool, page_args, run_context),
+                        timeout=self._tool_timeout_s,
+                    )
+                    if not result.success:
+                        if hasattr(run_context, "clear_pending_skill"):
+                            run_context.clear_pending_skill()
+                        err = result.error or "skill continuation failed"
+                        pages.append(err)
+                        return "\n\n".join(pages), (
+                            f"Auto-continuation of skill '{pending}' failed: {err} "
+                            "Pending load cleared; call use_skill at offset 0 to reload."
+                        )
+                    out = (
+                        result.output
+                        if isinstance(result.output, str)
+                        else str(result.output)
+                    )
+                    pages.append(out)
+                else:
+                    if hasattr(run_context, "clear_pending_skill"):
+                        run_context.clear_pending_skill()
+                    return "\n\n".join(pages), (
+                        f"Auto-continuation of skill '{skill_name}' exceeded "
+                        "page limit; pending cleared."
+                    )
+            except asyncio.TimeoutError:
+                if hasattr(run_context, "clear_pending_skill"):
+                    run_context.clear_pending_skill()
+                return "\n\n".join(pages), (
+                    f"Auto-continuation of skill '{skill_name}' timed out; "
+                    "pending cleared."
+                )
+
+            if not pages:
+                return "", None
+            banner = (
+                f"[Harness auto-continued skill '{skill_name}' to EOF "
+                f"({len(pages)} page(s)).]\n\n"
+            )
+            return banner + "\n\n".join(pages), None
+
     async def execute_tool(
         self,
         tool_name: str,
@@ -492,12 +626,53 @@ class ToolRegistry:
         if not tool:
             return ToolResult(success=False, output="", error=f"Unknown tool: {tool_name}")
 
+        # Active-profile gate (activate_tool_group is always allowed).
+        if (
+            self._active_tools is not None
+            and tool_name not in self._active_tools
+            and tool_name != "activate_tool_group"
+        ):
+            return ToolResult(
+                success=False,
+                output="",
+                error=(
+                    f"Tool '{tool_name}' is registered but not active. "
+                    "Call activate_tool_group(group=…) to unlock its group, "
+                    "or activate_tool_group(group='list') to see options."
+                ),
+            )
+
         def _skill_key(value: object) -> str:
             return re.sub(r"[\s\-]+", "_", str(value or "").strip().lower())
 
-        # Partial instructions are not actionable. Until every contiguous page
-        # is read, only the next use_skill continuation may execute.
-        # Prefer continue=true — models routinely mangle 64-char sha256 echoes.
+        # Completed skills compose by intersection. Skill discovery/loading is
+        # control-plane behavior; it may add restrictions but never widen them.
+        # retrieve_tool_result is control-plane recovery for crushed outputs;
+        # crush headers advertise it — the gate must not refuse it.
+        control_plane = {"use_skill", "list_skills", "retrieve_tool_result"}
+
+        def _projected_allowed_tools() -> frozenset[str] | None:
+            """Allow-list after any pending skill page would activate at EOF."""
+            active = getattr(run_context, "active_skill_allowed_tools", None)
+            pending_name_local = getattr(run_context, "pending_skill_name", None)
+            pending_declared = bool(
+                getattr(run_context, "pending_skill_boundary_declared", False)
+            )
+            pending_boundary = getattr(run_context, "pending_skill_allowed_tools", None)
+            if pending_name_local and pending_declared:
+                boundary = (
+                    frozenset() if pending_boundary is None else frozenset(pending_boundary)
+                )
+                if active is None:
+                    return boundary
+                return frozenset(active) & boundary
+            return active if active is None else frozenset(active)
+
+        # Partial multi-page skill loads: the harness finishes remaining pages
+        # itself (name/offset/hash are deterministic) then runs the tool the
+        # model actually asked for. Exact continuations and abort=true still
+        # go through use_skill without auto-drain.
+        auto_skill_prefix = ""
         pending_name = getattr(run_context, "pending_skill_name", None)
         if pending_name:
             expected_offset = getattr(run_context, "pending_skill_next_offset", None)
@@ -506,6 +681,8 @@ class ToolRegistry:
                 supplied_offset = int(args.get("offset", 0) or 0)
             except (TypeError, ValueError):
                 supplied_offset = -1
+            # Prefer continue=true — models routinely mangle 64-char sha256
+            # echoes; pending offset/hash already live on the server.
             want_continue = bool(args.get("continue"))
             same_skill = _skill_key(args.get("name") or pending_name) == _skill_key(
                 pending_name
@@ -523,29 +700,51 @@ class ToolRegistry:
             )
             aborting = tool_name == "use_skill" and bool(args.get("abort"))
             if not continuing and not aborting:
-                return ToolResult(
-                    success=False,
-                    output="",
-                    error=(
-                        f"Refused: finish loading skill '{pending_name}' first. "
-                        f'Call use_skill with name="{pending_name}", continue=true '
-                        f"(server holds offset={expected_offset}; do not re-type the hash)."
-                    ),
+                # Refuse before drain when the tool would fail the post-EOF
+                # allow-list — otherwise drained pages are discarded on the
+                # gate return below (pending state already cleared).
+                projected = _projected_allowed_tools()
+                if (
+                    projected is not None
+                    and tool_name not in projected
+                    and tool_name not in control_plane
+                ):
+                    skill_label = str(
+                        pending_name
+                        or getattr(run_context, "active_skill_name", "")
+                        or ""
+                    )
+                    return ToolResult(
+                        success=False,
+                        output="",
+                        error=(
+                            f"Refused: skill '{skill_label}' (pending load) allows "
+                            f"only: {', '.join(sorted(projected)) or 'no data-plane tools'}. "
+                            "Finish or abort the skill load before calling other tools."
+                        ),
+                    )
+                drain_text, drain_err = await self._auto_drain_pending_skill(
+                    run_context
                 )
+                if drain_err:
+                    return ToolResult(
+                        success=False,
+                        output=drain_text or "",
+                        error=drain_err,
+                    )
+                auto_skill_prefix = drain_text or ""
 
-        # Completed skills compose by intersection. Skill discovery/loading is
-        # control-plane behavior; it may add restrictions but never widen them.
         allowed_tools = getattr(run_context, "active_skill_allowed_tools", None)
-        control_plane = {"use_skill", "list_skills", "retrieve_tool_result"}
         if (
             allowed_tools is not None
             and tool_name not in allowed_tools
             and tool_name not in control_plane
         ):
             active_name = str(getattr(run_context, "active_skill_name", "") or "")
+            # If drain somehow raced ahead of the preflight, still surface pages.
             return ToolResult(
                 success=False,
-                output="",
+                output=auto_skill_prefix or "",
                 error=(
                     f"Refused: active skill '{active_name}' allows only: "
                     f"{', '.join(sorted(allowed_tools)) or 'no data-plane tools'}."
@@ -567,18 +766,11 @@ class ToolRegistry:
                 or args.get("file_path")
                 or args.get("filePath")
             )
-            project_root = None
-            meta = getattr(run_context, "_metadata", None)
-            if isinstance(meta, dict):
-                root = meta.get("project_root") or meta.get("workspace")
-                if isinstance(root, str) and root:
-                    project_root = root
             decision = evaluate_tool_permission(
                 tool_name,
                 mode=mode,
                 file_path=file_path if isinstance(file_path, str) else None,
                 command=args.get("command") if isinstance(args.get("command"), str) else None,
-                project_root=project_root,
             )
             if not decision.allowed and not decision.requires_confirmation:
                 return ToolResult(
@@ -589,31 +781,6 @@ class ToolRegistry:
                         "to read-only tools while planning."
                     ),
                 )
-            # ── permission_callback invocation ────────────────────────────
-            # When the decision requires user confirmation (DEFAULT mode for
-            # write-class tools, or ACCEPT_EDITS for out-of-root paths),
-            # consult the permission_callback if one was provided.  Without a
-            # callback, the legacy fall-through behaviour is preserved so that
-            # non-desktop callers are unaffected.
-            if decision.requires_confirmation:
-                from clawagents.permissions.mode import PermissionDecision as _PD
-                _callback = getattr(run_context, "permission_callback", None)
-                if _callback is not None:
-                    _user_decision = await _callback({
-                        "tool": tool_name,
-                        "file_path": file_path if isinstance(file_path, str) else None,
-                        "command": args.get("command") if isinstance(args.get("command"), str) else None,
-                        "reason": decision.reason,
-                    })
-                    if _user_decision in ("allow_once", "allow_always"):
-                        decision = _PD(allowed=True, reason=f"user-{_user_decision}")
-                    else:
-                        decision = _PD(allowed=False, reason="user-denied")
-                    if not decision.allowed:
-                        return ToolResult(
-                            success=False, output="",
-                            error=f"Refused: '{tool_name}' was denied by the user.",
-                        )
 
         # Declarative permission rules (deny wins)
         engine = getattr(self, "_permission_engine", None)
@@ -647,6 +814,13 @@ class ToolRegistry:
         if is_cacheable:
             cached = self._result_cache.get(tool_name, effective_args)
             if cached is not None:
+                if auto_skill_prefix and isinstance(cached.output, str):
+                    return ToolResult(
+                        success=cached.success,
+                        output=f"{auto_skill_prefix}\n\n--- then executed {tool_name} ---\n\n{cached.output}",
+                        error=cached.error,
+                        raw_output=cached.raw_output,
+                    )
                 return cached
 
         try:
@@ -659,11 +833,14 @@ class ToolRegistry:
                 execute_awaitable,
                 timeout=self._tool_timeout_s,
             )
-            output = result.output
+            # Keep full output on ``raw_output`` so prepare_tool_output_for_context
+            # / retrieve_tool_result can archive the real dump. ``output`` is a
+            # bounded preview for UI/cache hot paths.
+            full_output = result.output
             if (
                 result.success
                 and tool_name in _WRITE_TOOLS
-                and isinstance(output, str)
+                and isinstance(full_output, str)
             ):
                 try:
                     from clawagents.tools.syntax_gate import append_syntax_gate
@@ -673,25 +850,54 @@ class ToolRegistry:
                         ws = getattr(run_context, "workspace", None) or getattr(
                             run_context, "cwd", None
                         )
-                    output = append_syntax_gate(
+                    full_output = append_syntax_gate(
                         tool_name,
                         effective_args if isinstance(effective_args, dict) else {},
-                        output,
+                        full_output,
                         workspace=ws,
                     )
                 except Exception:
                     pass
-            truncated = ToolResult(
+            if auto_skill_prefix and isinstance(full_output, str):
+                full_output = (
+                    f"{auto_skill_prefix}\n\n"
+                    f"--- then executed {tool_name} ---\n\n"
+                    f"{full_output}"
+                )
+            elif auto_skill_prefix and not isinstance(full_output, str):
+                # Non-string tool output: keep skill pages as the string preview
+                # and leave structured output on raw_output unchanged.
+                preview_with_skill = (
+                    f"{auto_skill_prefix}\n\n"
+                    f"--- then executed {tool_name} (structured output) ---"
+                )
+                preview_output = truncate_tool_output(preview_with_skill)
+                wrapped = ToolResult(
+                    success=result.success,
+                    output=preview_output,
+                    error=result.error,
+                    raw_output=result.output,
+                )
+                if is_cacheable and wrapped.success:
+                    self._result_cache.set(tool_name, effective_args, wrapped)
+                return wrapped
+            preview_output = (
+                truncate_tool_output(full_output)
+                if isinstance(full_output, str)
+                else full_output
+            )
+            wrapped = ToolResult(
                 success=result.success,
-                output=truncate_tool_output(output),
+                output=preview_output,
                 error=result.error,
+                raw_output=full_output,
             )
 
             # Cache successful results for cacheable tools
-            if is_cacheable and truncated.success:
-                self._result_cache.set(tool_name, effective_args, truncated)
+            if is_cacheable and wrapped.success:
+                self._result_cache.set(tool_name, effective_args, wrapped)
 
-            if truncated.success and tool_name in _WRITE_TOOLS:
+            if wrapped.success and tool_name in _WRITE_TOOLS:
                 prompt_idx = None
                 if run_context is not None and isinstance(
                     getattr(run_context, "_metadata", None), dict
@@ -705,7 +911,7 @@ class ToolRegistry:
                     tool_name, effective_args, prompt_index=prompt_idx,
                 )
 
-            return truncated
+            return wrapped
         except asyncio.TimeoutError:
             return ToolResult(
                 success=False, output="",

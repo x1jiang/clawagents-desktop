@@ -196,9 +196,6 @@ class ClawAgent:
         images: Optional[list[dict]] = None,
         files: Optional[list[dict]] = None,
         session_end_tail: bool = True,
-        session_id: Optional[str] = None,
-        session_dir: Optional[Path] = None,
-        permission_callback: Optional[Callable[[dict], Any]] = None,
     ) -> AgentState:
         """Start the ReAct agent loop for ``task``.
 
@@ -262,13 +259,12 @@ class ClawAgent:
         default_pm = getattr(self, "_default_permission_mode", None)
         if default_pm is not None:
             run_context.permission_mode = default_pm
-        if permission_callback is not None:
-            run_context.permission_callback = permission_callback
         store = getattr(self, "skill_store", None)
         if store is not None:
             run_context._metadata["skill_store"] = store
         # Gate Goal reminder + final verifier on this turn's mode (Act ≠ Goal).
         run_context._metadata["goal_mode"] = bool(getattr(self, "goal_mode", False))
+        # OS sandbox contract — used by execute unsandboxed retry + env banner.
         if not isinstance(run_context._metadata, dict):
             run_context._metadata = {}
         run_context._metadata["sandbox_profile"] = getattr(
@@ -335,9 +331,6 @@ class ClawAgent:
             image_blocks=image_blocks,
             file_blocks=file_blocks,
             session_end_tail=session_end_tail,
-            session_id=session_id,
-            session_dir=session_dir,
-            permission_callback=permission_callback,
         )
 
     # ── Convenience hook methods ──────────────────────────────────────
@@ -749,6 +742,12 @@ def create_claw_agent(
                         ``seatbelt``, ``bwrap``, …). Default: ``CLAW_SANDBOX_PROFILE``
                         or ``workspace`` (path-confined; upgrades to seatbelt/bwrap
                         when available). Pass ``sandbox=`` to inject a custom backend.
+        chat_mode:      Host UI mode (``ask`` / ``read_only`` / ``auto`` /
+                        ``full_access``). Coupled to the OS sandbox: ``full_access``
+                        with ``allow_full_access`` → profile ``off``; ``read_only``
+                        → ``read-only``. Explicit ``sandbox_profile`` still wins.
+        allow_full_access: Settings gate required before ``chat_mode=full_access``
+                        disables the OS sandbox (VS Code / Desktop parity).
         permission_rules: Extra declarative allow/deny/ask rules (deny wins).
                         Defaults load from ``.clawagents/permissions.json`` when
                         ``permission_rules`` feature is on.
@@ -876,6 +875,7 @@ def create_claw_agent(
         resolved_advisor_llm = _resolve_model(advisor_spec, streaming, adv_key, context_window)
 
     # ── Resolve sandbox backend ────────────────────────────────────────
+    # Chat UI mode and seatbelt are one contract — see sandbox_profile_for_chat_mode.
     sandbox_profile_name = "off"
     if sandbox is not None:
         sb = sandbox
@@ -1367,6 +1367,28 @@ def create_claw_agent(
         ):
             if registry.get(discovery_tool.name) is None:
                 registry.register(discovery_tool)
+
+    # GPT-5.6 / Luna: shrink the advertised tool surface; optional groups stay
+    # registered and unlock via activate_tool_group (see tool_groups.py).
+    try:
+        from clawagents.harness_profiles import resolve_harness_profile
+        from clawagents.tools.tool_groups import (
+            ActivateToolGroupTool,
+            apply_core_active_profile,
+        )
+
+        _mid = (
+            model
+            if isinstance(model, str)
+            else getattr(llm, "model", None) or getattr(model, "model", None)
+        )
+        _hp = resolve_harness_profile(str(_mid) if _mid else None)
+        if _hp is not None and _hp.name == "openai-gpt56":
+            if registry.get("activate_tool_group") is None:
+                registry.register(ActivateToolGroupTool(registry))
+            apply_core_active_profile(registry)
+    except Exception:
+        pass
 
     return agent
 
@@ -1996,16 +2018,7 @@ def _build_skill_catalog_prompt(
 
 
 _DEFAULT_MEMORY_FILES = ["AGENTS.md", "CLAWAGENTS.md", "CLAUDE.md"]
-_DEFAULT_SKILL_DIRS = [
-    "skills",
-    ".skills",
-    "skill",
-    ".skill",
-    "Skills",
-    ".agents/skills",
-    ".agent/skills",
-    ".cursor/skills",
-]
+_DEFAULT_SKILL_DIRS = ["skills", ".skills", "skill", ".skill", "Skills"]
 
 
 def _auto_discover_memory() -> list:
