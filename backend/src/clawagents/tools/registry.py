@@ -496,7 +496,8 @@ class ToolRegistry:
             return re.sub(r"[\s\-]+", "_", str(value or "").strip().lower())
 
         # Partial instructions are not actionable. Until every contiguous page
-        # is read, only the exact next use_skill continuation may execute.
+        # is read, only the next use_skill continuation may execute.
+        # Prefer continue=true — models routinely mangle 64-char sha256 echoes.
         pending_name = getattr(run_context, "pending_skill_name", None)
         if pending_name:
             expected_offset = getattr(run_context, "pending_skill_next_offset", None)
@@ -505,27 +506,37 @@ class ToolRegistry:
                 supplied_offset = int(args.get("offset", 0) or 0)
             except (TypeError, ValueError):
                 supplied_offset = -1
+            want_continue = bool(args.get("continue"))
+            same_skill = _skill_key(args.get("name") or pending_name) == _skill_key(
+                pending_name
+            )
             continuing = (
                 tool_name == "use_skill"
-                and _skill_key(args.get("name")) == _skill_key(pending_name)
-                and supplied_offset == expected_offset
-                and args.get("expected_hash") == expected_hash
+                and same_skill
+                and (
+                    want_continue
+                    or (
+                        supplied_offset == expected_offset
+                        and args.get("expected_hash") == expected_hash
+                    )
+                )
             )
-            if not continuing:
+            aborting = tool_name == "use_skill" and bool(args.get("abort"))
+            if not continuing and not aborting:
                 return ToolResult(
                     success=False,
                     output="",
                     error=(
                         f"Refused: finish loading skill '{pending_name}' first. "
-                        f"Call use_skill with offset={expected_offset} and "
-                        f"expected_hash={expected_hash}."
+                        f'Call use_skill with name="{pending_name}", continue=true '
+                        f"(server holds offset={expected_offset}; do not re-type the hash)."
                     ),
                 )
 
         # Completed skills compose by intersection. Skill discovery/loading is
         # control-plane behavior; it may add restrictions but never widen them.
         allowed_tools = getattr(run_context, "active_skill_allowed_tools", None)
-        control_plane = {"use_skill", "list_skills"}
+        control_plane = {"use_skill", "list_skills", "retrieve_tool_result"}
         if (
             allowed_tools is not None
             and tool_name not in allowed_tools
