@@ -34,10 +34,10 @@ xcrun notarytool store-credentials clawagents-notary \
 SKIP_NOTARIZE=1 ./build.sh
 ```
 
-## Features (0.4.3)
+## Features (0.4.13)
 
 - **Default Auto-approve:** Edit + Execute on
-- **Engine 6.20.25:** skill tool filtering + aliases, apply_patch matching, MCP reconnect/timeout, compaction tool_calls_meta fix; circuit breaker on by default
+- **Engine 6.20.32:** Graphify companion floors/skill sync (clawagents 6.20.31–6.20.32); prior: skill tool filtering, apply_patch, MCP reconnect/timeout, compaction tool_calls_meta, circuit breaker on by default
 - **Settings / providers:** concurrent settings-save hardening; Mantle/catalog fixes; connection-banner reliability
 - **VS Code parity carry-forward:** skill capabilities, project-scoped runtime trust, rewind / companions / plan-approval
 - Local projects and **SSH remote** projects (`~/.ssh/config`, including `ProxyJump`)
