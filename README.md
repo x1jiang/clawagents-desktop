@@ -34,7 +34,7 @@ xcrun notarytool store-credentials clawagents-notary \
 SKIP_NOTARIZE=1 ./build.sh
 ```
 
-## Features (0.4.16)
+## Features (0.4.17)
 
 - **Default Auto-approve:** Edit + Execute on
 - **Engine 6.20.35: failure discipline + shell-secret redaction; prior 6.20.34** 8KB UI tool results, execute stderr-first failures, Codex apply_patch; prior 6.20.33 scratch/CRLF fixes
