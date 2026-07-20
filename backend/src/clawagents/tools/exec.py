@@ -71,6 +71,79 @@ def _truncate_exec_output(output: str) -> str:
     )
 
 
+def _git_not_a_repo_signal(command: str, exit_code: int, stdout: str, stderr: str) -> bool:
+    if exit_code != 128:
+        return False
+    blob = f"{stdout}\n{stderr}".lower()
+    if "not a git repository" in blob:
+        return True
+    # Common when agents chain ``node --check … && git diff`` outside a repo.
+    cmd = (command or "").lower()
+    return "git " in f" {cmd} " or cmd.strip().startswith("git")
+
+
+def _sandbox_eperm_signal(stdout: str, stderr: str) -> bool:
+    blob = f"{stdout}\n{stderr}"
+    return "Operation not permitted" in blob or "EPERM" in blob
+
+
+def _sandbox_write_hint(stdout: str, stderr: str) -> str | None:
+    if not _sandbox_eperm_signal(stdout, stderr):
+        return None
+    blob = f"{stdout}\n{stderr}"
+    try:
+        import tempfile
+
+        scratch = tempfile.gettempdir()
+    except Exception:
+        scratch = "<system temp>"
+    # Scripts often do `cmd >/dev/null || echo fail` — the redirect fails, not cmd.
+    if "/dev/null" in blob and (
+        "credentials" not in blob.lower() and ".config/" not in blob
+    ):
+        return (
+            "OS sandbox denied the redirect target /dev/null (not necessarily "
+            "your command). On current clawagents this should be allowed — "
+            "upgrade the package, or retry with execute(unsandboxed=true) when "
+            "Full access is on, or set CLAW_SANDBOX_PROFILE=off."
+        )
+    home_config = (
+        "gcloud" in blob.lower()
+        or ".config/" in blob
+        or "credentials.db" in blob
+    )
+    if home_config:
+        return (
+            "OS sandbox blocked a write outside the workspace (home config / "
+            f"credentials). Workspace + {scratch} + /tmp are allowed by default. "
+            "gcloud/aws/docker need ~/.config — enable Full access (chat_mode="
+            "full_access with Allow Full Access; disables OS sandbox), retry "
+            "with execute(unsandboxed=true) under that mode, or run in a "
+            "normal macOS Terminal."
+        )
+    return (
+        f"Sandbox write denied. Prefer the workspace or session scratch "
+        f"({scratch}); /tmp and /private/tmp are also allowed when the OS "
+        f"sandbox profile is active. Avoid writing outside those roots. "
+        "Under Full access you may retry with execute(unsandboxed=true)."
+    )
+
+
+def _may_run_unsandboxed(run_context: Any, args: Dict[str, Any]) -> bool:
+    """True when this call is allowed to skip seatbelt/bwrap wrap."""
+    if not _truthy(args.get("unsandboxed")):
+        return False
+    meta = getattr(run_context, "_metadata", None)
+    if not isinstance(meta, dict):
+        return False
+    return bool(meta.get("allow_unsandboxed_exec"))
+
+
+def _short_exit_error(exit_code: int) -> str:
+    """UI/error field: exit code only — full command lives in structured output."""
+    return f"Command exited with code {exit_code}"
+
+
 def _format_nonzero_command_output(
     command: str,
     exit_code: int,
@@ -78,6 +151,21 @@ def _format_nonzero_command_output(
     stderr: str,
     warning_prefix: str,
 ) -> str:
+    interpretation = (
+        "The command ran and exited nonzero. Treat stdout/stderr as "
+        "diagnostic feedback, not as a tool transport failure."
+    )
+    if _git_not_a_repo_signal(command, exit_code, stdout, stderr):
+        interpretation = (
+            "Git exited 128 because this working directory is not a git "
+            "repository. Do not retry git here. Run syntax/tests in a "
+            "separate execute call without chaining `&& git …` "
+            "(e.g. `node --check file.js` alone). Prefer snapshot_diff to "
+            "review edits when git is unavailable."
+        )
+    hint = _sandbox_write_hint(stdout, stderr)
+    if hint:
+        interpretation = f"{interpretation} {hint}"
     payload: dict[str, Any] = {
         "command_executed": True,
         "success": False,
@@ -85,10 +173,7 @@ def _format_nonzero_command_output(
         "command": command,
         "stdout": _truncate_exec_output(stdout or ""),
         "stderr": _truncate_exec_output(stderr or ""),
-        "interpretation": (
-            "The command ran and exited nonzero. Treat stdout/stderr as "
-            "diagnostic feedback, not as a tool transport failure."
-        ),
+        "interpretation": interpretation,
     }
     warning = warning_prefix.strip()
     if warning:
@@ -205,6 +290,12 @@ def _maybe_wrap_for_profile(sb: Any, command: str, *, cwd: str | None) -> str:
     if callable(wrap):
         return str(wrap(command, cwd=cwd))
     return command
+
+
+def _unsandboxed_backend(sb: Any) -> Any:
+    """Prefer the inner LocalBackend when ``sb`` is a ProfileBackend."""
+    inner = getattr(sb, "_inner", None)
+    return inner if inner is not None else sb
 
 
 def _resolve_block_until_ms(args: Dict[str, Any]) -> tuple[int, bool]:
@@ -363,6 +454,9 @@ class ExecTool:
         "Working directory and (when enabled) env exports persist across calls "
         "in this session. Noisy commands (pytest, git status/log/diff, ls, rg, …) "
         "may be auto-wrapped with rtk when installed. "
+        "Do not chain git with other checks via `&&` when the workspace may not "
+        "be a git repo — run `node --check` / tests alone, and prefer git_status / "
+        "git_diff tools (they report clearly when there is no .git). "
         "Use block_until_ms (alias of timeout) for the foreground wait; "
         "block_until_ms=0 or is_background=true returns a job_id immediately. "
         "Foreground deadlines may auto-background — use task_status / task_output / "
@@ -389,6 +483,15 @@ class ExecTool:
             "description": (
                 "Run in the background and return job_id immediately "
                 "(for long-running commands). Default: false."
+            ),
+        },
+        "unsandboxed": {
+            "type": "boolean",
+            "description": (
+                "Skip OS sandbox wrap (seatbelt/bwrap) for this command. "
+                "Only honored when chat mode is full_access with Allow Full "
+                "Access. Use after a sandbox EPERM on home-config CLIs "
+                "(gcloud/aws/docker)."
             ),
         },
     }
@@ -457,9 +560,14 @@ class ExecTool:
                     error="is_background requires CLAW_FEATURE_EXECUTE_BACKGROUND=1",
                 )
 
-            # Match foreground isolation: wrap for seatbelt/bwrap + scrub env.
+            # Match foreground isolation: wrap for seatbelt/bwrap + scrub env
+            # unless Full access authorized unsandboxed=true.
             try:
-                bg_command = _maybe_wrap_for_profile(sb, command, cwd=run_cwd)
+                if _may_run_unsandboxed(run_context, args):
+                    bg_command = command
+                    warning_prefix += "[sandbox: off for this command (unsandboxed)]\n"
+                else:
+                    bg_command = _maybe_wrap_for_profile(sb, command, cwd=run_cwd)
             except Exception as e:
                 return ToolResult(
                     success=False, output="", error=f"Background sandbox wrap failed: {e}"
@@ -596,10 +704,7 @@ class ExecTool:
                         stderr or "",
                         warning_prefix,
                     ),
-                    error=(
-                        f"Command exited with code {exit_code}: "
-                        f"{args.get('command', command)}"
-                    ),
+                    error=_short_exit_error(exit_code),
                 )
 
             output = stdout or ""
@@ -614,22 +719,23 @@ class ExecTool:
 
         # Legacy sandbox path (kill-on-timeout). Profile backends land here
         # because kind is ``profile:*:local`` — keep that so seatbelt/bwrap run.
-        with tool_span("exec.run", command=command, timeout_ms=timeout_ms):
+        exec_sb = sb
+        if _may_run_unsandboxed(run_context, args):
+            exec_sb = _unsandboxed_backend(sb)
+            warning_prefix += "[sandbox: off for this command (unsandboxed)]\n"
+
+        async def _run_once(target: Any):
             try:
-                result = await sb.exec(command, timeout=timeout_ms, cwd=run_cwd)
+                return await target.exec(command, timeout=timeout_ms, cwd=run_cwd)
             except TypeError as e:
-                # Only retry without cwd when the backend rejects the kwarg.
                 msg = str(e).lower()
                 if "cwd" not in msg and "unexpected keyword" not in msg:
-                    return ToolResult(
-                        success=False, output="", error=f"Command failed: {e}"
-                    )
-                try:
-                    result = await sb.exec(command, timeout=timeout_ms)
-                except Exception as e2:
-                    return ToolResult(
-                        success=False, output="", error=f"Command failed: {e2}"
-                    )
+                    raise
+                return await target.exec(command, timeout=timeout_ms)
+
+        with tool_span("exec.run", command=command, timeout_ms=timeout_ms):
+            try:
+                result = await _run_once(exec_sb)
             except Exception as e:
                 return ToolResult(
                     success=False, output="", error=f"Command failed: {e}"
@@ -649,6 +755,32 @@ class ExecTool:
                 )
 
             stdout = result.stdout or ""
+            stderr = getattr(result, "stderr", None) or ""
+            # Escalation ladder: sandbox EPERM → one automatic unsandboxed
+            # retry when Full access authorized this turn.
+            meta = getattr(run_context, "_metadata", None) if run_context else None
+            can_escalate = (
+                isinstance(meta, dict)
+                and bool(meta.get("allow_unsandboxed_exec"))
+                and exec_sb is sb
+                and result.exit_code != 0
+                and _sandbox_eperm_signal(stdout, stderr)
+            )
+            if can_escalate:
+                warning_prefix += (
+                    "[sandbox: EPERM — auto-retrying once without OS sandbox]\n"
+                )
+                try:
+                    result = await _run_once(_unsandboxed_backend(sb))
+                    stdout = result.stdout or ""
+                    stderr = getattr(result, "stderr", None) or ""
+                except Exception as e:
+                    return ToolResult(
+                        success=False,
+                        output=warning_prefix,
+                        error=f"Unsandboxed retry failed: {e}",
+                    )
+
             if session is not None:
                 stdout = session.consume_stdout(stdout, sticky_env=sticky_env)
 
@@ -660,13 +792,10 @@ class ExecTool:
                         str(args.get("command", command)),
                         result.exit_code,
                         stdout,
-                        result.stderr or "",
+                        stderr,
                         warning_prefix,
                     ),
-                    error=(
-                        f"Command exited with code {result.exit_code}: "
-                        f"{args.get('command', command)}"
-                    ),
+                    error=_short_exit_error(result.exit_code),
                 )
 
             output = stdout

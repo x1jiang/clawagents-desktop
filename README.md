@@ -34,10 +34,10 @@ xcrun notarytool store-credentials clawagents-notary \
 SKIP_NOTARIZE=1 ./build.sh
 ```
 
-## Features (0.4.14)
+## Features (0.4.15)
 
 - **Default Auto-approve:** Edit + Execute on
-- **Engine 6.20.33:** `/tmp` write_file sandbox parity + secret CRLF scrub + python3 preference; prior Graphify companion (6.20.31–6.20.32)
+- **Engine 6.20.34:** 8KB UI tool results, execute stderr-first failures, Codex apply_patch; prior 6.20.33 scratch/CRLF fixes
 - **Settings / providers:** concurrent settings-save hardening; Mantle/catalog fixes; connection-banner reliability
 - **VS Code parity carry-forward:** skill capabilities, project-scoped runtime trust, rewind / companions / plan-approval
 - Local projects and **SSH remote** projects (`~/.ssh/config`, including `ProxyJump`)
