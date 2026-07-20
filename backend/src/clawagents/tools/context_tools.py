@@ -261,11 +261,144 @@ class CheckpointDiffTool:
             return ToolResult(success=False, output="", error=str(info.get("error")))
         return ToolResult(success=True, output=json.dumps(info.get("files") or [], indent=2))
 
+class SnapshotDiffTool:
+    name = "snapshot_diff"
+    description = (
+        "Diff the working tree against a pre-edit file snapshot under "
+        ".clawagents/snapshots/ (git-free review). Use when is_git_repo is false "
+        "or before claiming edits are correct. Optional path limits to one file; "
+        "optional snapshot id (directory name); default is the oldest snapshot "
+        "still on disk (session-start baseline when available)."
+    )
+    parameters = {
+        "path": {
+            "type": "string",
+            "description": "Optional workspace-relative file to diff",
+        },
+        "snapshot": {
+            "type": "string",
+            "description": "Snapshot directory name under .clawagents/snapshots/",
+        },
+        "max_chars": {
+            "type": "integer",
+            "description": "Cap returned diff chars (default 24000)",
+        },
+    }
+
+    def __init__(self, workspace: str | None = None) -> None:
+        self._workspace = workspace or os.getcwd()
+
+    async def execute(self, args: dict[str, Any]) -> ToolResult:
+        import difflib
+
+        root = Path(self._workspace).resolve()
+        snap_root = root / ".clawagents" / "snapshots"
+        if not snap_root.is_dir():
+            return ToolResult(
+                success=True,
+                output=(
+                    "No .clawagents/snapshots/ yet — edit a file with apply_patch / "
+                    "write_file / hashline_edit first (snapshots are taken pre-write)."
+                ),
+            )
+        dirs = sorted(
+            [p for p in snap_root.iterdir() if p.is_dir()],
+            key=lambda p: p.name,
+        )
+        if not dirs:
+            return ToolResult(success=True, output="No snapshot directories present.")
+        wanted = str(args.get("snapshot") or "").strip()
+        if wanted:
+            snap_dir = snap_root / wanted
+            if not snap_dir.is_dir():
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=f"snapshot not found: {wanted}. Available: {[d.name for d in dirs[-8:]]}",
+                )
+        else:
+            snap_dir = dirs[0]  # oldest ≈ session-start baseline
+
+        rel = str(args.get("path") or "").strip()
+        try:
+            max_chars = int(args.get("max_chars") or 24_000)
+        except (TypeError, ValueError):
+            max_chars = 24_000
+
+        files: list[Path]
+        if rel:
+            cand = (snap_dir / rel).resolve()
+            try:
+                cand.relative_to(snap_dir.resolve())
+            except ValueError:
+                return ToolResult(success=False, output="", error="path escapes snapshot")
+            files = [cand] if cand.is_file() else []
+            if not files:
+                return ToolResult(
+                    success=True,
+                    output=f"No snapshot of {rel!r} in {snap_dir.name}",
+                )
+        else:
+            files = [p for p in snap_dir.rglob("*") if p.is_file()]
+
+        total_files = len(files)
+        file_cap = 40
+        shown_files = files[:file_cap]
+        header = f"Snapshot baseline: {snap_dir.name} ({total_files} file(s))"
+        if total_files > file_cap:
+            header += (
+                f" — showing {file_cap} of {total_files}; "
+                "pass path= to focus on a specific file"
+            )
+        parts: list[str] = [header]
+        for snap_file in shown_files:
+            try:
+                rel_path = snap_file.relative_to(snap_dir)
+            except ValueError:
+                continue
+            cur = root / rel_path
+            try:
+                before = snap_file.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                parts.append(f"\n## {rel_path}\n(read snapshot failed: {exc})")
+                continue
+            if not cur.is_file():
+                parts.append(f"\n## {rel_path}\n(deleted in working tree)")
+                continue
+            try:
+                after = cur.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                parts.append(f"\n## {rel_path}\n(read working tree failed: {exc})")
+                continue
+            if before == after:
+                continue
+            diff = "".join(
+                difflib.unified_diff(
+                    before.splitlines(keepends=True),
+                    after.splitlines(keepends=True),
+                    fromfile=f"snapshot/{rel_path}",
+                    tofile=f"worktree/{rel_path}",
+                    n=2,
+                )
+            )
+            parts.append(f"\n## {rel_path}\n{diff or '(changed but empty diff)'}")
+
+        if len(parts) == 1:
+            parts.append("\n(no textual differences vs snapshot)")
+        text = parts[0] + "".join(parts[1:])
+        if len(text) > max_chars:
+            text = text[: max_chars - 40] + "\n… [snapshot_diff truncated] …\n"
+        return ToolResult(success=True, output=text)
+
+
 class WritePlanTool:
     name = "write_plan"
     description = (
         "Write/update .clawagents/plan.md for Plan→Act handoff "
-        "(goals, steps, risks, files)."
+        "(goals, invariants, steps, risks, files). Before a publish/deploy-style "
+        "side effect, add exact shell commands as backticked bullets under a "
+        "'Verification gates' heading; Act mode will require every command to "
+        "succeed after the latest edit."
     )
     parameters = {
         "content": {
@@ -278,7 +411,7 @@ class WritePlanTool:
     def __init__(self, workspace: str | None = None) -> None:
         self._workspace = workspace or os.getcwd()
 
-    async def execute(self, args: dict[str, Any]) -> ToolResult:
+    async def execute(self, args: dict[str, Any], run_context: Any = None) -> ToolResult:
         root = Path(self._workspace) / ".clawagents"
         root.mkdir(parents=True, exist_ok=True)
         path = root / "plan.md"
@@ -288,6 +421,25 @@ class WritePlanTool:
         if not body.startswith("#"):
             body = "# Plan\n\n" + body
         path.write_text(body + "\n", encoding="utf-8")
+        if run_context is not None and isinstance(
+            getattr(run_context, "_metadata", None), dict
+        ):
+            run_context._metadata["pending_plan_text"] = body
+        from clawagents.config.features import is_enabled
+        from clawagents.permissions.act_invariants import (
+            clear_contract,
+            mark_plan_pending,
+        )
+        from clawagents.permissions.mode import PermissionMode
+
+        if is_enabled("act_invariant_gate"):
+            if (
+                run_context is not None
+                and getattr(run_context, "permission_mode", None) == PermissionMode.PLAN
+            ):
+                mark_plan_pending(run_context, body, workspace=self._workspace)
+            else:
+                clear_contract(run_context, workspace=self._workspace)
         return ToolResult(success=True, output=f"Wrote {path}")
 
 
@@ -300,7 +452,16 @@ def load_plan_preamble(workspace: str | Path | None = None, max_chars: int = 3_0
         return ""
     if len(text) > max_chars:
         text = text[: max_chars - 20] + "\n…"
-    return f"## Active Plan\n\n{text}\n"
+    preamble = f"## Active Plan\n\n{text}\n"
+    from clawagents.config.features import is_enabled
+
+    if is_enabled("act_invariant_gate"):
+        from clawagents.permissions.act_invariants import contract_preamble
+
+        gate = contract_preamble(workspace=workspace)
+        if gate:
+            preamble += "\n" + gate
+    return preamble
 
 
 def create_context_tools(workspace: str | None = None) -> list[Tool]:
@@ -316,5 +477,6 @@ def create_context_tools(workspace: str | None = None) -> list[Tool]:
         CheckpointRestoreTool(ws),
         CheckpointListTool(ws),
         CheckpointDiffTool(ws),
+        SnapshotDiffTool(ws),
         WritePlanTool(ws),
     ]
