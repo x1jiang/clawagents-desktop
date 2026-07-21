@@ -34,10 +34,10 @@ xcrun notarytool store-credentials clawagents-notary \
 SKIP_NOTARIZE=1 ./build.sh
 ```
 
-## Features (0.4.24)
+## Features (0.4.25)
 
 - **Default Auto-approve:** Edit + Execute on
-- **Engine 6.20.44:** Mantle frontier base `…/openai/v1` (GPT-5.x 404 fix); Sol region us-east-1/2
+- **Engine 6.20.45:** Mantle Claude Bearer (`AsyncAnthropicBedrockMantle`); frontier `…/openai/v1`
 - **Settings / providers:** concurrent settings-save hardening; Mantle/catalog fixes; connection-banner reliability
 - **VS Code parity carry-forward:** skill capabilities, project-scoped runtime trust, rewind / companions / plan-approval
 - Local projects and **SSH remote** projects (`~/.ssh/config`, including `ProxyJump`)
