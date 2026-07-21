@@ -348,6 +348,19 @@ def _render_anchored(a: Anchor, content: str) -> str:
     return f"{a.line}:{a.suffix()}{ARROW}{content}"
 
 
+def _sample_anchors(
+    lines: Sequence[str], scheme: ChunkFingerprint, *, limit: int = 4
+) -> list[str]:
+    """Fresh ``LINE:HASH1:HASH2`` samples for malformed-anchor recovery hints."""
+    if not lines:
+        return []
+    anchors = scheme.generate_anchors(lines)
+    out: list[str] = []
+    for a in anchors[: max(0, limit)]:
+        out.append(a.render())
+    return out
+
+
 def _validate_anchor(
     anchor_str: str, lines: Sequence[str], scheme: ChunkFingerprint
 ) -> Tuple[Optional[int], Optional[ApplyError]]:
@@ -356,13 +369,32 @@ def _validate_anchor(
     if parsed is None:
         recovered = _recover_by_suffix(cleaned, lines, scheme)
         if recovered is None:
+            samples = _sample_anchors(lines, scheme)
+            hint = ""
+            if samples:
+                shown = ", ".join(f'"{s}"' for s in samples)
+                hint = (
+                    f" Valid anchors from this file (copy exactly, including the "
+                    f"line number): {shown}. Prefer hashline_read / hashline_grep, "
+                    f"then paste the ANCHOR before the arrow."
+                )
             return None, ApplyError(
                 kind="invalid_input",
                 message=(
                     f'Malformed anchor: "{cleaned}". '
-                    'Expected format: "LINE:HASH1:HASH2" (e.g. "22:abc:rst").'
+                    'Expected format: "LINE:HASH1:HASH2" (e.g. "22:abc:rst"). '
+                    "Do not pass bare HASH1:HASH2 without the line number unless "
+                    "it uniquely matches a suffix in the file."
+                    f"{hint}"
                 ),
                 requested_anchor=cleaned,
+                context="\n".join(
+                    _render_anchored(a, lines[a.line - 1])
+                    for a in scheme.generate_anchors(lines)[:4]
+                    if 0 < a.line <= len(lines)
+                )
+                or None,
+                context_start_line=1 if lines else None,
             )
         parsed = recovered
 
@@ -510,11 +542,35 @@ def _parse_ops(raw: Any) -> Tuple[Optional[List[dict[str, Any]]], Optional[str]]
     if not isinstance(raw, list) or not raw:
         return None, "edits must be a non-empty array of edit operations"
     ops: List[dict[str, Any]] = []
-    for item in raw:
+    for idx, item in enumerate(raw):
+        if isinstance(item, str):
+            try:
+                item = json.loads(item)
+            except json.JSONDecodeError as exc:
+                return None, f"edit #{idx + 1} was a JSON string but could not be parsed: {exc}"
         if not isinstance(item, dict):
-            return None, "each edit must be an object"
+            return None, f"edit #{idx + 1} must be an object"
         ops.append(item)
     return ops, None
+
+
+def _fresh_partial_anchor(
+    anchor_str: Any,
+    lines: Sequence[str],
+    scheme: ChunkFingerprint,
+) -> Optional[str]:
+    """Return the full current anchor for an incomplete ``LINE:HASH`` input.
+
+    This is only a recovery hint for anchors missing the context component;
+    complete-but-stale anchors retain the stricter shifted/ambiguous workflow.
+    """
+    parsed = ParsedAnchor.parse(_strip_arrow(str(anchor_str or "")))
+    if parsed is None or parsed.context is not None:
+        return None
+    idx = parsed.line - 1
+    if idx < 0 or idx >= len(lines):
+        return None
+    return scheme.generate_anchors(lines)[idx].render()
 
 
 def apply_edits(
@@ -582,7 +638,23 @@ def apply_edits(
                             f"failed validation, none of the edits were applied. "
                             f"Retry all {len(ops)} edits with fresh anchors."
                         )
-                    return None, aerr.to_dict()
+                    error = aerr.to_dict()
+                    fresh_anchors: dict[str, str] = {}
+                    fresh_start = _fresh_partial_anchor(anchor, lines, scheme)
+                    if fresh_start:
+                        fresh_anchors["anchor"] = fresh_start
+                    if end_anchor:
+                        fresh_end = _fresh_partial_anchor(end_anchor, lines, scheme)
+                        if fresh_end:
+                            fresh_anchors["end_anchor"] = fresh_end
+                    if fresh_anchors:
+                        error["fresh_anchors"] = fresh_anchors
+                        rendered = json.dumps(fresh_anchors, separators=(",", ":"))
+                        error["message"] += (
+                            f"\nRetry with these exact anchors: {rendered}. "
+                            "Do not shorten or reorder their hash components."
+                        )
+                    return None, error
                 assert start is not None
                 if end_anchor:
                     end_i, eerr = _validate_anchor(str(end_anchor), lines, scheme)
@@ -962,19 +1034,44 @@ class HashlineEditTool:
         'replace {op, anchor, end_anchor?, content}, '
         'insert_after {op, anchor|"0:"|"EOF", content}, '
         "write {op, content} (sole op). Batch is atomic — all validate or none apply. "
-        "On success returns a fresh-anchor snippet; on stale anchors returns recovery context. "
+        "Anchors must be full LINE:HASH1:HASH2 (e.g. 22:abc:rst) copied from "
+        "hashline_read/grep BEFORE the arrow — never invent short hashes. "
+        "On success returns a fresh-anchor snippet; on stale/malformed anchors "
+        "returns recovery context with valid samples. "
         "Prefer: hashline_grep → hashline_edit for multi-hunk work."
     )
     parameters: Dict[str, Dict[str, Any]] = {
         "path": {"type": "string", "description": "Path of the file to edit", "required": True},
         "edits": {
             "type": "array",
-            "description": "Array of edit operations (or a JSON string / single object)",
-            "required": True,
+            "description": (
+                "Array of edit objects. Pass objects directly, never JSON-encoded strings."
+            ),
             "items": {
                 "type": "object",
-                "description": "A single hashline edit operation (replace/insert_after/write)",
+                "properties": {
+                    "op": {
+                        "type": "string",
+                        "enum": ["replace", "insert_after", "write"],
+                        "description": "Edit operation.",
+                    },
+                    "anchor": {
+                        "type": "string",
+                        "description": (
+                            "Exact LINE:HASH1:HASH2 anchor copied before the arrow; "
+                            "insert_after also accepts 0: or EOF."
+                        ),
+                    },
+                    "end_anchor": {
+                        "type": "string",
+                        "description": "Optional inclusive end anchor for replace.",
+                    },
+                    "content": {"type": "string", "description": "Replacement text."},
+                },
+                "required": ["op", "content"],
+                "additionalProperties": False,
             },
+            "required": True,
         },
     }
 
