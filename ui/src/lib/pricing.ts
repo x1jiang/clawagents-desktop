@@ -47,15 +47,41 @@ const PRICES: Array<[string, Price]> = [
   ["gemini-2.5-pro",         { input: 1.25, output: 10.00 }],
   ["gemini-2.5-flash",       { input: 0.30, output: 2.50 }],
   ["gemini-2.0-flash",       { input: 0.10, output: 0.40 }],
+  // Amazon Bedrock / Mantle US Standard (aws.amazon.com/bedrock/pricing/)
+  ["xai.grok-4.3",           { input: 1.25, cachedInput: 0.20, output: 2.50 }],
+  ["grok-4.3",               { input: 1.25, cachedInput: 0.20, output: 2.50 }],
+  ["deepseek.v3.2",          { input: 0.62, output: 1.85 }],
+  ["deepseek.v3.1",          { input: 0.60, output: 1.73 }],
+  ["moonshot.kimi-k2.5",     { input: 0.60, output: 3.00 }],
+  ["kimi-k2.5",              { input: 0.60, output: 3.00 }],
+  ["moonshot.kimi-k2-thinking", { input: 0.60, output: 2.50 }],
+  ["kimi-k2-thinking",       { input: 0.60, output: 2.50 }],
+  ["zai.glm-5",              { input: 1.00, output: 3.20 }],
+  ["glm-5",                  { input: 1.00, output: 3.20 }],
+  ["zai.glm-4.7-flash",      { input: 0.07, output: 0.40 }],
+  ["glm-4.7-flash",          { input: 0.07, output: 0.40 }],
+  ["zai.glm-4.7",            { input: 0.60, output: 2.20 }],
+  ["glm-4.7",                { input: 0.60, output: 2.20 }],
+  ["zai.glm-4.6",            { input: 0.60, output: 2.20 }],
+  ["glm-4.6",                { input: 0.60, output: 2.20 }],
+  ["openai.gpt-oss-safeguard-120b", { input: 0.15, output: 0.60 }],
+  ["gpt-oss-safeguard-120b", { input: 0.15, output: 0.60 }],
+  ["openai.gpt-oss-safeguard-20b", { input: 0.07, output: 0.20 }],
+  ["gpt-oss-safeguard-20b",  { input: 0.07, output: 0.20 }],
+  ["openai.gpt-oss-120b",    { input: 0.15, output: 0.60 }],
+  ["gpt-oss-120b",           { input: 0.15, output: 0.60 }],
+  ["openai.gpt-oss-20b",     { input: 0.07, output: 0.30 }],
+  ["gpt-oss-20b",            { input: 0.07, output: 0.30 }],
 ];
 
 export function priceFor(model: string | undefined | null): Price | null {
   if (!model) return null;
-  // Find the longest matching prefix.
+  const key = model.trim().toLowerCase();
+  // Longest known prefix wins (catalog ids + bare ids listed above).
   let best: Price | null = null;
   let bestLen = 0;
   for (const [prefix, price] of PRICES) {
-    if (model.startsWith(prefix) && prefix.length > bestLen) {
+    if ((key === prefix || key.startsWith(prefix)) && prefix.length > bestLen) {
       best = price;
       bestLen = prefix.length;
     }

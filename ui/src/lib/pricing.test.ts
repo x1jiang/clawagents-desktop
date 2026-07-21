@@ -23,6 +23,13 @@ describe("priceFor", () => {
     expect(priceFor(null)).toBeNull();
     expect(priceFor(undefined)).toBeNull();
   });
+
+  test("Mantle catalog ids resolve AWS list prices", () => {
+    expect(priceFor("xai.grok-4.3")?.input).toBe(1.25);
+    expect(priceFor("xai.grok-4.3")?.output).toBe(2.5);
+    expect(priceFor("deepseek.v3.2")?.input).toBe(0.62);
+    expect(priceFor("openai.gpt-oss-20b")?.input).toBe(0.07);
+  });
 });
 
 describe("estimateCostUsd", () => {

@@ -34,10 +34,10 @@ xcrun notarytool store-credentials clawagents-notary \
 SKIP_NOTARIZE=1 ./build.sh
 ```
 
-## Features (0.4.22)
+## Features (0.4.23)
 
 - **Default Auto-approve:** Edit + Execute on
-- **Engine 6.20.43:** Mantle xAI Grok `/openai/v1` routing (Berm access_denied fix); prior sandbox/PTY/patch recovery
+- **Engine 6.20.43:** Mantle xAI Grok `/openai/v1` routing; AWS list prices for Mantle catalog cost estimates
 - **Settings / providers:** concurrent settings-save hardening; Mantle/catalog fixes; connection-banner reliability
 - **VS Code parity carry-forward:** skill capabilities, project-scoped runtime trust, rewind / companions / plan-approval
 - Local projects and **SSH remote** projects (`~/.ssh/config`, including `ProxyJump`)
