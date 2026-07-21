@@ -3,7 +3,7 @@
     "agent.py": "000cb73ff7a4506ce9222ce828045d189c78dfc33eb761fc5a8b3170dfb3b2b3",
     "gateway/server.py": "8a04390151a502a8d3eaa483e9dd8829aeccd5b920326ddbf7ce1980fd5ca44f",
     "gateway/ws.py": "5b814ec6e75b08fd54c8984942d3c7b52671ddc3c5e3f1b0242d78cf4720928a",
-    "graph/agent_loop.py": "ec5a3c93a6cd486ba190d0161737cae864a624a816a4e6c16125cf8e85c86380",
+    "graph/agent_loop.py": "cce2e880b7bf18e42e38a03ff3be58ebb165bad188e099fb59e12f25c9b8d800",
     "permissions/mode.py": "e4da438b41cf2719362ffa034822e968e967fb8d68411be5cdf8a00a1a6052a3",
     "run_context.py": "793a297f3a2a13618b658f0bd0446e519ac88d1a4a3adb6b2c0709432057683f",
     "run_result.py": "d508a029ad5d6301f2e8237fe9f460844aa6b31a77a3c481a8ea905dfe2f1a0b",
@@ -212,6 +212,7 @@
     "tools/subagent_resolve.py",
     "tools/think.py",
     "tools/todolist.py",
+    "tools/tool_groups.py",
     "tools/tool_program.py",
     "tools/validate.py",
     "tools/web.py",
@@ -233,7 +234,8 @@
     "transport.py",
     "usage.py",
     "utils/__init__.py",
-    "utils/atomic_write.py"
+    "utils/atomic_write.py",
+    "utils/bounded_output.py"
   ],
   "shared_hashes": {
     "__init__.py": "7a47384f6eed4c2dd4c5a490eab0838690920302b88325d859d4b23418f08288",
