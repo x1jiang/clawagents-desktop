@@ -29,6 +29,7 @@ const WINDOWS: Array<[string, number]> = [
   ["claude-haiku-4-5",  200_000],
   ["claude-haiku-4",    200_000],
   // Gemini — 3.x / 2.5 family ~1M.
+  ["gemini-3.6",       1_000_000],
   ["gemini-3.5",       1_000_000],
   ["gemini-3.1",       1_000_000],
   ["gemini-3",         1_000_000],

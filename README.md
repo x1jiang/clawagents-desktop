@@ -34,10 +34,10 @@ xcrun notarytool store-credentials clawagents-notary \
 SKIP_NOTARIZE=1 ./build.sh
 ```
 
-## Features (0.4.27)
+## Features (0.4.28)
 
 - **Default Auto-approve:** Edit + Execute on
-- **Engine 6.20.49:** OpenAI cache_write_tokens metered; Mantle Grok/Sonnet-5 omit temperature; Kimi `moonshotai.*`
+- **Engine 6.20.50:** Gemini 3.6 Flash + 3.5 Flash-Lite in the model picker / profiles
 - **Settings / providers:** concurrent settings-save hardening; Mantle/catalog fixes; connection-banner reliability
 - **VS Code parity carry-forward:** skill capabilities, project-scoped runtime trust, rewind / companions / plan-approval
 - Local projects and **SSH remote** projects (`~/.ssh/config`, including `ProxyJump`)
