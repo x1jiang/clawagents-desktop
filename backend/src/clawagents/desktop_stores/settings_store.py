@@ -29,7 +29,7 @@ class AppSettings:
     theme: str = "system"       # "light" | "dark" | "system"
     workspace_system_prompt: str = ""  # Prepended to every chat's first turn
     # Preferred provider for default-model routing / Settings UI focus.
-    # "auto" | "openai" | "anthropic" | "gemini" | "bedrock" | "ollama"
+    # "auto" | "openai" | "anthropic" | "gemini" | "bedrock" | "xai" | "ollama"
     provider: str = "auto"
     # OpenAI-compatible base URL (Azure, Ollama, BAG/LiteLLM). Empty = native.
     base_url: str = ""
@@ -62,6 +62,9 @@ class AppSettings:
     skill_user_homes: bool = True
     # Auto-install/upgrade context-mode + rtk companions (VS Code parity).
     ensure_companions: bool = True
+    # Record full LLM context events under .clawagents/context-observatory/
+    # (VS Code advanced.enableContextObservatory parity).
+    context_observatory: bool = False
 
     def __post_init__(self) -> None:
         if self.skill_dirs is None:

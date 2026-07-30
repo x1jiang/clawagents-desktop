@@ -5,19 +5,21 @@ import { useProjects } from "../stores/projects";
 import { BackupPanel } from "./BackupPanel";
 import { clearAllDrafts } from "../lib/drafts";
 import { pushToast } from "../stores/toasts";
+import { tauriApi } from "../lib/tauri";
 import type { AppSettings, ProviderCatalogEntry } from "../lib/gateway";
 
 interface Props {
   onClose: () => void;
 }
 
-type ProviderId = "openai" | "anthropic" | "gemini" | "bedrock";
+type ProviderId = "openai" | "anthropic" | "gemini" | "bedrock" | "xai";
 type SettingsTab = "providers" | "defaults" | "agent" | "data";
 
 const KEY_PROVIDERS: Array<{ id: ProviderId; name: string; hint: string }> = [
   { id: "openai", name: "OpenAI", hint: "Official API, or OpenAI-compatible proxies via Base URL" },
   { id: "anthropic", name: "Anthropic", hint: "Claude via Anthropic API (not Bedrock)" },
   { id: "gemini", name: "Google Gemini", hint: "Google AI Studio / Gemini API key" },
+  { id: "xai", name: "xAI (Grok)", hint: "Native Grok API via api.x.ai (XAI_API_KEY)" },
   { id: "bedrock", name: "AWS Bedrock", hint: "Native IAM (HIPAA) or optional Access Gateway" },
 ];
 
@@ -54,6 +56,7 @@ export function SettingsModal({ onClose }: Props) {
   const [mcpTrust, setMcpTrust] = useState(false);
   const [contextMode, setContextMode] = useState(true);
   const [ensureCompanions, setEnsureCompanions] = useState(true);
+  const [contextObservatory, setContextObservatory] = useState(false);
   const [companionBusy, setCompanionBusy] = useState(false);
   const [browserTools, setBrowserTools] = useState(false);
   const [trajectory, setTrajectory] = useState(false);
@@ -66,6 +69,11 @@ export function SettingsModal({ onClose }: Props) {
   const [wireApi, setWireApi] = useState("auto");
   const [sslVerify, setSslVerify] = useState(true);
   const [skillUserHomes, setSkillUserHomes] = useState(true);
+  const [skillAutoDiscover, setSkillAutoDiscover] = useState(true);
+  const [skillDirs, setSkillDirs] = useState<string[]>([]);
+  const [skillIgnoreDirs, setSkillIgnoreDirs] = useState<string[]>([]);
+  const [skillExclude, setSkillExclude] = useState<string[]>([]);
+  const [skillDirDraft, setSkillDirDraft] = useState("");
   const [catalog, setCatalog] = useState<ProviderCatalogEntry[]>([]);
   const [saving, setSaving] = useState(false);
   const [securityScope, setSecurityScope] = useState("projectless");
@@ -100,6 +108,7 @@ export function SettingsModal({ onClose }: Props) {
         setMcpTrust(Boolean(s.mcp_trust_workspace));
         setContextMode(s.context_mode !== false);
         setEnsureCompanions(s.ensure_companions !== false);
+        setContextObservatory(Boolean(s.context_observatory));
         setBrowserTools(Boolean(s.browser_tools));
         setTrajectory(Boolean(s.trajectory));
         setLearn(Boolean(s.learn));
@@ -111,6 +120,10 @@ export function SettingsModal({ onClose }: Props) {
         setWireApi(s.wire_api || "auto");
         setSslVerify(s.ssl_verify !== false);
         setSkillUserHomes(s.skill_user_homes !== false);
+        setSkillAutoDiscover(s.skill_auto_discover !== false);
+        setSkillDirs(Array.isArray(s.skill_dirs) ? s.skill_dirs.map(String) : []);
+        setSkillIgnoreDirs(Array.isArray(s.skill_ignore_dirs) ? s.skill_ignore_dirs.map(String) : []);
+        setSkillExclude(Array.isArray(s.skill_exclude) ? s.skill_exclude.map(String) : []);
       } catch {
         /* defaults */
       }
@@ -236,6 +249,7 @@ export function SettingsModal({ onClose }: Props) {
           mcp_trust_workspace: mcpTrust,
           context_mode: contextMode,
           ensure_companions: ensureCompanions,
+          context_observatory: contextObservatory,
           browser_tools: browserTools,
           trajectory,
           learn,
@@ -247,6 +261,10 @@ export function SettingsModal({ onClose }: Props) {
           wire_api: wireApi,
           ssl_verify: sslVerify,
           skill_user_homes: skillUserHomes,
+          skill_auto_discover: skillAutoDiscover,
+          skill_dirs: skillDirs,
+          skill_ignore_dirs: skillIgnoreDirs,
+          skill_exclude: skillExclude,
         }, projectId, securityScope === "projectless");
         useSettingsSaveStatus.getState().setInFlight(patchPromise);
         try {
@@ -302,6 +320,9 @@ export function SettingsModal({ onClose }: Props) {
             className="text-xs shrink-0 px-2 py-1 rounded border border-gray-300 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-800"
             onClick={() => {
               setProvider(id);
+              if (id === "xai" && !defaultModel) {
+                setDefaultModel("grok-4.5");
+              }
               if (id === "bedrock" && !defaultModel) {
                 setDefaultModel("us.anthropic.claude-sonnet-4-5-20250929-v1:0");
               }
@@ -528,6 +549,7 @@ export function SettingsModal({ onClose }: Props) {
                       <option value="openai">OpenAI</option>
                       <option value="anthropic">Anthropic</option>
                       <option value="gemini">Gemini</option>
+                      <option value="xai">xAI (Grok)</option>
                       <option value="bedrock">AWS Bedrock</option>
                       <option value="ollama">Ollama</option>
                     </select>
@@ -700,12 +722,14 @@ export function SettingsModal({ onClose }: Props) {
                       [mcpTrust, setMcpTrust, "Trust workspace .clawagents/mcp.json"],
                       [contextMode, setContextMode, "Context Mode tools"],
                       [ensureCompanions, setEnsureCompanions, "Ensure companions on Doctor (context-mode / rtk)"],
+                      [contextObservatory, setContextObservatory, "Context Observatory (write .clawagents/context-observatory/)"],
                       [browserTools, setBrowserTools, "Browser tools (Playwright)"],
                       [trajectory, setTrajectory, "Trajectory logging"],
                       [learn, setLearn, "Learn from trajectories"],
                       [allowFullAccess, setAllowFullAccess, "Allow Full Access mode"],
                       [allowExternalSkillDirs, setAllowExternalSkillDirs, "Allow registered external skill folders"],
                       [skillUserHomes, setSkillUserHomes, "Load personal skill homes (~/.codex, ~/.claude, ~/.agents)"],
+                      [skillAutoDiscover, setSkillAutoDiscover, "Auto-discover project skill folders"],
                     ] as const
                   ).map(([checked, setChecked, label], i) => (
                     <label
@@ -720,6 +744,108 @@ export function SettingsModal({ onClose }: Props) {
                       {label}
                     </label>
                   ))}
+                  <div className="pt-2 space-y-2 border-t border-gray-200 dark:border-gray-800">
+                    <h4 className="text-xs font-semibold uppercase tracking-wide text-gray-500">Registered skill folders</h4>
+                    <p className="text-[11px] text-gray-500 dark:text-gray-400">
+                      Absolute paths. External folders require “Allow registered external skill folders”.
+                    </p>
+                    {skillDirs.length === 0 && (
+                      <p className="text-xs text-gray-400">None registered yet.</p>
+                    )}
+                    <ul className="space-y-1">
+                      {skillDirs.map((dir) => (
+                        <li key={dir} className="flex items-center gap-2 text-xs font-mono">
+                          <span className="flex-1 truncate text-gray-700 dark:text-gray-200" title={dir}>{dir}</span>
+                          <button
+                            type="button"
+                            className="text-amber-700 dark:text-amber-300"
+                            onClick={() => {
+                              setSkillDirs((prev) => prev.filter((d) => d !== dir));
+                              setSkillIgnoreDirs((prev) => (prev.includes(dir) ? prev : [...prev, dir]));
+                            }}
+                          >
+                            Ignore
+                          </button>
+                          <button
+                            type="button"
+                            className="text-red-600 dark:text-red-300"
+                            onClick={() => setSkillDirs((prev) => prev.filter((d) => d !== dir))}
+                          >
+                            Remove
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                    <div className="flex gap-2">
+                      <input
+                        value={skillDirDraft}
+                        onChange={(e) => setSkillDirDraft(e.target.value)}
+                        placeholder="/absolute/path/to/skills"
+                        className="flex-1 px-2 py-1 text-xs font-mono border border-gray-300 dark:border-gray-700 rounded bg-white dark:bg-gray-800 dark:text-gray-100"
+                      />
+                      <button
+                        type="button"
+                        className="px-2 py-1 text-xs border rounded"
+                        onClick={() => {
+                          const path = skillDirDraft.trim();
+                          if (!path) return;
+                          setSkillDirs((prev) => (prev.includes(path) ? prev : [...prev, path]));
+                          setSkillIgnoreDirs((prev) => prev.filter((d) => d !== path));
+                          setSkillDirDraft("");
+                        }}
+                      >
+                        Add
+                      </button>
+                      <button
+                        type="button"
+                        className="px-2 py-1 text-xs border rounded"
+                        onClick={() => {
+                          void tauriApi.pickFolder().then((path) => {
+                            if (!path) return;
+                            setSkillDirs((prev) => (prev.includes(path) ? prev : [...prev, path]));
+                            setSkillIgnoreDirs((prev) => prev.filter((d) => d !== path));
+                            if (!allowExternalSkillDirs) setAllowExternalSkillDirs(true);
+                          });
+                        }}
+                      >
+                        Browse…
+                      </button>
+                    </div>
+                    {skillIgnoreDirs.length > 0 && (
+                      <div className="space-y-1">
+                        <h4 className="text-xs font-medium text-gray-500">Ignored folders</h4>
+                        {skillIgnoreDirs.map((dir) => (
+                          <div key={dir} className="flex items-center gap-2 text-xs font-mono text-gray-500">
+                            <span className="flex-1 truncate">{dir}</span>
+                            <button
+                              type="button"
+                              className="text-blue-600 dark:text-blue-300"
+                              onClick={() => setSkillIgnoreDirs((prev) => prev.filter((d) => d !== dir))}
+                            >
+                              Restore
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {skillExclude.length > 0 && (
+                      <div className="space-y-1">
+                        <h4 className="text-xs font-medium text-gray-500">Excluded skill names</h4>
+                        {skillExclude.map((name) => (
+                          <div key={name} className="flex items-center gap-2 text-xs font-mono">
+                            <span className="flex-1">{name}</span>
+                            <button
+                              type="button"
+                              className="text-blue-600 dark:text-blue-300"
+                              onClick={() => setSkillExclude((prev) => prev.filter((n) => n !== name))}
+                            >
+                              Keep
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                   <button
                     type="button"
                     disabled={!client || companionBusy}

@@ -1417,6 +1417,37 @@ async def run_chat_turn(
         async with _chdir_lock:
             with _chdir(project_root), _temp_env(project_env_vars):
                 agent = create_claw_agent(**agent_kwargs) if agent_kwargs else create_claw_agent()
+                if getattr(settings, "context_observatory", False):
+                    try:
+                        from clawagents.context_observatory.hooks import ContextObserverHooks
+                        from clawagents.context_observatory.store import EventStore
+
+                        obs_store = EventStore()
+                        obs_model = str(
+                            agent_kwargs.get("model")
+                            or getattr(settings, "default_model", "")
+                            or ""
+                        )
+                        obs_store.set_session_meta(
+                            chat_id=chat_id,
+                            model=obs_model,
+                            mode=mode,
+                            workspace=str(workspace),
+                        )
+                        agent.hooks = ContextObserverHooks(
+                            store=obs_store,
+                            model=obs_model,
+                        )
+                    except Exception as obs_exc:  # noqa: BLE001
+                        on_event(
+                            "warn",
+                            {
+                                "message": (
+                                    "Context Observatory enabled but failed to attach "
+                                    f"({type(obs_exc).__name__}: {obs_exc})"
+                                ),
+                            },
+                        )
                 try:
                     agent.tools.register(_make_ask_user_tool())
                 except Exception:  # noqa: BLE001

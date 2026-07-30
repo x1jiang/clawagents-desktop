@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,10 @@ from clawagents.gateway.desktop_router import require_auth
 from clawagents.utils.atomic_write import atomic_write_text
 
 router = APIRouter(tags=["rewind"], dependencies=[require_auth()])
+
+# Cap so a long abandoned branch cannot dominate the restored context.
+_BRANCH_SUMMARY_MAX_ITEMS = 6
+_BRANCH_SUMMARY_SNIPPET = 240
 
 
 class RewindBody(BaseModel):
@@ -47,6 +52,52 @@ def _resolve_workspace(
     )
 
 
+def summarize_abandoned_branch(rows: list[dict[str, Any]]) -> str:
+    """One note describing the attempt a rewind is throwing away.
+
+    Rewind restores files and truncates the transcript, so everything the
+    failed attempt learned is lost — the agent then re-derives it and often
+    re-attempts the same thing. A short "tried X, it failed because Y" note
+    carried back into the surviving branch removes that loop.
+
+    Deliberately extractive rather than LLM-summarized: a rewind should be
+    instant and free. Returns "" when there is nothing worth saying.
+    """
+    asks: list[str] = []
+    outcomes: list[str] = []
+    failures: list[str] = []
+    for row in rows:
+        kind = str(row.get("type") or row.get("kind") or "")
+        text = str(row.get("content") or row.get("text") or row.get("message") or "").strip()
+        if not text:
+            continue
+        snippet = " ".join(text.split())[:_BRANCH_SUMMARY_SNIPPET]
+        if kind in ("user_message", "user"):
+            asks.append(snippet)
+        elif kind in ("assistant_final", "assistant_message", "assistant"):
+            outcomes.append(snippet)
+        elif kind in ("error", "warn"):
+            failures.append(snippet)
+
+    if not (asks or outcomes or failures):
+        return ""
+
+    lines = ["Rewound past an earlier attempt. What it already established:"]
+    if asks:
+        lines.append(f"- Asked: {asks[0]}")
+        if len(asks) > 1:
+            lines.append(f"  (plus {len(asks) - 1} follow-up request(s))")
+    for outcome in outcomes[-_BRANCH_SUMMARY_MAX_ITEMS:]:
+        lines.append(f"- Result: {outcome}")
+    for failure in failures[-_BRANCH_SUMMARY_MAX_ITEMS:]:
+        lines.append(f"- FAILED: {failure}")
+    lines.append(
+        "Do not repeat the failed approach above without changing something; "
+        "the files themselves have been restored."
+    )
+    return "\n".join(lines)
+
+
 def _truncate_chat_jsonl(
     chat_id: str,
     *,
@@ -68,7 +119,6 @@ def _truncate_chat_jsonl(
     kept: list[str] = []
     target = (user_text or "").strip()
     if target:
-        user_seen = 0
         for i, ln in enumerate(lines):
             try:
                 row = json.loads(ln)
@@ -79,7 +129,6 @@ def _truncate_chat_jsonl(
                 if content == target:
                     kept = lines[: i + 1]
                     break
-                user_seen += 1
     if not kept and message_count is not None and message_count > 0:
         user_seen = 0
         for i, ln in enumerate(lines):
@@ -92,9 +141,34 @@ def _truncate_chat_jsonl(
                 if user_seen >= message_count:
                     kept = lines[: i + 1]
                     break
+    branch_note = ""
     if kept:
+        dropped_rows: list[dict[str, Any]] = []
+        for ln in lines[len(kept) :]:
+            try:
+                dropped_rows.append(json.loads(ln))
+            except json.JSONDecodeError:
+                continue
+        branch_note = summarize_abandoned_branch(dropped_rows)
+        if branch_note:
+            kept = kept + [
+                json.dumps(
+                    {
+                        "type": "assistant_message",
+                        "content": branch_note,
+                        "branch_summary": True,
+                        "ts": time.time(),
+                    },
+                    default=str,
+                )
+            ]
         atomic_write_text(path, "\n".join(kept) + "\n")
-    return {"ok": True, "kept_events": len(kept), "chat_id": chat_id}
+    return {
+        "ok": True,
+        "kept_events": len(kept),
+        "chat_id": chat_id,
+        "branch_summary": branch_note,
+    }
 
 
 @router.get("/rewind")

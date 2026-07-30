@@ -38,6 +38,16 @@ def test_empty_key_clears_env(client: TestClient, monkeypatch: pytest.MonkeyPatc
     assert "ANTHROPIC_API_KEY" not in os.environ
 
 
+def test_set_xai_key_writes_env(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+    r = client.post("/settings/api-keys", json={"provider": "xai", "api_key": "xai-runtime"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert body["env"] == "XAI_API_KEY"
+    assert os.environ.get("XAI_API_KEY") == "xai-runtime"
+
+
 def test_unknown_provider_returns_422(client: TestClient) -> None:
     # Pydantic Literal rejects with 422 before our handler runs.
     r = client.post("/settings/api-keys", json={"provider": "bogus", "api_key": "x"})

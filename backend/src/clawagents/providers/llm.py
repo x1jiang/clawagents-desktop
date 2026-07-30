@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -38,6 +39,7 @@ class LLMMessage:
         tool_calls_meta: list[dict[str, Any]] | None = None,
         gemini_parts: list[dict[str, Any]] | None = None,
         thinking: str | None = None,
+        added_tool_names: list[str] | None = None,
     ):
         self.role = role
         self.content = content
@@ -45,6 +47,10 @@ class LLMMessage:
         self.tool_calls_meta = tool_calls_meta    # For role="assistant": list of {id, name, args}
         self.gemini_parts = gemini_parts          # Preserved Gemini response parts (thought/thought_signature)
         self.thinking = thinking                  # Feature H: preserved <think> block content
+        # For role="tool": tools this result activated. Lets the provider layer
+        # reference them from the transcript instead of appending them to the
+        # tool list, which would rewrite the cached prompt prefix.
+        self.added_tool_names = added_tool_names
 
 
 class NativeToolSchema:
@@ -824,11 +830,33 @@ def normalize_reasoning_effort(value: str | None) -> str | None:
     return v if v in _REASONING_EFFORT_VALUES else None
 
 
+# xAI Grok offers exactly these levels; `none` / `minimal` are rejected by the
+# server (xai-grok-pager/src/slash/commands/effort_levels.rs), so an unsupported
+# level must be mapped rather than forwarded.
+_GROK_EFFORT_LEVELS: frozenset[str] = frozenset({"low", "medium", "high", "xhigh"})
+
+
+def clamp_reasoning_effort_for_model(model: str, effort: str | None) -> str | None:
+    """Map an effort level onto what ``model`` actually accepts."""
+    if not effort:
+        return effort
+    from clawagents.providers.model_classify import is_grok_model
+
+    if not is_grok_model(model):
+        return effort
+    if effort in _GROK_EFFORT_LEVELS:
+        return effort
+    # `none`/`minimal` would 400; `max` is not offered. Pick the nearest level.
+    return "low" if effort in ("none", "minimal") else "xhigh"
+
+
 def model_supports_reasoning_effort(model: str) -> bool:
     """Heuristic: models that accept ``reasoning_effort`` / Responses ``reasoning``."""
     m = _bare_openai_model_id(model)
     if not m:
         return False
+    if m.startswith("grok"):
+        return True
     if m.startswith(("o1", "o3", "o4")):
         return True
     if m.startswith(("gpt-5.5", "gpt-5.6")):
@@ -922,7 +950,9 @@ def _apply_tool_reasoning_compat(
     preferred: str | None = None,
 ) -> None:
     """Chat Completions reasoning_effort (forces none for GPT-5.5/5.6 + tools)."""
-    effort = normalize_reasoning_effort(preferred)
+    effort = clamp_reasoning_effort_for_model(
+        model, normalize_reasoning_effort(preferred)
+    )
     if effort:
         kwargs["reasoning_effort"] = effort
     # Chat Completions + tools on GPT-5.5/5.6 still requires none.
@@ -1010,6 +1040,7 @@ def _content_to_responses_parts(content: list[Any], role: str) -> list[dict[str,
 
 def _messages_to_responses_input(
     messages: list[dict[str, Any]],
+    deferred_by_call_id: dict[str, list[dict[str, Any]]] | None = None,
 ) -> tuple[str | None, list[dict[str, Any]]]:
     """Convert Chat Completions-style messages to Responses ``instructions`` + ``input``."""
     instructions_parts: list[str] = []
@@ -1025,13 +1056,44 @@ def _messages_to_responses_input(
             content = m.get("content")
             if not isinstance(content, str):
                 content = json.dumps(content)
+            call_id = str(m.get("tool_call_id") or "")
             items.append(
                 {
                     "type": "function_call_output",
-                    "call_id": str(m.get("tool_call_id") or ""),
+                    "call_id": call_id,
                     "output": content or "",
                 }
             )
+            # Cache-preserving activation: introduce tools this result unlocked
+            # from the transcript instead of appending them to the tools array
+            # (which lives in the cached prefix). Responses expresses that as a
+            # client-executed tool_search pair rather than Anthropic's
+            # tool_reference block.
+            unlocked = (deferred_by_call_id or {}).get(call_id) or []
+            if unlocked:
+                names = [str(t.get("name") or "") for t in unlocked]
+                digest = hashlib.sha256(
+                    f"{call_id}:{','.join(names)}".encode()
+                ).hexdigest()[:16]
+                search_id = f"claw_tool_load_{digest}"
+                items.append(
+                    {
+                        "type": "tool_search_call",
+                        "call_id": search_id,
+                        "execution": "client",
+                        "status": "completed",
+                        "arguments": {"query": " ".join(names), "limit": len(names)},
+                    }
+                )
+                items.append(
+                    {
+                        "type": "tool_search_output",
+                        "call_id": search_id,
+                        "execution": "client",
+                        "status": "completed",
+                        "tools": unlocked,
+                    }
+                )
             continue
         if role == "assistant" and m.get("tool_calls"):
             content = m.get("content")
@@ -1188,7 +1250,78 @@ def _openai_chat_messages(messages: list[LLMMessage]) -> list[dict[str, Any]]:
     return formatted
 
 
-class OpenAIProvider(LLMProvider):
+class _ResponsesDeferredMixin:
+    """Deferred-tool bookkeeping for the OpenAI Responses wire.
+
+    Responses expresses mid-run activation as a client-executed
+    ``tool_search_call`` / ``tool_search_output`` pair rather than Anthropic's
+    ``tool_reference`` block, and the deferred schema travels *inside* that
+    output instead of staying in the ``tools`` array.
+    """
+
+    _deferred_names: set[str] | None = None
+    _deferred_by_call_id: dict[str, list[dict[str, Any]]] | None = None
+    _deferred_disabled: bool = False
+
+    def _deferred_tools_enabled(self) -> bool:
+        if self._deferred_disabled:
+            return False
+        try:
+            from clawagents.config.features import is_enabled
+
+            return bool(is_enabled("deferred_tool_loading"))
+        except Exception:
+            return False
+
+    def _prepare_deferred_tools(self, messages, tools, oai_tools) -> None:
+        self._deferred_names = None
+        self._deferred_by_call_id = None
+        if not tools or not oai_tools or not self._deferred_tools_enabled():
+            return
+        from clawagents.providers.deferred_tools import split_deferred_tools
+
+        _immediate, deferred = split_deferred_tools(messages, tools)
+        if not deferred:
+            return
+        by_name = {t.get("name"): t for t in _chat_tools_to_responses_tools(oai_tools)}
+        introduced: set[str] = set()
+        by_call: dict[str, list[dict[str, Any]]] = {}
+        for m in messages:
+            if getattr(m, "role", "") != "tool" or not getattr(m, "tool_call_id", None):
+                continue
+            payload = []
+            for raw in getattr(m, "added_tool_names", None) or []:
+                name = str(raw)
+                if name not in deferred or name in introduced:
+                    continue
+                schema = by_name.get(name)
+                if schema is None:
+                    continue
+                introduced.add(name)
+                payload.append({**schema, "defer_loading": True})
+            if payload:
+                by_call[str(m.tool_call_id)] = payload
+        if by_call:
+            self._deferred_names = introduced
+            self._deferred_by_call_id = by_call
+
+    def _disable_deferred_tools(self, exc: BaseException) -> bool:
+        from clawagents.providers.deferred_tools import is_deferred_tool_rejection
+
+        if self._deferred_disabled or not is_deferred_tool_rejection(exc):
+            return False
+        self._deferred_disabled = True
+        self._deferred_names = None
+        self._deferred_by_call_id = None
+        logger.warning(
+            "  [openai-responses] deferred tool loading rejected (%s) — falling "
+            "back to the full tool list for the rest of this session",
+            type(exc).__name__,
+        )
+        return True
+
+
+class OpenAIProvider(_ResponsesDeferredMixin, LLMProvider):
     name = "openai"
 
     def __init__(self, config: EngineConfig):
@@ -1274,6 +1407,10 @@ class OpenAIProvider(LLMProvider):
     ) -> LLMResponse:
         formatted = _sanitize_openai_tool_pairs(_openai_chat_messages(messages))
         oai_tools = _to_openai_tools(tools) if tools else None
+        # Deferred-tool bookkeeping is computed from the ORIGINAL LLMMessages
+        # (the chat-format dicts drop added_tool_names) and kept off the wire
+        # dicts entirely, so nothing extra can ever reach Chat Completions.
+        self._prepare_deferred_tools(messages, tools, oai_tools)
 
         try:
             from clawagents.circuit_breaker import breaker_key as _bk
@@ -1321,6 +1458,17 @@ class OpenAIProvider(LLMProvider):
                     on_first_token=on_first_token,
                 )
             except Exception as exc:
+                # Unverified deferred-tool wire shape must never cost a turn:
+                # drop deferral and replay with the ordinary tool list.
+                if self._disable_deferred_tools(exc):
+                    return await self._stream_with_retry_responses(
+                        formatted,
+                        on_chunk,
+                        cancel_event,
+                        oai_tools,
+                        session_id=session_id,
+                        on_first_token=on_first_token,
+                    )
                 if (
                     _is_responses_unsupported(exc)
                     and self._wire_api != "responses"
@@ -1416,7 +1564,9 @@ class OpenAIProvider(LLMProvider):
         stream: bool = False,
         session_id: str | None = None,
     ) -> dict[str, Any]:
-        instructions, input_items = _messages_to_responses_input(messages)
+        instructions, input_items = _messages_to_responses_input(
+            messages, getattr(self, "_deferred_by_call_id", None)
+        )
         kwargs: dict[str, Any] = {
             "model": self.model,
             "input": input_items,
@@ -1427,6 +1577,12 @@ class OpenAIProvider(LLMProvider):
         if instructions:
             kwargs["instructions"] = instructions
         resp_tools = _chat_tools_to_responses_tools(oai_tools)
+        deferred_names = getattr(self, "_deferred_names", None) or set()
+        if deferred_names:
+            # Unlike Anthropic (deferred stays in `tools` with defer_loading),
+            # Responses carries the schema inside tool_search_output — leaving
+            # it in `tools` too would rewrite the prefix we are protecting.
+            resp_tools = [t for t in resp_tools if t.get("name") not in deferred_names]
         if resp_tools:
             kwargs["tools"] = resp_tools
         schema = getattr(self, "_structured_json_schema", None)
@@ -2733,7 +2889,48 @@ def _apply_conversation_cache_breakpoints(api_messages: list[dict[str, Any]]) ->
         msg["content"] = blocks
 
 
-class AnthropicProvider(LLMProvider):
+class _DeferredToolsMixin:
+    """Opt-in cache-preserving tool activation with a self-healing fallback.
+
+    The ``defer_loading`` / ``tool_reference`` wire shape cannot be verified
+    without a live API call, so a rejection must never cost the user a turn:
+    the first time the provider rejects it, deferral is switched off for this
+    provider instance and the request is retried with the ordinary full tool
+    list. That makes enabling the feature safe to try in production.
+    """
+
+    _deferred_disabled: bool = False
+
+    def _deferred_tools_enabled(self) -> bool:
+        if self._deferred_disabled:
+            return False
+        try:
+            from clawagents.config.features import is_enabled
+
+            if not is_enabled("deferred_tool_loading"):
+                return False
+        except Exception:
+            return False
+        from clawagents.providers.deferred_tools import model_supports_tool_references
+
+        return model_supports_tool_references(getattr(self, "model", ""))
+
+    def _disable_deferred_tools(self, exc: BaseException) -> bool:
+        """Turn deferral off after a shape rejection. True when caller retries."""
+        from clawagents.providers.deferred_tools import is_deferred_tool_rejection
+
+        if self._deferred_disabled or not is_deferred_tool_rejection(exc):
+            return False
+        self._deferred_disabled = True
+        logger.warning(
+            "  [anthropic] deferred tool loading rejected (%s) — falling back to "
+            "the full tool list for the rest of this session",
+            type(exc).__name__,
+        )
+        return True
+
+
+class AnthropicProvider(_DeferredToolsMixin, LLMProvider):
     name = "anthropic"
 
     def __init__(self, config: EngineConfig):
@@ -2761,15 +2958,81 @@ class AnthropicProvider(LLMProvider):
         session_id: str | None = None,
         on_first_token: Any | None = None,
     ) -> LLMResponse:
+        try:
+            return await self._chat_once(
+                messages,
+                on_chunk,
+                cancel_event,
+                tools,
+                session_id=session_id,
+                on_first_token=on_first_token,
+            )
+        except Exception as exc:
+            # Unverifiable wire shape must never cost a turn: drop deferral for
+            # this provider and replay the request with the full tool list.
+            if not self._disable_deferred_tools(exc):
+                raise
+            return await self._chat_once(
+                messages,
+                on_chunk,
+                cancel_event,
+                tools,
+                session_id=session_id,
+                on_first_token=on_first_token,
+            )
+
+    async def _chat_once(
+        self,
+        messages: list[LLMMessage],
+        on_chunk: OnChunkCallback = None,
+        cancel_event: asyncio.Event | None = None,
+        tools: list[NativeToolSchema] | None = None,
+        *,
+        session_id: str | None = None,
+        on_first_token: Any | None = None,
+    ) -> LLMResponse:
         _ = session_id
         system_parts = []
         api_messages = []
+
+        # Cache-preserving tool activation: tools introduced mid-run are sent
+        # as deferred schemas + a transcript-level reference, leaving the
+        # cached tool-list prefix byte-identical. Disabled by default and
+        # auto-disabled for this provider after a rejection (see chat()).
+        deferred_schemas: dict[str, Any] = {}
+        if tools and self._deferred_tools_enabled():
+            from clawagents.providers.deferred_tools import split_deferred_tools
+
+            immediate, deferred_schemas = split_deferred_tools(messages, tools)
+            if deferred_schemas:
+                tools = immediate + list(deferred_schemas.values())
+        deferred_names = set(deferred_schemas)
+        referenced: set[str] = set()
 
         for m in messages:
             if m.role == "system":
                 system_parts.append(m.content if isinstance(m.content, str) else str(m.content))
             elif m.role == "tool" and m.tool_call_id:
                 block = {"type": "tool_result", "tool_use_id": m.tool_call_id, "content": m.content}
+                extra_blocks: list[dict[str, Any]] = []
+                if deferred_names:
+                    from clawagents.providers.deferred_tools import tool_reference_blocks
+
+                    refs = tool_reference_blocks(m, deferred_names, referenced)
+                    if refs:
+                        # Anthropic rejects tool_reference mixed with ordinary
+                        # tool-result content, so the real output moves to a
+                        # sibling text block in the same user message.
+                        block["content"] = refs
+                        if m.content:
+                            extra_blocks.append(
+                                {
+                                    "type": "text",
+                                    "text": m.content
+                                    if isinstance(m.content, str)
+                                    else json.dumps(m.content),
+                                }
+                            )
                 # Coalesce consecutive tool results into ONE user message —
                 # Anthropic requires every tool_result block answering a single
                 # assistant turn (parallel tool calls) to be in the same user
@@ -2784,8 +3047,9 @@ class AnthropicProvider(LLMProvider):
                     and prev["content"][0].get("type") == "tool_result"
                 ):
                     prev["content"].append(block)
+                    prev["content"].extend(extra_blocks)
                 else:
-                    api_messages.append({"role": "user", "content": [block]})
+                    api_messages.append({"role": "user", "content": [block, *extra_blocks]})
             elif m.role == "assistant" and m.tool_calls_meta:
                 content_blocks = []
                 if m.content:
@@ -2870,6 +3134,9 @@ class AnthropicProvider(LLMProvider):
                             k for k, v in s.parameters.items() if v.get("required")
                         ],
                     },
+                    # Deferred tools stay out of the cached prefix; the model
+                    # learns about them from the transcript tool_reference.
+                    **({"defer_loading": True} if s.name in deferred_names else {}),
                 }
                 for s in tools
             ]
@@ -3581,6 +3848,28 @@ def create_provider(
         base_url=config.openai_base_url,
         provider_hint=provider_hint or ref.prefix_hint,
     )
+
+    # ── xAI Grok (OpenAI-compatible wire at https://api.x.ai/v1) ────────
+    # Handled before the generic OpenAI path so a bare ``grok-4.5`` works with
+    # no base_url configured. An explicit base_url still wins (proxies/gateways).
+    from clawagents.providers.model_classify import XAI_BASE_URL, is_grok_model
+
+    if is_grok_model(ref.raw or model_name):
+        if not (config.openai_base_url or "").strip():
+            config.openai_base_url = XAI_BASE_URL
+        if not (config.openai_api_key or "").strip():
+            config.openai_api_key = (
+                os.environ.get("XAI_API_KEY")
+                or os.environ.get("GROK_API_KEY")
+                or config.openai_api_key
+            )
+        # xAI's documented surface is /v1/chat/completions. Left on "auto" the
+        # unknown-gateway heuristic can pick Responses, which api.x.ai does not
+        # serve the same way; an explicit wire_api still wins.
+        if _normalize_wire_api(config.openai_wire_api) == "auto":
+            config.openai_wire_api = "chat_completions"
+        config.openai_model = model_name
+        return OpenAIProvider(config)
 
     if kind == "gemini" or lower.startswith("gemini"):
         if not _HAS_GEMINI:

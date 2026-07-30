@@ -27,6 +27,8 @@ export interface SlashContext {
   refreshChat?: () => Promise<void>;
   openCheckpoints?: () => void;
   openRewind?: () => void;
+  openMemory?: () => void;
+  openWorkshop?: () => void;
   /** Optional list of user-defined slash commands (for /help to surface). */
   getCustomCommands?: () => Array<{ name: string; description: string }>;
   /** Optional snapshot of the chat's cumulative usage for /usage. */
@@ -162,6 +164,28 @@ export const SLASH_COMMANDS: SlashCommand[] = [
         return;
       }
       ctx.openRewind();
+    },
+  },
+  {
+    name: "memory",
+    description: "Open the Memory browser (.clawagents facts, archives, compact backups)",
+    run: (_args, ctx) => {
+      if (!ctx.openMemory) {
+        ctx.appendError("Memory browser is not available in this context.");
+        return;
+      }
+      ctx.openMemory();
+    },
+  },
+  {
+    name: "workshop",
+    description: "Open the Skill workshop (proposals + marketplace install)",
+    run: (_args, ctx) => {
+      if (!ctx.openWorkshop) {
+        ctx.appendError("Skill workshop is only available inside a project chat.");
+        return;
+      }
+      ctx.openWorkshop();
     },
   },
   {

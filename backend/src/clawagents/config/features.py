@@ -91,6 +91,12 @@ _FEATURE_DEFAULTS: dict[str, str] = {
     "execute_background":   "1",   # Optional is_background on execute tool
     "rtk_wrap":             "1",   # Auto-wrap noisy execute cmds with rtk (if installed)
     "aggressive_tool_crush": "1",  # Lower crush thresholds in agent_loop (not hooks)
+    # Cache-preserving mid-run tool activation (Anthropic `defer_loading` /
+    # `tool_reference`). Fully wired and fail-soft: a provider rejection of the
+    # shape disables deferral for that provider and replays the request with the
+    # ordinary tool list, so enabling it cannot cost a turn. Still opt-in only
+    # because the wire shape has not been confirmed against the live API.
+    "deferred_tool_loading": "0",
     "execute_shell_session": "1",  # Persist cwd across execute (Grok shell-state slice)
     "execute_shell_env":    "1",   # Sticky env overlay across execute (with shell_session)
     "execute_auto_background": "1",  # On FG timeout, adopt process as background job

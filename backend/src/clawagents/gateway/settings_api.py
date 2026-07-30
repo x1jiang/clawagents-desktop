@@ -30,13 +30,14 @@ from clawagents.gateway.desktop_router import require_auth
 
 router = APIRouter(tags=["settings"], dependencies=[require_auth()])
 
-Provider = Literal["openai", "anthropic", "gemini", "bedrock"]
+Provider = Literal["openai", "anthropic", "gemini", "bedrock", "xai"]
 
 _PROVIDER_TO_ENV: dict[str, str] = {
     "openai": "OPENAI_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
     "gemini": "GEMINI_API_KEY",
     "bedrock": "BEDROCK_API_KEY",
+    "xai": "XAI_API_KEY",
 }
 
 
@@ -87,6 +88,7 @@ def _settings_payload(s) -> dict:
         "skill_exclude": list(s.skill_exclude or []),
         "skill_user_homes": s.skill_user_homes,
         "ensure_companions": s.ensure_companions,
+        "context_observatory": s.context_observatory,
         "has_aws_credentials": _has_aws_credentials(),
     }
 
@@ -158,6 +160,7 @@ class AppSettingsPatchBody(BaseModel):
     skill_exclude: list[str] | None = None
     skill_user_homes: bool | None = None
     ensure_companions: bool | None = None
+    context_observatory: bool | None = None
 
 
 @router.patch("/settings/app")
@@ -197,7 +200,7 @@ def patch_app_settings(
         if "workspace_system_prompt" in sent:
             settings.workspace_system_prompt = body.workspace_system_prompt or ""
         if "provider" in sent and body.provider is not None:
-            allowed = {"auto", "openai", "anthropic", "gemini", "bedrock", "ollama"}
+            allowed = {"auto", "openai", "anthropic", "gemini", "bedrock", "xai", "ollama"}
             settings.provider = body.provider if body.provider in allowed else "auto"
         if "base_url" in sent and body.base_url is not None:
             base = body.base_url.strip()
@@ -250,6 +253,8 @@ def patch_app_settings(
             settings.skill_user_homes = bool(body.skill_user_homes)
         if "ensure_companions" in sent and body.ensure_companions is not None:
             settings.ensure_companions = bool(body.ensure_companions)
+        if "context_observatory" in sent and body.context_observatory is not None:
+            settings.context_observatory = bool(body.context_observatory)
         if root and requested_runtime:
             changes = {field: getattr(body, field) for field in requested_runtime}
             if "trust_custom_base_url" in requested_runtime:
@@ -283,6 +288,10 @@ _VERIFY_ENDPOINTS: dict[str, dict] = {
         "url": "https://generativelanguage.googleapis.com/v1beta/models",
         "auth_header": lambda key: {},
         "query": lambda key: {"key": key},
+    },
+    "xai": {
+        "url": "https://api.x.ai/v1/models",
+        "auth_header": lambda key: {"Authorization": f"Bearer {key}"},
     },
 }
 

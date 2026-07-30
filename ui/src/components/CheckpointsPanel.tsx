@@ -12,6 +12,11 @@ interface CheckpointRow {
   [key: string]: unknown;
 }
 
+interface DiffFile {
+  status?: string;
+  path?: string;
+}
+
 interface Props {
   chatId: string;
   projectId?: string | null;
@@ -23,10 +28,15 @@ export function CheckpointsPanel({ chatId, projectId = null, open, onClose }: Pr
   const client = useProjectGateway(projectId);
   const [rows, setRows] = useState<CheckpointRow[]>([]);
   const [loading, setLoading] = useState(false);
+  const [diffSha, setDiffSha] = useState<string | null>(null);
+  const [diffFiles, setDiffFiles] = useState<DiffFile[]>([]);
+  const [diffLoading, setDiffLoading] = useState(false);
 
   useEffect(() => {
     if (!open || !client) return;
     setLoading(true);
+    setDiffSha(null);
+    setDiffFiles([]);
     void client.listCheckpoints(chatId)
       .then((data) => setRows(Array.isArray(data) ? data as CheckpointRow[] : []))
       .catch(() => setRows([]))
@@ -52,6 +62,30 @@ export function CheckpointsPanel({ chatId, projectId = null, open, onClose }: Pr
       onClose();
     } catch (e) {
       pushToast((e as Error).message, "error");
+    }
+  }
+
+  async function showDiff(sha: string) {
+    if (!client || !sha) return;
+    if (diffSha === sha) {
+      setDiffSha(null);
+      setDiffFiles([]);
+      return;
+    }
+    setDiffLoading(true);
+    setDiffSha(sha);
+    try {
+      const result = await client.checkpointDiff(chatId, sha);
+      const files = Array.isArray(result.files) ? result.files : [];
+      setDiffFiles(files);
+      if (files.length === 0) {
+        pushToast("No file changes vs current workspace", "info");
+      }
+    } catch (e) {
+      setDiffFiles([]);
+      pushToast((e as Error).message, "error");
+    } finally {
+      setDiffLoading(false);
     }
   }
 
@@ -87,7 +121,20 @@ export function CheckpointsPanel({ chatId, projectId = null, open, onClose }: Pr
                   <button type="button" className="px-2 py-1 text-xs border rounded" onClick={() => void restore(sha, "files")}>Files</button>
                   <button type="button" className="px-2 py-1 text-xs border rounded" onClick={() => void restore(sha, "conversation")}>Chat</button>
                   <button type="button" className="px-2 py-1 text-xs border rounded" onClick={() => void restore(sha, "both")}>Both</button>
+                  <button type="button" className="px-2 py-1 text-xs border rounded" onClick={() => void showDiff(sha)}>
+                    {diffSha === sha && diffLoading ? "Diff…" : diffSha === sha ? "Hide diff" : "Diff"}
+                  </button>
                 </div>
+                {diffSha === sha && !diffLoading && diffFiles.length > 0 && (
+                  <ul className="mt-2 max-h-40 overflow-y-auto rounded border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-950/40 px-2 py-1 font-mono text-[11px] text-gray-700 dark:text-gray-300">
+                    {diffFiles.map((f) => (
+                      <li key={`${f.status}-${f.path}`} className="truncate">
+                        <span className="text-gray-500">{String(f.status || "?").padEnd(1)}</span>{" "}
+                        {f.path || "(unknown)"}
+                      </li>
+                    ))}
+                  </ul>
+                )}
               </div>
             );
           })}

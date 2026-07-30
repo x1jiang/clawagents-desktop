@@ -53,6 +53,19 @@ _CATALOG: list[dict[str, Any]] = [
         ],
     },
     {
+        "id": "xai",
+        "name": "xAI (Grok)",
+        "env_key": "XAI_API_KEY",
+        "models": [
+            {"id": "grok-4.5", "label": "Grok 4.5"},
+            {"id": "grok-4.3", "label": "Grok 4.3"},
+            {"id": "grok-4.20-0309-reasoning", "label": "Grok 4.20 Reasoning"},
+            {"id": "grok-4.20-0309-non-reasoning", "label": "Grok 4.20 Non-reasoning"},
+            {"id": "grok-4.20-multi-agent-0309", "label": "Grok 4.20 Multi-agent"},
+            {"id": "grok-build-0.1", "label": "Grok Build 0.1"},
+        ],
+    },
+    {
         "id": "bedrock",
         "name": "AWS Bedrock",
         # Native IAM uses the AWS credential chain (no gateway key). When
@@ -113,6 +126,7 @@ _MANTLE_MODELS: list[dict[str, str]] = [
     {"id": "openai.gpt-oss-20b", "label": "GPT-OSS 20B (Mantle · chat)"},
     {"id": "openai.gpt-oss-120b", "label": "GPT-OSS 120B (Mantle · chat)"},
     {"id": "deepseek.v3.2", "label": "DeepSeek V3.2 (Mantle · chat)"},
+    {"id": "xai.grok-4.3", "label": "xAI Grok 4.3 (Mantle · openai/v1)"},
     # Anthropic Messages path (…/anthropic/v1/messages)
     {"id": "anthropic.claude-haiku-4-5", "label": "Claude Haiku 4.5 (Mantle · messages)"},
     {"id": "anthropic.claude-sonnet-5", "label": "Claude Sonnet 5 (Mantle · messages)"},

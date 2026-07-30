@@ -31,6 +31,8 @@ import { AskUserPrompt } from "./Message/AskUserPrompt";
 import { AutoApproveBar } from "./AutoApproveBar";
 import { CheckpointsPanel } from "./CheckpointsPanel";
 import { RewindPanel } from "./RewindPanel";
+import { MemoryBrowserPanel } from "./MemoryBrowserPanel";
+import { SkillWorkshopPanel } from "./SkillWorkshopPanel";
 import { tryRunSlashCommand } from "../lib/slash_commands";
 import { useUI } from "../stores/ui";
 import { useCustomCommands } from "../stores/custom_commands";
@@ -180,6 +182,8 @@ export function ChatSurface({ projectId, chatId }: Props) {
   const [caveman, setCaveman] = useState(() => loadCaveman(chatId));
   const [checkpointsOpen, setCheckpointsOpen] = useState(false);
   const [rewindOpen, setRewindOpen] = useState(false);
+  const [memoryOpen, setMemoryOpen] = useState(false);
+  const [workshopOpen, setWorkshopOpen] = useState(false);
   const [lastCheckpointTs, setLastCheckpointTs] = useState<number | undefined>();
   const [checkpointTick, setCheckpointTick] = useState(() => Date.now());
   const [compacting, setCompacting] = useState(false);
@@ -473,6 +477,8 @@ export function ChatSurface({ projectId, chatId }: Props) {
         openShortcuts,
         openCheckpoints: () => setCheckpointsOpen(true),
         openRewind: () => setRewindOpen(true),
+        openMemory: () => setMemoryOpen(true),
+        openWorkshop: () => setWorkshopOpen(true),
         patchChat: async (body) => {
           await client.patchChat(chatId, body);
           if (body.mode) setMode(body.mode as ExecMode);
@@ -819,6 +825,34 @@ export function ChatSurface({ projectId, chatId }: Props) {
               {lastCheckpointLabel ?? "none"}
             </span>
           </button>
+          <button
+            type="button"
+            onClick={() => setMemoryOpen(true)}
+            title="Browse .clawagents memory, facts, and compact backups"
+            className={
+              "text-xs px-2 py-1 border rounded shrink-0 " +
+              (memoryOpen
+                ? "border-gray-400 bg-gray-100 text-gray-800 dark:border-gray-500 dark:bg-gray-700 dark:text-gray-100"
+                : "border-gray-300 bg-white text-gray-600 hover:bg-gray-50 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-300 dark:hover:bg-gray-800")
+            }
+          >
+            Memory
+          </button>
+          {projectId && (
+            <button
+              type="button"
+              onClick={() => setWorkshopOpen(true)}
+              title="Review skill workshop proposals and marketplace installs"
+              className={
+                "text-xs px-2 py-1 border rounded shrink-0 " +
+                (workshopOpen
+                  ? "border-gray-400 bg-gray-100 text-gray-800 dark:border-gray-500 dark:bg-gray-700 dark:text-gray-100"
+                  : "border-gray-300 bg-white text-gray-600 hover:bg-gray-50 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-300 dark:hover:bg-gray-800")
+              }
+            >
+              Workshop
+            </button>
+          )}
           <CompactChip
             usage={usage}
             modelOverride={model || undefined}
@@ -1287,6 +1321,19 @@ export function ChatSurface({ projectId, chatId }: Props) {
           })();
         }}
       />
+      <MemoryBrowserPanel
+        projectId={projectId}
+        chatId={chatId}
+        open={memoryOpen}
+        onClose={() => setMemoryOpen(false)}
+      />
+      {projectId && (
+        <SkillWorkshopPanel
+          projectId={projectId}
+          open={workshopOpen}
+          onClose={() => setWorkshopOpen(false)}
+        />
+      )}
     </div>
   );
 }

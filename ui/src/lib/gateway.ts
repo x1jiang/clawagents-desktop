@@ -123,6 +123,7 @@ export interface AppSettings {
   skill_user_homes?: boolean;
   has_aws_credentials?: boolean;
   ensure_companions?: boolean;
+  context_observatory?: boolean;
 }
 
 export interface AutoApprove {
@@ -378,7 +379,7 @@ export class GatewayClient {
   }
 
   setApiKey(
-    provider: "openai" | "anthropic" | "gemini" | "bedrock",
+    provider: "openai" | "anthropic" | "gemini" | "bedrock" | "xai",
     apiKey: string,
   ): Promise<{ ok: boolean; env: string; set: boolean }> {
     return this.request("/settings/api-keys", {
@@ -432,6 +433,16 @@ export class GatewayClient {
       method: "POST",
       body: JSON.stringify({ sha, mode }),
     });
+  }
+
+  checkpointDiff(
+    chatId: string,
+    lhs: string,
+    rhs?: string,
+  ): Promise<{ ok?: boolean; files?: Array<{ status: string; path: string }>; diff?: string; [key: string]: unknown }> {
+    const q = new URLSearchParams({ lhs });
+    if (rhs) q.set("rhs", rhs);
+    return this.request(`/chats/${chatId}/checkpoints/diff?${q.toString()}`);
   }
 
   listSnapshots(chatId: string, limit = 50): Promise<Array<{ id: string; path: string; mtime: number; files: string[] }>> {
@@ -631,19 +642,182 @@ export class GatewayClient {
     return this.request(`/templates/${name}`, { method: "DELETE" });
   }
 
-  /**
-   * Skills the agent will auto-load for this project — driven by `SKILL.md`
-   * files under one of the recognised skill directories
-   * (`skills/`, `.skills/`, `.agents/skills/`, `.cursor/skills/`, …).
-   */
-  discoveredSkills(projectId: string): Promise<{
+  discoveredSkills(projectId: string, includeUserHomes = false): Promise<{
     root: string;
-    skills: Array<{ name: string; description: string; source_dir: string; path: string; origin?: string }>;
+    skills: Array<{
+      name: string;
+      description: string;
+      source_dir: string;
+      path: string;
+      origin?: string;
+      excluded?: boolean;
+    }>;
+    folders?: Array<{ path: string; display: string; origin: string }>;
+    excluded?: string[];
+    ignored_dirs?: string[];
+    auto_discover?: boolean;
     unavailable: Record<string, string>;
     quarantined: Record<string, string>;
     warnings: string[];
   }> {
-    return this.request(`/skills/discovered?project_id=${encodeURIComponent(projectId)}`);
+    const q = new URLSearchParams({ project_id: projectId });
+    if (includeUserHomes) q.set("include_user_homes", "true");
+    return this.request(`/skills/discovered?${q.toString()}`);
+  }
+
+  previewSkills(projectId?: string | null, includeUserHomes?: boolean): Promise<{
+    root: string;
+    folders: Array<{ path: string; display: string; origin: string }>;
+    skills: Array<{
+      name: string;
+      description: string;
+      source_dir: string;
+      path: string;
+      origin?: string;
+      excluded?: boolean;
+    }>;
+    excluded: string[];
+    ignored_dirs: string[];
+    auto_discover: boolean;
+    skill_user_homes?: boolean;
+    allow_external_skill_dirs?: boolean;
+    unavailable: Record<string, string>;
+    quarantined: Record<string, string>;
+    warnings: string[];
+  }> {
+    const q = new URLSearchParams();
+    if (projectId) q.set("project_id", projectId);
+    if (includeUserHomes != null) q.set("include_user_homes", includeUserHomes ? "true" : "false");
+    const qs = q.toString();
+    return this.request(`/skills${qs ? `?${qs}` : ""}`);
+  }
+
+  excludeSkill(name: string, exclude: boolean, projectId?: string | null): Promise<{ ok: boolean; excluded: string[] }> {
+    return this.request("/skills/exclude", {
+      method: "POST",
+      body: JSON.stringify({ name, exclude, project_id: projectId ?? null }),
+    });
+  }
+
+  listWorkshop(projectId?: string | null): Promise<{
+    ok: boolean;
+    workspace: string;
+    proposals: Array<{
+      id: string;
+      name: string;
+      description: string;
+      status: string;
+      action: string;
+      target_skill?: string | null;
+      goal?: string;
+      evidence?: string;
+      scan_findings: string[];
+      support_file_count: number;
+    }>;
+  }> {
+    const q = projectId ? `?project_id=${encodeURIComponent(projectId)}` : "";
+    return this.request(`/skills/workshop${q}`);
+  }
+
+  inspectWorkshop(proposalId: string, projectId?: string | null): Promise<Record<string, unknown>> {
+    const q = projectId ? `?project_id=${encodeURIComponent(projectId)}` : "";
+    return this.request(`/skills/workshop/${encodeURIComponent(proposalId)}${q}`);
+  }
+
+  applyWorkshop(proposalId: string, projectId?: string | null): Promise<{ ok: boolean; message?: string; rollback_id?: string; error?: string; findings?: string[] }> {
+    return this.request(`/skills/workshop/${encodeURIComponent(proposalId)}/apply`, {
+      method: "POST",
+      body: JSON.stringify({ project_id: projectId ?? null }),
+    });
+  }
+
+  rejectWorkshop(proposalId: string, projectId?: string | null, reason = ""): Promise<{ ok: boolean; error?: string }> {
+    return this.request(`/skills/workshop/${encodeURIComponent(proposalId)}/reject`, {
+      method: "POST",
+      body: JSON.stringify({ project_id: projectId ?? null, reason }),
+    });
+  }
+
+  quarantineWorkshop(proposalId: string, projectId?: string | null, reason = ""): Promise<{ ok: boolean; error?: string }> {
+    return this.request(`/skills/workshop/${encodeURIComponent(proposalId)}/quarantine`, {
+      method: "POST",
+      body: JSON.stringify({ project_id: projectId ?? null, reason }),
+    });
+  }
+
+  rollbackWorkshop(rollbackId: string, projectId?: string | null): Promise<{ ok: boolean; restored?: string; error?: string }> {
+    return this.request("/skills/workshop/rollback", {
+      method: "POST",
+      body: JSON.stringify({ project_id: projectId ?? null, rollback_id: rollbackId }),
+    });
+  }
+
+  listMarketplace(projectId?: string | null): Promise<{
+    ok: boolean;
+    packages: Array<{ kind: string; name: string; path: string; source?: string; commit?: string }>;
+  }> {
+    const q = projectId ? `?project_id=${encodeURIComponent(projectId)}` : "";
+    return this.request(`/skills/marketplace${q}`);
+  }
+
+  installMarketplace(source: string, projectId?: string | null, kind: "skill" | "plugin" = "skill"): Promise<{
+    ok: boolean;
+    name?: string;
+    path?: string;
+    error?: string;
+  }> {
+    return this.request("/skills/marketplace/install", {
+      method: "POST",
+      body: JSON.stringify({ source, project_id: projectId ?? null, kind }),
+    });
+  }
+
+  memoryOverview(projectId?: string | null): Promise<{
+    ok: boolean;
+    workspace: string;
+    clawagents_dir: string;
+    clawagents_exists: boolean;
+    artifacts: Array<{
+      kind: string;
+      label: string;
+      path: string;
+      abs_path: string;
+      exists: boolean;
+      is_dir: boolean;
+      size: number | null;
+      mtime: number;
+      preview: string;
+    }>;
+    facts: Array<Record<string, unknown>>;
+    counts: Record<string, number>;
+  }> {
+    const q = projectId ? `?project_id=${encodeURIComponent(projectId)}` : "";
+    return this.request(`/memory/overview${q}`);
+  }
+
+  memoryFile(path: string, projectId?: string | null): Promise<{
+    ok: boolean;
+    path: string;
+    content: string;
+    truncated: boolean;
+    size: number;
+    mtime: number;
+  }> {
+    const q = new URLSearchParams({ path });
+    if (projectId) q.set("project_id", projectId);
+    return this.request(`/memory/file?${q.toString()}`);
+  }
+
+  memorySearch(query: string, projectId?: string | null, limit = 12): Promise<{
+    ok: boolean;
+    query?: string;
+    hits: Array<{ text?: string; score?: number; source?: string; path?: string }>;
+    error?: string;
+  }> {
+    return this.request("/memory/search", {
+      method: "POST",
+      body: JSON.stringify({ query, project_id: projectId ?? null, limit }),
+    });
   }
 
   /**
@@ -651,7 +825,7 @@ export class GatewayClient {
    * Returns shape: { ok, status, message, model_count }. Used by Settings "Test".
    */
   verifyApiKey(
-    provider: "openai" | "anthropic" | "gemini" | "bedrock",
+    provider: "openai" | "anthropic" | "gemini" | "bedrock" | "xai",
     apiKey: string = "",
   ): Promise<{
     ok: boolean;

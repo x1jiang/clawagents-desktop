@@ -209,6 +209,7 @@ def create_app() -> tuple:
     from clawagents.gateway.diagnostics_api import router as _diagnostics_router
     from clawagents.gateway.system_api import router as _system_router
     from clawagents.gateway.skills_api import router as _skills_router
+    from clawagents.gateway.memory_api import router as _memory_router
     from clawagents.gateway.attachments_api import router as _attachments_router
     from clawagents.gateway.agent_power_api import router as _agent_power_router
     from clawagents.gateway.rewind_api import router as _rewind_router
@@ -227,6 +228,7 @@ def create_app() -> tuple:
     app.include_router(_diagnostics_router)
     app.include_router(_system_router)
     app.include_router(_skills_router)
+    app.include_router(_memory_router)
     app.include_router(_attachments_router)
     app.include_router(_agent_power_router)
     app.include_router(_rewind_router)

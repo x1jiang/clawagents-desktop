@@ -34,15 +34,14 @@ xcrun notarytool store-credentials clawagents-notary \
 SKIP_NOTARIZE=1 ./build.sh
 ```
 
-## Features (0.4.28)
+## Features (0.4.29)
 
 - **Default Auto-approve:** Edit + Execute on
-- **Engine 6.20.50:** Gemini 3.6 Flash + 3.5 Flash-Lite in the model picker / profiles
-- **Settings / providers:** concurrent settings-save hardening; Mantle/catalog fixes; connection-banner reliability
-- **VS Code parity carry-forward:** skill capabilities, project-scoped runtime trust, rewind / companions / plan-approval
+- **Engine 6.20.52:** deferred tools, background job notices, compaction reduction guard, native **xAI Grok**
+- **Settings / providers:** OpenAI / Anthropic / Gemini / **xAI** / **AWS Bedrock** (IAM / Mantle / gateway) / Ollama
+- **VS Code parity:** Memory browser, Skill Workshop, Context Observatory toggle, rewind abandoned-branch summary, checkpoint Diff panel
 - Local projects and **SSH remote** projects (`~/.ssh/config`, including `ProxyJump`)
 - Chat UI with Export (Markdown) and Fork; file tree + right-side editor
-- Providers: OpenAI / Anthropic / Gemini / **AWS Bedrock** (IAM / Mantle / gateway) / Ollama
 - **Developer ID signed** + notarized release builds (`./build.sh`)
 
 ## Develop

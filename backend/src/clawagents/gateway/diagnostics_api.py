@@ -113,6 +113,7 @@ def diagnostics() -> dict:
                 ("anthropic", "ANTHROPIC_API_KEY"),
                 ("gemini", "GEMINI_API_KEY"),
                 ("bedrock", "BEDROCK_API_KEY"),
+                ("xai", "XAI_API_KEY"),
             ) if os.environ.get(env)
         ] + (
             ["bedrock"]

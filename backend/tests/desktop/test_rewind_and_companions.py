@@ -52,3 +52,20 @@ def test_ensure_companions_respects_setting(client: TestClient) -> None:
     assert resp.status_code == 200
     data = resp.json()
     assert data.get("skipped") is True
+
+
+def test_summarize_abandoned_branch_extractive() -> None:
+    from clawagents.gateway.rewind_api import summarize_abandoned_branch
+
+    assert summarize_abandoned_branch([]) == ""
+    note = summarize_abandoned_branch(
+        [
+            {"type": "user_message", "content": "Refactor auth"},
+            {"type": "assistant_message", "content": "Tried swapping the middleware"},
+            {"type": "error", "content": "ImportError: circular"},
+        ]
+    )
+    assert "Rewound past" in note
+    assert "Refactor auth" in note
+    assert "FAILED" in note
+    assert "circular" in note

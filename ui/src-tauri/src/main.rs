@@ -348,6 +348,7 @@ fn collect_keychain_env_blocking() -> Vec<(String, String)> {
                 ("anthropic", "ANTHROPIC_API_KEY"),
                 ("gemini", "GEMINI_API_KEY"),
                 ("bedrock", "BEDROCK_API_KEY"),
+                ("xai", "XAI_API_KEY"),
             ];
             for (account, env_name) in mapping {
                 if let Some(Some(value)) = map.get(account) {
@@ -523,6 +524,7 @@ fn start_gateway_inner() -> Result<RuntimeInfo, String> {
                     "ANTHROPIC_API_KEY" => "anthropic",
                     "GEMINI_API_KEY" => "gemini",
                     "BEDROCK_API_KEY" => "bedrock",
+                    "XAI_API_KEY" => "xai",
                     _ => continue,
                 };
                 let url = format!("http://127.0.0.1:{port}/settings/api-keys");
