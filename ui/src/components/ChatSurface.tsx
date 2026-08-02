@@ -70,6 +70,14 @@ function loadCaveman(chatId: string): boolean {
   }
 }
 
+function loadGoal(chatId: string): boolean {
+  try {
+    return localStorage.getItem(`clawagents:goal:${chatId}`) === "1";
+  } catch {
+    return false;
+  }
+}
+
 interface Props {
   projectId: string | null;
   chatId: string;
@@ -180,6 +188,7 @@ export function ChatSurface({ projectId, chatId }: Props) {
   const [attachmentItems, setAttachmentItems] = useState<ComposerAttachment[]>([]);
   const [autoApprove, setAutoApprove] = useState<AutoApprove>(() => loadAutoApprove(chatId));
   const [caveman, setCaveman] = useState(() => loadCaveman(chatId));
+  const [goal, setGoal] = useState(() => loadGoal(chatId));
   const [checkpointsOpen, setCheckpointsOpen] = useState(false);
   const [rewindOpen, setRewindOpen] = useState(false);
   const [memoryOpen, setMemoryOpen] = useState(false);
@@ -229,6 +238,12 @@ export function ChatSurface({ projectId, chatId }: Props) {
       localStorage.setItem(`clawagents:caveman:${chatId}`, caveman ? "1" : "0");
     } catch { /* ignore */ }
   }, [chatId, caveman]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(`clawagents:goal:${chatId}`, goal ? "1" : "0");
+    } catch { /* ignore */ }
+  }, [chatId, goal]);
 
   // Persist on every keystroke. localStorage writes are cheap (<1ms).
   useEffect(() => {
@@ -613,6 +628,7 @@ export function ChatSurface({ projectId, chatId }: Props) {
           attachment_ids: attachmentIds.length > 0 ? attachmentIds : undefined,
           auto_approve: autoApprove,
           caveman,
+          goal,
           interaction: "interactive",
         },
         ctrl.signal,
@@ -1223,6 +1239,8 @@ export function ChatSurface({ projectId, chatId }: Props) {
           onChange={setAutoApprove}
           caveman={caveman}
           onCavemanChange={setCaveman}
+          goal={goal}
+          onGoalChange={setGoal}
           disabled={streaming}
         />
         {activeAttachmentItems.length > 0 && (

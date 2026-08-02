@@ -9,7 +9,7 @@ from clawagents.eval import run_agent_environment
 from clawagents.explorer import create_explorer_tools
 from clawagents.agent import create_claw_agent
 from clawagents.graph.agent_loop import AgentState, run_agent_graph
-from clawagents.providers.llm import LLMMessage, LLMResponse, NativeToolCall
+from clawagents.providers.llm import LLMMessage, LLMResponse, LLMProvider, NativeToolCall
 from clawagents.rl import Trajectory, to_next_state_transitions
 from clawagents.run_result import RunResult
 from clawagents.sandbox.backend import ExecResult
@@ -17,7 +17,7 @@ from clawagents.sandbox.docker import DockerBackend
 from clawagents.session import InMemorySession
 from clawagents.tools.cache import SqliteResultCacheManager
 from clawagents.tools.catalog import create_tool_discovery_tools, names_for_tool_profile
-from clawagents.tools.exec import create_exec_tools
+from clawagents.tools.exec import _format_nonzero_command_output, create_exec_tools
 from clawagents.tools.registry import ToolRegistry, ToolResult
 
 
@@ -49,7 +49,7 @@ class BadlyNamedSearchTool:
         return ToolResult(True, "ok")
 
 
-class FakeLLM:
+class FakeLLM(LLMProvider):
     name = "fake"
 
     async def chat(self, *args, **kwargs):
@@ -151,6 +151,260 @@ async def test_execute_returns_structured_context_for_nonzero_command_exits():
     assert "nonzero" in payload["interpretation"].lower()
 
 
+def test_execute_classifies_external_authentication_failure():
+    payload = json.loads(
+        _format_nonzero_command_output(
+            "smbclient //server/share",
+            1,
+            "session setup failed: NT_STATUS_LOGON_FAILURE",
+            "",
+            "",
+        )
+    )
+    interpretation = payload["interpretation"]
+    assert "authentication" in interpretation.lower()
+    assert "stop changing" in interpretation.lower()
+    assert "user" in interpretation.lower()
+
+
+def test_execute_classifies_npm_audit_findings_without_retrying():
+    payload = json.loads(
+        _format_nonzero_command_output(
+            "bash -n deploy.sh; npm audit --omit=dev --audit-level=high",
+            1,
+            "# npm audit report\n10 vulnerabilities (4 high, 2 critical)",
+            "",
+            "",
+        )
+    )
+
+    assert payload["success"] is False
+    interpretation = payload["interpretation"].lower()
+    assert "completed" in interpretation
+    assert "failed security check" in interpretation
+    assert "do not retry" in interpretation
+    assert "lockfile" in interpretation
+    assert "no fix available" in interpretation
+    assert "earlier checks may have succeeded" in interpretation
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "npm --prefix web audit --omit=dev",
+        "npm --workspace app audit --json",
+        "cd frontend && npm -w app audit",
+        "env CI=1 /usr/local/bin/npm --prefix=web audit",
+    ],
+)
+def test_execute_recognizes_npm_audit_after_global_options(command):
+    payload = json.loads(
+        _format_nonzero_command_output(
+            command,
+            1,
+            '{"auditReportVersion": 2, "vulnerabilities": {}}',
+            "",
+            "",
+        )
+    )
+    assert "npm audit completed" in payload["interpretation"]
+
+
+def test_execute_does_not_misclassify_unrelated_npm_command():
+    payload = json.loads(
+        _format_nonzero_command_output(
+            "npm run audit",
+            1,
+            "vulnerabilities found by custom script",
+            "",
+            "",
+        )
+    )
+    assert "npm audit completed" not in payload["interpretation"]
+
+
+def test_execute_classifies_missing_package_without_suggesting_tool_churn():
+    payload = json.loads(
+        _format_nonzero_command_output(
+            "conda create -n smb samba",
+            1,
+            "PackagesNotFoundError: samba",
+            "",
+            "",
+        )
+    )
+    interpretation = payload["interpretation"]
+    assert "package" in interpretation.lower()
+    assert "package manager" in interpretation.lower()
+    assert "do not" in interpretation.lower()
+
+
+def test_execute_classifies_quarantine_as_application_outcome():
+    payload = json.loads(
+        _format_nonzero_command_output(
+            "python split_all.py --input-dir input --output-dir output",
+            1,
+            "QUARANTINED: output/quarantine/run-id\nQuarantined runs: 1",
+            "",
+            "",
+        )
+    )
+
+    interpretation = payload["interpretation"].lower()
+    assert "application" in interpretation
+    assert "quarantine" in interpretation
+    assert "manifest" in interpretation
+
+
+def test_execute_identifies_primary_and_cleanup_missing_executables():
+    stderr = """Traceback (most recent call last):
+  File \"publish_sandbox.py\", line 57, in main
+    subprocess.run([\"kinit\", principal])
+  File \"/usr/lib/python3.12/subprocess.py\", line 1955, in _execute_child
+FileNotFoundError: [Errno 2] No such file or directory: 'kinit'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File \"publish_sandbox.py\", line 73, in main
+    subprocess.run([\"kdestroy\"])
+  File \"/usr/lib/python3.12/subprocess.py\", line 1955, in _execute_child
+FileNotFoundError: [Errno 2] No such file or directory: 'kdestroy'
+"""
+    payload = json.loads(
+        _format_nonzero_command_output("python3 publish_sandbox.py", 1, "", stderr, "")
+    )
+
+    interpretation = payload["interpretation"].lower()
+    assert "missing required external executable `kinit`" in interpretation
+    assert "`kdestroy`" in interpretation
+    assert "cleanup" in interpretation
+    assert "secondary" in interpretation
+    assert "command -v" in interpretation
+    assert "did not reach" in interpretation
+
+
+def test_execute_explains_empty_compound_failure_with_redirected_output():
+    command = (
+        "rm -rf experiment/naming-test && mkdir -p experiment/naming-test/input "
+        "&& python split_all.py --profile billing_img >/tmp/hca-naming-test.log "
+        "&& python -c \"print('validate')\""
+    )
+    payload = json.loads(
+        _format_nonzero_command_output(
+            command,
+            1,
+            "",
+            "",
+            "[bash_validator: WARN DESTRUCTIVE — rm -rf is destructive]",
+        )
+    )
+
+    interpretation = payload["interpretation"].lower()
+    assert "advisory" in interpretation
+    assert "did not cause" in interpretation
+    assert "&&" in interpretation
+    assert "later stages" in interpretation
+    assert "/tmp/hca-naming-test.log" in interpretation
+    assert "redirect" in interpretation
+    assert "rerun" in interpretation
+
+
+def test_execute_classifies_missing_input_and_empty_json_as_cascade():
+    command = (
+        "for pdf in missing-a.pdf present.pdf missing-b.pdf; do "
+        "python diagnose.py \"$pdf\" >\"/tmp/$pdf.json\"; "
+        "python -c 'import json,sys; json.load(open(sys.argv[1]))' "
+        "\"/tmp/$pdf.json\"; done"
+    )
+    stderr = """split_hca_pdf.SplitError: Input file does not exist: missing-a.pdf
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+split_hca_pdf.SplitError: Input file does not exist: missing-b.pdf
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+"""
+    stdout = "present.pdf:\npages 169 packets 54\n"
+    payload = json.loads(
+        _format_nonzero_command_output(command, 1, stdout, stderr, "")
+    )
+
+    interpretation = payload["interpretation"].lower()
+    assert "primary" in interpretation
+    assert "missing-a.pdf" in interpretation
+    assert "missing-b.pdf" in interpretation
+    assert "secondary" in interpretation
+    assert "empty" in interpretation
+    assert "redirection" in interpretation
+    assert "preflight" in interpretation
+    assert "producer" in interpretation
+    assert "consumer" in interpretation
+    assert "for` loop" in interpretation
+    assert "continues" in interpretation
+    assert "partial success" in interpretation
+
+
+def test_execute_classifies_missing_python_module_as_interpreter_issue():
+    payload = json.loads(
+        _format_nonzero_command_output(
+            "python3 - <<'PY'\nfrom pypdf import PdfReader\nPY",
+            1,
+            "",
+            "ModuleNotFoundError: No module named 'pypdf'",
+            "",
+        )
+    )
+
+    interpretation = payload["interpretation"].lower()
+    assert "selected python interpreter" in interpretation
+    assert "`pypdf`" in interpretation
+    assert "did not reach" in interpretation
+    assert ".venv/bin/python" in interpretation
+    assert "same interpreter" in interpretation
+    assert "-m pip show" in interpretation
+    assert "global" in interpretation
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("program", ["grep", "rg"])
+async def test_execute_normalizes_search_exit_one_with_no_output(program: str):
+    class Backend:
+        async def exec(self, command, timeout=None, cwd=None, env=None):
+            return ExecResult(stdout="", stderr="", exit_code=1)
+
+    tool = create_exec_tools(Backend())[0]
+    result = await tool.execute({"command": f"{program} needle manifest.json"})
+
+    assert result.success is True
+    assert "no matches" in str(result.output).lower()
+
+
+@pytest.mark.asyncio
+async def test_execute_keeps_non_search_exit_one_as_failure():
+    class Backend:
+        async def exec(self, command, timeout=None, cwd=None, env=None):
+            return ExecResult(stdout="", stderr="", exit_code=1)
+
+    tool = create_exec_tools(Backend())[0]
+    result = await tool.execute({"command": "pytest"})
+
+    assert result.success is False
+
+
+def test_execute_redacts_high_entropy_shell_command_failure():
+    secret = "vP7Vf5uipuaO"
+    payload = json.loads(
+        _format_nonzero_command_output(
+            "python3 hca_smb.py ls",
+            127,
+            "",
+            f"bash: line 1: {secret}: command not found",
+            "",
+        )
+    )
+    assert secret not in payload["stderr"]
+    assert "[REDACTED:SHELL_SECRET]" in payload["stderr"]
+    assert "unsafe secret interpolation" in payload["interpretation"]
+
+
 @pytest.mark.asyncio
 async def test_repeated_execute_calls_get_command_specific_recovery_hint():
     class RepeatingExecuteLLM:
@@ -210,12 +464,67 @@ async def test_repeated_execute_calls_get_command_specific_recovery_hint():
         if message.role == "user"
     ]
     transcript = "\n".join(str(message.content) for batch in llm.seen for message in batch)
-    assert "command_executed" in transcript
-    assert "exit_code" in transcript
+    assert "Command exited with code 1" in transcript
+    assert "FAILED" in transcript
     assert any(
         "execute command" in hint and "nonzero" in hint and "Do not rerun" in hint
         for hint in hints
     )
+
+
+@pytest.mark.asyncio
+async def test_three_failures_trigger_rethink_without_opt_in_flag():
+    class FailureAwareLLM:
+        name = "failure-aware"
+
+        def __init__(self):
+            self.calls = 0
+            self.saw_rethink = False
+
+        async def chat(self, messages, **kwargs):
+            self.calls += 1
+            transcript = "\n".join(str(message.content) for message in messages)
+            self.saw_rethink = "Classify the failure" in transcript
+            if self.saw_rethink:
+                return LLMResponse(content="stopped", model="fake", tokens_used=1)
+            return LLMResponse(
+                content="",
+                model="fake",
+                tokens_used=1,
+                tool_calls=[
+                    NativeToolCall(
+                        "probe",
+                        {"attempt": self.calls},
+                        tool_call_id=f"probe_{self.calls}",
+                    )
+                ],
+            )
+
+    class ProbeTool:
+        name = "probe"
+        description = "Probe an external dependency"
+        parameters = {"attempt": {"type": "integer", "required": True}}
+
+        async def execute(self, args):
+            return ToolResult(False, "external service rejected request", "probe failed")
+
+    llm = FailureAwareLLM()
+    registry = ToolRegistry()
+    registry.register(ProbeTool())
+    result = await run_agent_graph(
+        "diagnose external service",
+        llm,
+        tools=registry,
+        max_iterations=8,
+        streaming=False,
+        use_native_tools=True,
+        rethink=False,
+    )
+    assert result.result == "stopped"
+    assert llm.saw_rethink is True
+    # Three failing turns + the recovery turn; a configured final-check pass
+    # may make one additional model call.
+    assert llm.calls in (4, 5)
 
 
 def test_sqlite_result_cache_persists_successful_tool_results(tmp_path: Path):

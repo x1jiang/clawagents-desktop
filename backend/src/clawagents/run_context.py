@@ -92,6 +92,8 @@ class RunContext(Generic[TContext]):
     # "allow_once", "allow_always", or "deny".  None means no callback — the
     # existing requires_confirmation fall-through behaviour is preserved for
     # backward compatibility with non-desktop callers.
+    # Desktop fork only: keep this field when merging upstream (the desktop
+    # gateway sets it per chat turn; tools/registry.py reads it).
     permission_callback: Optional[Callable[[dict], Awaitable[str]]] = field(
         default=None, repr=False, compare=False,
     )
@@ -126,6 +128,15 @@ class RunContext(Generic[TContext]):
             next_offset=None,
             total_chars=0,
         )
+
+    def clear_pending_skill(self) -> None:
+        """Drop in-flight multi-page skill state without activating the skill."""
+        self.pending_skill_name = None
+        self.pending_skill_content_hash = None
+        self.pending_skill_next_offset = None
+        self.pending_skill_total_chars = None
+        self.pending_skill_allowed_tools = None
+        self.pending_skill_boundary_declared = False
 
     def record_skill_page(
         self,

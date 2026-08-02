@@ -641,6 +641,9 @@ class MessageBody(_BM):
     attachment_ids: list[str] | None = None
     auto_approve: AutoApproveBody | None = None
     caveman: bool = False
+    # Long-horizon autopilot: keep working until the goal is met, rather than
+    # stopping at the first plausible answer.
+    goal: bool = False
     # interactive = ask_user hits the UI; auto = agent decides without waiting.
     interaction: str = "interactive"
 
@@ -908,6 +911,7 @@ async def run_chat_turn(
     on_event: Callable[[str, dict], None],
     auto_approve: dict | None = None,
     caveman: bool = False,
+    goal: bool = False,
     interaction: str = "interactive",
     cancel_event: "asyncio.Event | None" = None,
 ) -> None:
@@ -1025,10 +1029,27 @@ async def run_chat_turn(
         if sections:
             augmented_content = "\n\n".join(sections) + "\n\n" + content
 
+    # Snapshot the conversation as it stood BEFORE this turn, for the history
+    # preload further down. It has to happen here, ahead of the user_message
+    # append below: replaying a file that already contains the current prompt
+    # would hand the model that prompt twice — once as replayed history and
+    # again as the `task` — which reads to the model as the user repeating
+    # themselves. Writing still happens first-thing so a crashed turn does not
+    # lose the user's text from GET /chats/:id/messages.
+    _prior_messages: list = []
+    if chat_jsonl.exists():
+        try:
+            _prior_messages = SessionReader(chat_jsonl).reconstruct_messages()
+        except Exception:  # noqa: BLE001
+            # Best-effort — without history the chat still works, just amnesic.
+            _prior_messages = []
+
     # Persist the user's prompt to the JSONL so GET /chats/:id/messages
-    # can replay it. The agent's SessionWriter only emits agent-side events
-    # (system_prompt, assistant_message, tool_result) — user input arrives
-    # as the `task` argument, never written by the agent itself.
+    # can replay it. The agent's SessionWriter emits only agent-side events,
+    # and not even all of those: a turn that ends in a plain answer writes no
+    # assistant_message at all (only the tool-calling path does), so the final
+    # reply is persisted after invoke() below. User input arrives as the
+    # `task` argument and is never written by the agent itself.
     _user_writer = SessionWriter(session_id=chat_id, session_dir=sessions_dir)
     persisted_user = {"content": content}
     if attachments:
@@ -1261,15 +1282,13 @@ async def run_chat_turn(
     # fresh agent that sees only the new user message — the user sees
     # "amnesia" symptoms ("which table?", repeated greetings, etc.).
     prior_session = None
-    if chat_jsonl.exists():
+    if _prior_messages:
         try:
-            from clawagents.session.persistence import SessionReader
             from clawagents.session.backends import InMemorySession
-            reader = SessionReader(chat_jsonl)
-            prior_messages = reader.reconstruct_messages()
+
             # Drop the leading system message — the agent emits its own
             # system prompt; keep only the user/assistant/tool turns.
-            replayable = [m for m in prior_messages if m.role != "system"]
+            replayable = [m for m in _prior_messages if m.role != "system"]
             if replayable:
                 prior_session = InMemorySession(session_id=chat_id)
                 await prior_session.add_items(replayable)
@@ -1348,6 +1367,11 @@ async def run_chat_turn(
     # Couple UI chat mode → OS sandbox (permission layer alone is not enough).
     if "chat_mode" in agent_params:
         agent_kwargs["chat_mode"] = mode
+    # Goal autopilot — long-horizon completion path. Probed rather than passed
+    # blindly: an older vendored engine has no such kwarg, and the trailing
+    # `allowed` filter would drop it silently either way.
+    if goal and "goal_mode" in agent_params:
+        agent_kwargs["goal_mode"] = True
     if "allow_full_access" in agent_params:
         agent_kwargs["allow_full_access"] = bool(settings.allow_full_access)
     elif (
@@ -1557,12 +1581,58 @@ async def run_chat_turn(
     status = getattr(result, "status", "unknown")
     iterations = getattr(result, "iterations", 0)
     out = getattr(result, "result", "")
+    _persist_final_assistant(chat_jsonl, sessions_dir, chat_id, out)
     on_event("turn_completed", {
         "chat_id": chat_id,
         "status": status,
         "iterations": iterations,
         "result": out if isinstance(out, str) else str(out),
     })
+
+
+def _last_assistant_content(chat_jsonl: Path) -> str | None:
+    """Content of the most recent assistant_message in a chat log, if any."""
+    try:
+        lines = chat_jsonl.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        if '"assistant_message"' not in line:
+            continue
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if event.get("type") == "assistant_message":
+            return str(event.get("content") or "")
+    return None
+
+
+def _persist_final_assistant(
+    chat_jsonl: Path, sessions_dir: Path, chat_id: str, text: Any
+) -> None:
+    """Append the turn's final answer to the chat log.
+
+    The engine's SessionWriter records an ``assistant_message`` only on the
+    tool-calling path, so a turn that ends in plain prose — the common case —
+    left nothing behind. That cost the next turn its memory of what the agent
+    had said, and left reloaded transcripts showing user messages only.
+
+    Guarded against double-writing: if the run ended immediately after a
+    tool round whose content the engine already stored, the identical text is
+    not appended again.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return
+    if _last_assistant_content(chat_jsonl) == text:
+        return
+    try:
+        SessionWriter(
+            session_id=chat_id, session_dir=sessions_dir
+        ).write_assistant_message(text)
+    except OSError:
+        # Persistence is best-effort; the reply already reached the UI live.
+        pass
 
 
 def _resolve_root_for_chat(chat_id: str) -> tuple[str, str | None]:
@@ -1639,6 +1709,7 @@ async def post_chat_message(chat_id: str, body: MessageBody, request: Request) -
                 "model": model,
                 "on_event": emit,
                 "caveman": bool(body.caveman),
+                "goal": bool(body.goal),
                 "interaction": body.interaction if body.interaction in ("interactive", "auto") else "interactive",
                 # Lets POST /cancel and client-disconnect actually stop the turn.
                 "cancel_event": cancel_event,

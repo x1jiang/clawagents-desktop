@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import zipfile
 from pathlib import Path
 
@@ -79,7 +80,30 @@ def export_backup() -> StreamingResponse:
     )
 
 
+# Fields accepted from an imported backup. Anything else is dropped rather
+# than passed through to the Project dataclass.
+_PROJECT_FIELDS: frozenset[str] = frozenset({
+    "id", "name", "root_path", "created_at", "updated_at", "last_opened_at",
+    "is_remote", "ssh_host", "remote_path", "color", "icon", "archived",
+})
+
+# `-` prefix makes ssh read the value as an option (-oProxyCommand=...).
+_SSH_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-@:\[\]]*$")
+
+
+def _reject_project_entry(entry: dict) -> str:
+    """Return a reason string when an imported project must not be trusted."""
+    host = str(entry.get("ssh_host") or "").strip()
+    if host and not _SSH_HOST_RE.match(host):
+        return f"unsafe ssh_host {host!r}"
+    remote = str(entry.get("remote_path") or "").strip()
+    if remote and not remote.startswith("/"):
+        return f"remote_path must be absolute: {remote!r}"
+    return ""
+
+
 @router.post("/backup/import")
+
 async def import_backup(file: UploadFile = File(...)) -> dict:
     """Restore from a previously-exported zip. Merges into existing state.
 
@@ -118,6 +142,18 @@ async def import_backup(file: UploadFile = File(...)) -> dict:
             if not root or not Path(root).exists():
                 continue
             from clawagents.desktop_stores.project_store import Project
+            # A backup archive is untrusted input — it can be shared or
+            # downloaded. Splatting arbitrary keys in let an attacker plant
+            # e.g. ssh_host="-oProxyCommand=..." which the Rust host would
+            # hand to ssh as an OPTION (local command execution) the moment
+            # the user clicked the project. Keep only known fields, and
+            # re-validate the ones that reach a subprocess.
+            entry = {k: v for k, v in entry.items() if k in _PROJECT_FIELDS}
+            bad = _reject_project_entry(entry)
+            if bad:
+                counts.setdefault("projects_rejected", 0)
+                counts["projects_rejected"] += 1
+                continue
             projects = store._load()  # noqa: SLF001
             projects.append(Project(**entry))
             store._save(projects)  # noqa: SLF001

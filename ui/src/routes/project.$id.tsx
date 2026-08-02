@@ -8,6 +8,7 @@ import { ensureProjectClient, isSshProject } from "../lib/project_client";
 import { formatErr } from "../lib/format_err";
 import { PermissionGrantsPanel } from "../components/PermissionGrantsPanel";
 import { ProjectSystemPromptPanel } from "../components/ProjectSystemPromptPanel";
+import { PinnedContextPanel } from "../components/PinnedContextPanel";
 import { ProjectEnvVarsPanel } from "../components/ProjectEnvVarsPanel";
 import { ProjectActivityWidget } from "../components/ProjectActivityWidget";
 import { ProjectDefaultsPanel } from "../components/ProjectDefaultsPanel";
@@ -132,6 +133,7 @@ export const Route = createRoute({
         <ProjectDefaultsPanel projectId={id} />
         <DiscoveredSkillsPanel projectId={id} />
         <ProjectSystemPromptPanel projectId={id} />
+        <PinnedContextPanel projectId={id} />
         <ProjectEnvVarsPanel projectId={id} />
         <PermissionGrantsPanel projectId={id} />
       </div>

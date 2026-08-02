@@ -69,6 +69,32 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\"'\"'"))
 }
 
+/// Reject hosts that `ssh` would parse as options rather than a destination.
+///
+/// A host beginning with `-` becomes an ssh flag — `-oProxyCommand=...` runs an
+/// arbitrary **local** command. Shell quoting does not help here; the problem is
+/// argv parsing, not the shell. Hosts arrive from user input *and* from imported
+/// project backups, so this must be validated, not trusted.
+pub fn validate_ssh_host(host: &str) -> Result<(), String> {
+    let h = host.trim();
+    if h.is_empty() {
+        return Err("SSH host is empty".into());
+    }
+    if h.starts_with('-') {
+        return Err(format!("Refusing SSH host {h:?}: must not begin with '-'"));
+    }
+    // user@host, host, host:port, IPv6 in brackets.
+    let ok = h.chars().all(|c| {
+        c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '@' | ':' | '[' | ']')
+    });
+    if !ok {
+        return Err(format!(
+            "Refusing SSH host {h:?}: only letters, digits and .-_@:[] are allowed"
+        ));
+    }
+    Ok(())
+}
+
 fn ssh_base_args(host: &str) -> Vec<String> {
     vec![
         "-o".into(),
@@ -77,11 +103,14 @@ fn ssh_base_args(host: &str) -> Vec<String> {
         "ConnectTimeout=20".into(),
         "-o".into(),
         "StrictHostKeyChecking=accept-new".into(),
+        // End option parsing so a hostile host can never be read as a flag.
+        "--".into(),
         host.into(),
     ]
 }
 
 fn run_ssh(host: &str, remote_cmd: &str, timeout: Duration) -> Result<String, String> {
+    validate_ssh_host(host)?;
     let mut args = ssh_base_args(host);
     args.push(remote_cmd.into());
     let mut child = Command::new("ssh")
@@ -201,6 +230,7 @@ pub fn test_ssh_connection(host: &str, remote_path: &str) -> Result<(), String> 
     if host.is_empty() {
         return Err("host is required".into());
     }
+    validate_ssh_host(host)?;
     if remote_path.is_empty() {
         return Err("remote_path is required".into());
     }
@@ -447,6 +477,9 @@ pub fn connect_remote(
     if host.is_empty() || remote_path.is_empty() {
         return Err("host and remote_path are required".into());
     }
+    // Rejects `-oProxyCommand=...`; reachable from an imported project backup,
+    // not just from the new-project form.
+    validate_ssh_host(&host)?;
     if !remote_path.starts_with('/') {
         return Err("remote_path must be an absolute path".into());
     }
@@ -478,6 +511,13 @@ pub fn connect_remote(
     let app_support = format!("{remote_path}/.clawagents/desktop-app-support");
     let mut env_exports = String::from(
         "export PYTHONPATH=\"$HOME/.cache/clawagents-desktop-remote/src${PYTHONPATH:+:$PYTHONPATH}\"; ",
+    );
+    // The remote gateway runs with cwd inside the checkout, so without these it
+    // would load that repo's `.env` with override=True — a committed `.env`
+    // could replace the Keychain API key and redirect base_url. The local
+    // sidecar already sets both (see sidecar.rs); the remote path must match.
+    env_exports.push_str(
+        "export CLAWAGENTS_SKIP_DOTENV=1; export CLAWAGENTS_DOTENV_OVERRIDE=0; ",
     );
     env_exports.push_str(&format!(
         "export GATEWAY_HOST=127.0.0.1; export GATEWAY_API_KEY={}; ",
@@ -519,6 +559,8 @@ pub fn connect_remote(
             "ServerAliveInterval=30",
             "-L",
             &forward,
+            // End option parsing before the destination (see validate_ssh_host).
+            "--",
             &host,
             &remote_cmd,
         ])

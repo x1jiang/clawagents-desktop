@@ -171,7 +171,50 @@ def create_app() -> tuple:
             def on_event(kind, data):
                 sse("agent", {"kind": kind, "data": data})
 
-            return await agent.invoke(task, on_event=on_event)
+            # Check if Context Observatory recording is enabled by payload setting or env
+            enable_obs = bool(
+                payload.get("enable_context_observatory")
+                or payload.get("context_observatory")
+                or os.environ.get("CLAWAGENTS_ENABLE_CONTEXT_OBSERVATORY") == "1"
+            )
+
+            if enable_obs:
+                import time
+                from clawagents.context_observatory.hooks import ContextObserverHooks
+                from clawagents.context_observatory.store import EventStore
+                from clawagents.graph.model_profiles import resolve_model_profile
+
+                chat_id = payload.get("chat_id") or payload.get("session_id") or payload.get("chatId")
+                model_name = getattr(llm, "model", None) or active_model
+                profile = resolve_model_profile(str(model_name))
+                context_window = int(
+                    payload.get("context_window")
+                    or (profile["max_input_tokens"] if profile else 128_000)
+                )
+                store = EventStore()
+                store.set_session_meta(
+                    model=str(model_name),
+                    context_window=context_window,
+                    started_at=time.time(),
+                )
+                observer = ContextObserverHooks(
+                    store=store,
+                    model=str(model_name),
+                    context_window=context_window,
+                    event_sink=lambda event: sse("observatory", event.to_dict()),
+                )
+
+                try:
+                    result = await agent.invoke(task, on_event=on_event, hooks=observer)
+                    store.set_session_meta(completed_at=time.time(), status=result.status)
+                    store.auto_save(chat_id=chat_id)
+                    return result
+                except Exception:
+                    store.set_session_meta(completed_at=time.time(), status="failed")
+                    store.auto_save(chat_id=chat_id)
+                    raise
+            else:
+                return await agent.invoke(task, on_event=on_event)
 
         run_task = asyncio.create_task(_run())
 
@@ -196,7 +239,9 @@ def create_app() -> tuple:
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
 
-
+    # ── Desktop fork: mount the Tauri app's own API surface ───────────────
+    # These routers live only in clawagents_desktop. Keep this block when
+    # merging upstream — without it the desktop UI has no backend at all.
     from clawagents.gateway.projects_api import router as _projects_router, img_router as _projects_img_router
     from clawagents.gateway.chats_api import router as _chats_router
     from clawagents.gateway.providers_api import router as _providers_router

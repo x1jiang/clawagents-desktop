@@ -820,6 +820,24 @@ export class GatewayClient {
     });
   }
 
+  /** Read `.clawagents/pinned-context.md` — short always-on instructions. */
+  getPinnedContext(projectId: string): Promise<PinnedContext> {
+    const q = new URLSearchParams({ project_id: projectId });
+    return this.request(`/memory/pinned-context?${q.toString()}`);
+  }
+
+  /**
+   * Write pinned context; empty text deletes the file. The response echoes what
+   * was actually stored (the server truncates past `max_chars`), so callers
+   * should adopt the returned text rather than assuming their own was kept.
+   */
+  setPinnedContext(projectId: string, text: string): Promise<PinnedContext> {
+    return this.request("/memory/pinned-context", {
+      method: "PUT",
+      body: JSON.stringify({ project_id: projectId, text }),
+    });
+  }
+
   /**
    * Hit the provider's models endpoint to confirm a key actually authenticates.
    * Returns shape: { ok, status, message, model_count }. Used by Settings "Test".
@@ -857,6 +875,16 @@ export class GatewayClient {
       body: JSON.stringify({ suffix }),
     });
   }
+}
+
+export interface PinnedContext {
+  ok: boolean;
+  text: string;
+  chars: number;
+  max_chars: number;
+  /** Only present on write: the server dropped text past `max_chars`. */
+  truncated?: boolean;
+  path: string;
 }
 
 export interface ModelUsage {

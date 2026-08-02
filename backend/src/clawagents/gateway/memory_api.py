@@ -304,3 +304,60 @@ def memory_search(body: MemorySearchBody) -> dict[str, Any]:
             "chunk_id": getattr(hit, "chunk_id", None),
         })
     return {"ok": True, "query": query, "hits": out}
+
+
+# ─── Pinned context ──────────────────────────────────────────────────────
+#
+# Short, always-on instructions the user edits inline ("use .venv312", "the
+# staging DB is read-only this week"). The engine already discovers
+# `.clawagents/pinned-context.md` as a rules source and leads the injected
+# block with it; these two routes are the editing surface.
+#
+# It is a plain file, not app state, so it stays diffable, survives outside
+# the app, and is picked up by every ClawAgents front end.
+
+_PINNED_MAX_CHARS = 4_000
+
+
+class PinnedContextBody(BaseModel):
+    project_id: str | None = None
+    root_path: str | None = None
+    text: str = Field(default="", max_length=100_000)
+
+
+@router.get("/memory/pinned-context")
+def get_pinned_context(
+    project_id: str | None = Query(default=None),
+    root_path: str | None = Query(default=None),
+) -> dict[str, Any]:
+    root = _project_root(project_id, root_path)
+    from clawagents.memory.rules import pinned_context_path, read_pinned_context
+
+    text = read_pinned_context(str(root))
+    return {
+        "ok": True,
+        "text": text,
+        "chars": len(text),
+        "max_chars": _PINNED_MAX_CHARS,
+        "path": str(pinned_context_path(str(root))),
+    }
+
+
+@router.put("/memory/pinned-context")
+def put_pinned_context(body: PinnedContextBody) -> dict[str, Any]:
+    root = _project_root(body.project_id, body.root_path)
+    from clawagents.memory.rules import pinned_context_path, write_pinned_context
+
+    # write_pinned_context truncates rather than rejecting, and returns what it
+    # actually stored — echo that back so the editor shows the real state
+    # instead of the text the user thought they saved. Clearing removes the
+    # file entirely.
+    stored = write_pinned_context(body.text, str(root), max_chars=_PINNED_MAX_CHARS)
+    return {
+        "ok": True,
+        "text": stored,
+        "chars": len(stored),
+        "max_chars": _PINNED_MAX_CHARS,
+        "truncated": len((body.text or "").strip()) > len(stored),
+        "path": str(pinned_context_path(str(root))),
+    }

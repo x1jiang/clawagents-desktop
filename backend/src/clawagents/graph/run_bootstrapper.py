@@ -484,8 +484,19 @@ class RunBootstrapper:
 
         if _feat_enabled("session_persistence"):
             from clawagents.session.persistence import SessionWriter
+            from clawagents.graph.agent_loop import (
+                DESKTOP_SESSION_DIR_KEY,
+                DESKTOP_SESSION_ID_KEY,
+            )
 
-            self._session_writer = SessionWriter()
+            # Desktop fork: a chat says which session file it owns, so the
+            # gateway can replay history for that chat specifically. Both keys
+            # are absent for every other caller, and SessionWriter(None,
+            # session_dir=None) is exactly upstream's behaviour.
+            self._session_writer = SessionWriter(
+                run_context._metadata.get(DESKTOP_SESSION_ID_KEY),
+                session_dir=run_context._metadata.get(DESKTOP_SESSION_DIR_KEY),
+            )
             run_context.session_id = self._session_writer.session_id
             run_context._metadata["session_id"] = self._session_writer.session_id
             self._base_emit(

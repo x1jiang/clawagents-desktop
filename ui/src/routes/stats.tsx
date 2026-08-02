@@ -25,6 +25,7 @@ function totalCost(by_model: Record<string, ModelUsage>): number | null {
       input_tokens: u.input_tokens,
       output_tokens: u.output_tokens,
       cached_input_tokens: u.cached_input_tokens,
+      cache_creation_tokens: u.cache_creation_tokens,
     });
     if (c !== null) { total += c; any = true; }
   }
@@ -44,6 +45,7 @@ function ModelRow({ model, usage }: { model: string; usage: ModelUsage }) {
     input_tokens: usage.input_tokens,
     output_tokens: usage.output_tokens,
     cached_input_tokens: usage.cached_input_tokens,
+    cache_creation_tokens: usage.cache_creation_tokens,
   });
   return (
     <tr className="border-b border-gray-100 dark:border-gray-800">

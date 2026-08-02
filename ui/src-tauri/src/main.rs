@@ -242,8 +242,31 @@ fn keyring_delete(service: String, account: String) -> Result<(), String> {
 
 #[tauri::command]
 fn open_in_finder(path: String) -> Result<(), String> {
+    // `open` LAUNCHES its argument — a .app/.command/.scpt or a URL executes.
+    // The gateway's own reveal endpoint (system_api.py) allowlists paths for
+    // exactly this reason; reimplementing the primitive here without the same
+    // check was a straight bypass of that guard.
+    let p = std::path::Path::new(path.trim());
+    if path.trim().is_empty() || path.contains("://") {
+        return Err("Refusing to open a URL or empty path".into());
+    }
+    let resolved = p
+        .canonicalize()
+        .map_err(|_| format!("Refusing to open {path:?}: path does not exist"))?;
+    let allowed_roots: Vec<std::path::PathBuf> = std::env::var("CLAWAGENTS_DESKTOP_APP_SUPPORT")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .into_iter()
+        .chain(std::env::var("HOME").ok().map(std::path::PathBuf::from))
+        .filter_map(|r| r.canonicalize().ok())
+        .collect();
+    if !allowed_roots.iter().any(|root| resolved.starts_with(root)) {
+        return Err(format!("Refusing to open {path:?}: outside allowed roots"));
+    }
+    // Reveal in Finder rather than launch the target.
     std::process::Command::new("open")
-        .arg(&path)
+        .arg("-R")
+        .arg(&resolved)
         .spawn()
         .map(|_| ())
         .map_err(|e| e.to_string())
@@ -499,7 +522,6 @@ fn start_gateway_inner() -> Result<RuntimeInfo, String> {
     // Only re-read Keychain after boot if spawn-time collect timed out / got
     // nothing — avoid a second unlock when keys were already injected as env.
     if keychain_env.is_empty() {
-        let port = port;
         let token = token.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_secs(1));

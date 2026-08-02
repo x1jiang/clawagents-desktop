@@ -14,6 +14,8 @@ import threading
 from pathlib import Path
 from typing import Any
 
+# Keep in step with clawagents.agent._DEFAULT_SKILL_DIRS, which is the fallback
+# when this resolution returns nothing.
 _AUTO_NAMES = (
     "skills",
     ".skills",
@@ -23,6 +25,11 @@ _AUTO_NAMES = (
     ".agents/skills",
     ".agent/skills",
     ".cursor/skills",
+    # Project-level counterpart of the ~/.claude/skills user home below.
+    ".claude/skills",
+    # Where marketplace.skills_install_dir() installs to — an installed skill
+    # that is never discovered is an installed skill that does not work.
+    ".clawagents/skills",
 )
 # Ordered lowest→highest precedence (later dirs win name collisions).
 _USER_SKILL_HOMES = (

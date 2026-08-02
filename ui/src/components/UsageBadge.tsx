@@ -22,6 +22,9 @@ function costFor(usage: ChatUsage | undefined, modelOverride?: string): number |
     input_tokens: usage.input_tokens,
     output_tokens: usage.output_tokens,
     cached_input_tokens: usage.cached_input_tokens,
+    // The store has tracked cache writes all along; without this the premium
+    // was silently dropped from every displayed cost.
+    cache_creation_tokens: usage.cache_creation_tokens,
   });
 }
 

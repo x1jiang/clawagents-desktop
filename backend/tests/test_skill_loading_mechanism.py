@@ -447,7 +447,8 @@ def test_use_skill_reports_content_hash_and_activation_state(tmp_path):
     assert context.active_skill_content_hash
 
 
-def test_use_skill_requires_contiguous_pages_before_tool_use(tmp_path):
+def test_use_skill_auto_continues_before_other_tool(tmp_path):
+    """Harness finishes remaining pages when the model skips continuations."""
     root = tmp_path / "skills"
     _write_skill(
         root,
@@ -484,16 +485,188 @@ def test_use_skill_requires_contiguous_pages_before_tool_use(tmp_path):
     assert first.success
     assert context.pending_skill_next_offset is not None
     assert "long-restricted" not in context.active_skills
-    assert not asyncio.run(
-        registry.execute_tool("read_file", {}, run_context=context)
-    ).success
 
+    # Model skips continuations and calls a prereq tool — harness drains pages.
+    auto = asyncio.run(
+        registry.execute_tool("read_file", {}, run_context=context)
+    )
+    assert auto.success
+    assert "Harness auto-continued skill 'long-restricted'" in auto.output
+    assert "read" in auto.output
+    assert "long-restricted" in context.active_skills
+    assert context.pending_skill_next_offset is None
+
+
+def test_disallowed_tool_refuses_before_auto_drain(tmp_path):
+    """Pending allow-list must gate BEFORE drain so pages are not discarded."""
+    root = tmp_path / "skills"
+    _write_skill(
+        root,
+        "long-restricted",
+        body=("first rules\n\n" + "A" * 10_000 + "\n\nlast rules\n" + "Z" * 4_000),
+        frontmatter=(
+            "name: long-restricted\ndescription: long skill\nallowed-tools: read_file"
+        ),
+    )
+    store = SkillStore()
+    store.add_directory(root)
+    _load(store)
+    use_tool = [tool for tool in create_skill_tools(store) if tool.name == "use_skill"][0]
+
+    class ExecTool:
+        name = "execute"
+        description = "exec"
+        parameters = {}
+
+        async def execute(self, args):
+            return ToolResult(success=True, output="ran")
+
+    registry = ToolRegistry()
+    registry.register(use_tool)
+    registry.register(ExecTool())
+    context = RunContext()
+    first = asyncio.run(
+        registry.execute_tool(
+            "use_skill",
+            {"name": "long-restricted", "max_chars": 4_000},
+            run_context=context,
+        )
+    )
+    assert first.success
+    pending_before = context.pending_skill_next_offset
+    assert pending_before is not None
+
+    refused = asyncio.run(
+        registry.execute_tool("execute", {}, run_context=context)
+    )
+    assert not refused.success
+    assert "allowed-tools" in (refused.error or "")
+    assert "Finishing the pending load will not unlock" in (refused.error or "")
+    # Pending load must survive — drain must not have run.
+    assert context.pending_skill_next_offset == pending_before
+    assert "long-restricted" not in context.active_skills
+    assert "Harness auto-continued" not in (refused.output or "")
+
+
+def test_repeated_plain_use_skill_call_continues_pending_page(tmp_path):
+    """A repeated same-name call advances rather than draining and restarting."""
+    root = tmp_path / "skills"
+    _write_skill(
+        root,
+        "long-manual",
+        body="A" * 12_000,
+        frontmatter="name: long-manual\ndescription: long\nallowed-tools: read_file",
+    )
+    store = SkillStore()
+    store.add_directory(root)
+    _load(store)
+    use_tool = [tool for tool in create_skill_tools(store) if tool.name == "use_skill"][0]
+    registry = ToolRegistry()
+    registry.register(use_tool)
+    context = RunContext()
+
+    first = asyncio.run(
+        registry.execute_tool(
+            "use_skill",
+            {"name": "long-manual", "max_chars": 4_000},
+            run_context=context,
+        )
+    )
+    first_offset = context.pending_skill_next_offset
+    assert first.success
+    assert first_offset is not None
+
+    second = asyncio.run(
+        registry.execute_tool(
+            "use_skill",
+            {"name": "long-manual", "max_chars": 4_000},
+            run_context=context,
+        )
+    )
+
+    assert second.success
+    assert "Harness auto-continued" not in (second.output or "")
+    assert context.pending_skill_next_offset is not None
+    assert context.pending_skill_next_offset > first_offset
+
+
+def test_repeated_plain_use_skill_with_changed_arguments_fails_closed(tmp_path):
+    root = tmp_path / "skills"
+    _write_skill(
+        root,
+        "argument-skill",
+        body=("Selected: $ARGUMENTS\n" + "A" * 12_000),
+    )
+    store = SkillStore()
+    store.add_directory(root)
+    _load(store)
+    use_tool = [tool for tool in create_skill_tools(store) if tool.name == "use_skill"][0]
+    registry = ToolRegistry()
+    registry.register(use_tool)
+    context = RunContext()
+
+    first = asyncio.run(
+        registry.execute_tool(
+            "use_skill",
+            {"name": "argument-skill", "arguments": "alpha", "max_chars": 4_000},
+            run_context=context,
+        )
+    )
+    assert first.success
+    assert context.pending_skill_name == "argument-skill"
+
+    changed = asyncio.run(
+        registry.execute_tool(
+            "use_skill",
+            {"name": "argument-skill", "arguments": "beta", "max_chars": 4_000},
+            run_context=context,
+        )
+    )
+    assert not changed.success
+    assert "content changed" in (changed.error or "")
+    assert "Pending cleared" in (changed.error or "")
+    assert context.pending_skill_name is None
+
+
+def test_use_skill_manual_continuation_still_works(tmp_path):
+    root = tmp_path / "skills"
+    _write_skill(
+        root,
+        "long-manual",
+        body="A" * 12_000,
+        frontmatter="name: long-manual\ndescription: long\nallowed-tools: read_file",
+    )
+    store = SkillStore()
+    store.add_directory(root)
+    _load(store)
+    use_tool = [tool for tool in create_skill_tools(store) if tool.name == "use_skill"][0]
+
+    class ReadTool:
+        name = "read_file"
+        description = "read"
+        parameters = {}
+
+        async def execute(self, args):
+            return ToolResult(success=True, output="read")
+
+    registry = ToolRegistry()
+    registry.register(use_tool)
+    registry.register(ReadTool())
+    context = RunContext()
+    first = asyncio.run(
+        registry.execute_tool(
+            "use_skill",
+            {"name": "long-manual", "max_chars": 4_000},
+            run_context=context,
+        )
+    )
+    assert first.success
     while context.pending_skill_next_offset is not None:
         continuation = asyncio.run(
             registry.execute_tool(
                 "use_skill",
                 {
-                    "name": "long-restricted",
+                    "name": "long-manual",
                     "offset": context.pending_skill_next_offset,
                     "expected_hash": context.pending_skill_content_hash,
                     "max_chars": 4_000,
@@ -502,11 +675,42 @@ def test_use_skill_requires_contiguous_pages_before_tool_use(tmp_path):
             )
         )
         assert continuation.success
-
-    assert "long-restricted" in context.active_skills
+    assert "long-manual" in context.active_skills
     assert asyncio.run(
         registry.execute_tool("read_file", {}, run_context=context)
     ).success
+
+
+def test_use_skill_abort_clears_pending(tmp_path):
+    root = tmp_path / "skills"
+    _write_skill(root, "long-abort", body="A" * 15_000)
+    store = SkillStore()
+    store.add_directory(root)
+    _load(store)
+    use_tool = [tool for tool in create_skill_tools(store) if tool.name == "use_skill"][0]
+    registry = ToolRegistry()
+    registry.register(use_tool)
+    context = RunContext()
+    first = asyncio.run(
+        registry.execute_tool(
+            "use_skill",
+            {"name": "long-abort", "max_chars": 4_000},
+            run_context=context,
+        )
+    )
+    assert first.success
+    assert context.pending_skill_name == "long-abort"
+    aborted = asyncio.run(
+        registry.execute_tool(
+            "use_skill",
+            {"name": "long-abort", "abort": True},
+            run_context=context,
+        )
+    )
+    assert aborted.success
+    assert "aborted" in aborted.output.lower()
+    assert context.pending_skill_name is None
+    assert "long-abort" not in context.active_skills
 
 
 def test_use_skill_rejects_skipped_offset_and_stale_hash(tmp_path):
@@ -532,32 +736,176 @@ def test_use_skill_rejects_skipped_offset_and_stale_hash(tmp_path):
         )
     )
     assert first.success
+    # Wrong offset is not a valid continuation: harness drains remaining pages
+    # first, then the bad call fails (must start at 0 once pending is clear).
+    bad_offset = context.pending_skill_next_offset + 1
+    bad_hash = context.pending_skill_content_hash
     skipped = asyncio.run(
         registry.execute_tool(
             "use_skill",
             {
                 "name": "long",
-                "offset": context.pending_skill_next_offset + 1,
-                "expected_hash": context.pending_skill_content_hash,
+                "offset": bad_offset,
+                "expected_hash": bad_hash,
             },
             run_context=context,
         )
     )
     assert not skipped.success
+    assert context.pending_skill_name is None
+    assert "long" in context.active_skills
 
+    # Fresh multi-page load, then mutate file mid-stream → hash mismatch
+    # must clear pending so restart at 0 is executable (no permanent wedge).
+    context2 = RunContext()
+    first2 = asyncio.run(
+        registry.execute_tool(
+            "use_skill", {"name": "long", "max_chars": 4_000}, run_context=context2
+        )
+    )
+    assert first2.success
+    assert context2.pending_skill_next_offset is not None
     skill.content += "changed"
     stale = asyncio.run(
         registry.execute_tool(
             "use_skill",
             {
                 "name": "long",
-                "offset": context.pending_skill_next_offset,
-                "expected_hash": context.pending_skill_content_hash,
+                "offset": context2.pending_skill_next_offset,
+                "expected_hash": context2.pending_skill_content_hash,
+            },
+            run_context=context2,
+        )
+    )
+    assert not stale.success
+    assert context2.pending_skill_name is None
+    restart = asyncio.run(
+        registry.execute_tool(
+            "use_skill", {"name": "long", "max_chars": 4_000}, run_context=context2
+        )
+    )
+    assert restart.success
+
+
+def test_use_skill_continue_true_ignores_mangled_hash(tmp_path):
+    """LLMs drop chars mid-sha256; continue=true uses server cursor only."""
+    root = tmp_path / "skills"
+    _write_skill(root, "long-cont", body="A" * 15_000)
+    store = SkillStore()
+    store.add_directory(root)
+    _load(store)
+    use_tool = [tool for tool in create_skill_tools(store) if tool.name == "use_skill"][0]
+    registry = ToolRegistry()
+    registry.register(use_tool)
+    context = RunContext()
+    first = asyncio.run(
+        registry.execute_tool(
+            "use_skill",
+            {"name": "long-cont", "max_chars": 4_000},
+            run_context=context,
+        )
+    )
+    assert first.success
+    assert "continue=true" in first.output
+    assert context.pending_skill_next_offset is not None
+    real = context.pending_skill_content_hash
+    mangled = real[:40] + "XXXXXXX" + real[47:]  # mid-string corruption
+    cont = asyncio.run(
+        registry.execute_tool(
+            "use_skill",
+            {
+                "name": "long-cont",
+                "continue": True,
+                "offset": 999_999,  # ignored
+                "expected_hash": mangled,  # ignored
+                "max_chars": 4_000,
             },
             run_context=context,
         )
     )
-    assert not stale.success
+    assert cont.success, cont.error
+    assert "expected_hash does not match" not in (cont.error or "")
+
+
+def test_use_skill_hash_mismatch_error_mentions_hash(tmp_path):
+    root = tmp_path / "skills"
+    _write_skill(root, "long-hash", body="A" * 15_000)
+    store = SkillStore()
+    store.add_directory(root)
+    _load(store)
+    use_tool = [tool for tool in create_skill_tools(store) if tool.name == "use_skill"][0]
+    registry = ToolRegistry()
+    registry.register(use_tool)
+    context = RunContext()
+    first = asyncio.run(
+        registry.execute_tool(
+            "use_skill",
+            {"name": "long-hash", "max_chars": 4_000},
+            run_context=context,
+        )
+    )
+    assert first.success
+    # Call use_skill tool directly (bypass registry auto-drain) with mangled hash.
+    bad = asyncio.run(
+        use_tool.execute(
+            {
+                "name": "long-hash",
+                "offset": context.pending_skill_next_offset,
+                "expected_hash": "deadbeef" * 8,
+            },
+            run_context=context,
+        )
+    )
+    assert not bad.success
+    assert "expected_hash" in (bad.error or "")
+    assert "continue=true" in (bad.error or "")
+    assert "must start at offset 0" not in (bad.error or "")
+
+
+def test_retrieve_tool_result_allowed_under_skill_gate(tmp_path):
+    root = tmp_path / "skills"
+    _write_skill(
+        root,
+        "narrow",
+        frontmatter="name: narrow\ndescription: d\nallowed-tools: read_file",
+    )
+    store = SkillStore()
+    store.add_directory(root)
+    _load(store)
+    use_tool = [tool for tool in create_skill_tools(store) if tool.name == "use_skill"][0]
+
+    class RetrieveTool:
+        name = "retrieve_tool_result"
+        description = "retrieve"
+        parameters = {}
+
+        async def execute(self, args):
+            return ToolResult(success=True, output="restored")
+
+    class WriteTool:
+        name = "write_file"
+        description = "write"
+        parameters = {}
+
+        async def execute(self, args):
+            return ToolResult(success=True, output="wrote")
+
+    registry = ToolRegistry()
+    registry.register(use_tool)
+    registry.register(RetrieveTool())
+    registry.register(WriteTool())
+    context = RunContext()
+    assert asyncio.run(
+        registry.execute_tool("use_skill", {"name": "narrow"}, run_context=context)
+    ).success
+    ok = asyncio.run(
+        registry.execute_tool("retrieve_tool_result", {}, run_context=context)
+    )
+    assert ok.success and ok.output == "restored"
+    denied = asyncio.run(
+        registry.execute_tool("write_file", {}, run_context=context)
+    )
+    assert not denied.success
 
 
 def test_explicit_empty_allowed_tools_blocks_every_data_plane_tool(tmp_path):
@@ -898,4 +1246,3 @@ def test_list_skills_shows_quarantined_section(tmp_path):
     assert "ok-skill" in result.output
     assert "Quarantined" in result.output
     assert "installer" in result.output
-

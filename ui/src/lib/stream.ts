@@ -55,6 +55,7 @@ export async function streamMessages(
     attachment_ids?: string[];
     auto_approve?: { edit?: boolean; execute?: boolean; web?: boolean; browser?: boolean };
     caveman?: boolean;
+    goal?: boolean;
     interaction?: "interactive" | "auto";
   },
   signal: AbortSignal,

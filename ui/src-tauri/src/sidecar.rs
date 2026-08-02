@@ -28,6 +28,17 @@ pub struct SpawnConfig {
     pub extra_env: Vec<(String, String)>,
 }
 
+/// Environment forwarded into the Python sidecar.
+///
+/// Deliberately excludes PYTHON*/LD_*/DYLD_* (interpreter injection),
+/// *_BASE_URL (trust-gate bypass) and *_PROXY (MITM of provider traffic).
+/// Provider credentials are injected explicitly from the Keychain instead.
+const SAFE_ENV_KEYS: &[&str] = &[
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TMP", "TEMP",
+    "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+];
+
 impl Sidecar {
     /// Spawn the gateway. The caller is responsible for calling
     /// [`Sidecar::shutdown`] on app exit.
@@ -44,6 +55,24 @@ impl Sidecar {
             "--serve",
             "--port", &cfg.port.to_string(),
         ]);
+        // Curated environment only. Inheriting the parent env forwards
+        // PYTHONPATH / PYTHONSTARTUP / PYTHONHOME / LD_PRELOAD / DYLD_* (code
+        // injection into the interpreter we are about to launch) and, just as
+        // bad, OPENAI_BASE_URL / ANTHROPIC_BASE_URL — which EngineConfig reads
+        // directly, bypassing this app's own base_url trust gate and sending
+        // Keychain keys wherever that variable points.
+        cmd.env_clear();
+        for key in SAFE_ENV_KEYS {
+            if let Ok(val) = std::env::var(key) {
+                cmd.env(key, val);
+            }
+        }
+        for (key, val) in std::env::vars() {
+            // Locale vars are numerous and harmless; forward the family.
+            if key.starts_with("LC_") {
+                cmd.env(key, val);
+            }
+        }
         cmd.env("GATEWAY_HOST", "127.0.0.1");
         cmd.env("GATEWAY_API_KEY", &cfg.api_key);
         // Keychain-injected keys must win over any workspace .env the library

@@ -18,7 +18,22 @@ async def test_second_turn_sees_first_turn_messages(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr("clawagents.config.features.is_enabled", lambda name: name == "session_persistence")
+    # Toggle the flag through the features API rather than replacing
+    # ``features.is_enabled`` itself. 52 modules do ``from clawagents.config
+    # .features import is_enabled``, binding the function object at import
+    # time; any of them first imported while a fake was installed would keep
+    # that fake forever, since monkeypatch only restores the attribute on the
+    # features module. That is not hypothetical — it silently disabled
+    # hunk_review for the rest of the session and broke an unrelated test
+    # ~100 files later. ``temporary_overrides`` mutates the dict the real
+    # ``is_enabled`` reads, so nothing can capture a stale callable.
+    from clawagents.config.features import temporary_overrides
+
+    with temporary_overrides({"session_persistence": True}):
+        await _run_two_turns(tmp_path, monkeypatch)
+
+
+async def _run_two_turns(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
     # Stub LLM that records what it was given on each call.
     from clawagents.providers.llm import LLMProvider, LLMResponse
@@ -111,4 +126,66 @@ async def test_second_turn_sees_first_turn_messages(
     assert "ack" in second_blob, (
         "second turn lost the first assistant reply; preload broke. "
         f"messages were: {second_turn}"
+    )
+
+    # The current prompt is written to the JSONL before the turn runs (so a
+    # crashed turn still shows it) AND passed as the task. Replaying a log that
+    # already contains it handed the model the same prompt twice, which reads
+    # as the user repeating themselves.
+    current_prompt = [m for m in second_turn if "What was my favourite" in m]
+    assert len(current_prompt) == 1, (
+        "current prompt replayed as history *and* passed as the task. "
+        f"messages were: {second_turn}"
+    )
+
+    # Turn 1's answer must be durable, not just streamed: GET /chats/:id/messages
+    # rebuilds the transcript from this file, and cross-turn memory reads it.
+    persisted = chat_jsonl.read_text(encoding="utf-8")
+    assert '"assistant_message"' in persisted, (
+        "no assistant_message persisted; a turn ending in plain prose writes "
+        "none from the engine, so the gateway must record the final answer"
+    )
+
+
+@pytest.mark.asyncio
+async def test_final_answer_is_not_double_persisted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gateway's final-answer write must not duplicate the engine's.
+
+    Guards the case where a run ends right after a tool round whose content the
+    engine already stored: appending the identical text again would show the
+    user the same reply twice on reload.
+    """
+    import json
+
+    from clawagents.gateway.chats_api import _persist_final_assistant
+    from clawagents.session.persistence import SessionWriter
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir(parents=True)
+    chat_id = "chat-dupe"
+    path = sessions_dir / f"{chat_id}.jsonl"
+    SessionWriter(session_id=chat_id, session_dir=sessions_dir).write_assistant_message(
+        "already stored"
+    )
+
+    def _count(text: str) -> int:
+        n = 0
+        for line in path.read_text(encoding="utf-8").splitlines():
+            event = json.loads(line)
+            if event.get("type") == "assistant_message" and event.get("content") == text:
+                n += 1
+        return n
+
+    _persist_final_assistant(path, sessions_dir, chat_id, "already stored")
+    assert _count("already stored") == 1, "identical final answer was appended twice"
+
+    _persist_final_assistant(path, sessions_dir, chat_id, "a genuinely new answer")
+    assert _count("a genuinely new answer") == 1, "a new final answer must be recorded"
+
+    for empty in ("", "   ", None):
+        _persist_final_assistant(path, sessions_dir, chat_id, empty)
+    assert len(path.read_text(encoding="utf-8").splitlines()) == 2, (
+        "empty results should not create assistant messages"
     )

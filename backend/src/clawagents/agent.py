@@ -196,6 +196,14 @@ class ClawAgent:
         images: Optional[list[dict]] = None,
         files: Optional[list[dict]] = None,
         session_end_tail: bool = True,
+        # ── Desktop-only (clawagents_desktop fork) ────────────────────────
+        # Re-added after a wholesale upstream overwrite of this file dropped
+        # them while gateway/chats_api.py kept passing all three, which made
+        # every desktop chat turn raise TypeError. Keep these when merging
+        # upstream — see backend/tests/desktop/test_session_threading.py.
+        session_id: Optional[str] = None,
+        session_dir: Optional[Path] = None,
+        permission_callback: Optional[Callable[[dict], Any]] = None,
     ) -> AgentState:
         """Start the ReAct agent loop for ``task``.
 
@@ -304,6 +312,9 @@ class ClawAgent:
             advisor_llm=self.advisor_llm,
             advisor_max_calls=self.advisor_max_calls,
             run_context=run_context,
+            session_id=session_id,
+            session_dir=session_dir,
+            permission_callback=permission_callback,
             user_context=user_context,
             hooks=hooks if hooks is not None else self.hooks,
             agent_hooks=agent_hooks if agent_hooks is not None else self.agent_hooks,
@@ -2022,7 +2033,29 @@ def _build_skill_catalog_prompt(
 
 
 _DEFAULT_MEMORY_FILES = ["AGENTS.md", "CLAWAGENTS.md", "CLAUDE.md"]
-_DEFAULT_SKILL_DIRS = ["skills", ".skills", "skill", ".skill", "Skills"]
+# Ordered lowest→highest precedence (SkillStore gives later dirs precedence).
+#
+# The agent-shell layouts below matter because real projects rarely use a bare
+# `skills/`: Cursor, Claude Code and friends each own a dotted directory, and a
+# desktop chat opened in such a project used to find nothing and re-invent work
+# the bundled skills already do. Keep them when merging upstream — the desktop's
+# own `desktop_stores/skills_catalog._AUTO_NAMES` carries the same list, and
+# this fallback runs whenever that resolution returns empty or raises.
+#
+# `.clawagents/skills` is where `marketplace.skills_install_dir()` writes, so
+# leaving it out meant an installed skill was never discovered.
+_DEFAULT_SKILL_DIRS = [
+    "skills",
+    ".skills",
+    "skill",
+    ".skill",
+    "Skills",
+    ".agents/skills",
+    ".agent/skills",
+    ".cursor/skills",
+    ".claude/skills",
+    ".clawagents/skills",
+]
 
 
 def _auto_discover_memory() -> list:

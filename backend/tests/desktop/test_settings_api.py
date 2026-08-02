@@ -11,6 +11,33 @@ from fastapi.testclient import TestClient
 from clawagents.gateway.settings_api import router as settings_router
 
 
+# The endpoint under test writes os.environ itself, so monkeypatch never learns
+# about the keys it creates: `monkeypatch.delenv(name, raising=False)` on a var
+# that was absent records nothing to restore, and the value the endpoint sets
+# afterwards outlives the test. That leaked XAI_API_KEY into the whole session
+# and failed an unrelated diagnostics assertion whenever collection order put
+# this file first. Snapshot and restore the keys these routes can touch.
+_PROVIDER_ENV_KEYS = (
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY",
+    "XAI_API_KEY",
+    "GROK_API_KEY",
+    "BEDROCK_API_KEY",
+)
+
+
+@pytest.fixture(autouse=True)
+def _restore_provider_env():
+    saved = {k: os.environ.get(k) for k in _PROVIDER_ENV_KEYS}
+    yield
+    for key, value in saved.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
 @pytest.fixture()
 def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     monkeypatch.delenv("GATEWAY_API_KEY", raising=False)

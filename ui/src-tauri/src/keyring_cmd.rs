@@ -13,10 +13,14 @@ use serde_json::{json, Value};
 const BUNDLE_ACCOUNT: &str = "api_keys_v1";
 const PROVIDERS: &[&str] = &["openai", "anthropic", "gemini", "bedrock", "xai"];
 
-static CACHE: OnceLock<Mutex<HashMap<(String, String), Option<String>>>> = OnceLock::new();
+/// (service, account) → the secret, or `None` for "looked up, not there".
+/// Caching the miss matters: it is what stops a second Keychain unlock prompt.
+type SecretCache = Mutex<HashMap<(String, String), Option<String>>>;
+
+static CACHE: OnceLock<SecretCache> = OnceLock::new();
 static BUNDLE_LOADED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
 
-fn cache() -> &'static Mutex<HashMap<(String, String), Option<String>>> {
+fn cache() -> &'static SecretCache {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -29,7 +33,7 @@ fn cache_key(service: &str, account: &str) -> (String, String) {
 }
 
 fn is_provider(account: &str) -> bool {
-    PROVIDERS.iter().any(|p| *p == account)
+    PROVIDERS.contains(&account)
 }
 
 fn read_entry_raw(service: &str, account: &str) -> Result<Option<String>, String> {
