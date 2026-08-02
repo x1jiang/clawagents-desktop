@@ -34,10 +34,10 @@ xcrun notarytool store-credentials clawagents-notary \
 SKIP_NOTARIZE=1 ./build.sh
 ```
 
-## Features (0.4.29)
+## Features (0.4.30)
 
 - **Default Auto-approve:** Edit + Execute on
-- **Engine 6.20.52:** deferred tools, background job notices, compaction reduction guard, native **xAI Grok**
+- **Engine 6.20.53:** split agent loop, chat memory persistence fix, pinned context, goal mode
 - **Settings / providers:** OpenAI / Anthropic / Gemini / **xAI** / **AWS Bedrock** (IAM / Mantle / gateway) / Ollama
 - **VS Code parity:** Memory browser, Skill Workshop, Context Observatory toggle, rewind abandoned-branch summary, checkpoint Diff panel
 - Local projects and **SSH remote** projects (`~/.ssh/config`, including `ProxyJump`)
