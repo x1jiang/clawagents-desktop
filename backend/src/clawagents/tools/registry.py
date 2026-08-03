@@ -929,8 +929,12 @@ class ToolRegistry:
                 command=args.get("command") if isinstance(args.get("command"), str) else None,
             )
             if not decision.allowed and not decision.requires_confirmation:
+                # ``output=auto_skill_prefix`` on this and the gates below: the
+                # drain above already committed the skill's remaining pages, so
+                # this ToolResult is the only place they can still reach the
+                # model; "" discarded them irrecoverably.
                 return ToolResult(
-                    success=False, output="",
+                    success=False, output=auto_skill_prefix or "",
                     error=(
                         f"Refused: '{tool_name}' is a write-class tool and you are in "
                         "plan mode. Call exit_plan_mode first, or restrict yourself "
@@ -967,7 +971,7 @@ class ToolRegistry:
                     ):
                         return ToolResult(
                             success=False,
-                            output="",
+                            output=auto_skill_prefix or "",
                             error=(
                                 f"Denied: the user rejected '{tool_name}'. Do not "
                                 "retry it; ask what they would like instead."
@@ -983,7 +987,7 @@ class ToolRegistry:
                 if invariant_reason:
                     return ToolResult(
                         success=False,
-                        output="",
+                        output=auto_skill_prefix or "",
                         error=invariant_reason,
                     )
 
@@ -998,7 +1002,7 @@ class ToolRegistry:
                 )
                 return ToolResult(
                     success=False,
-                    output="",
+                    output=auto_skill_prefix or "",
                     error=reason,
                 )
 
@@ -1009,7 +1013,7 @@ class ToolRegistry:
             validation = validate_tool_args(tool, args)
             if not validation.valid:
                 return ToolResult(
-                    success=False, output="",
+                    success=False, output=auto_skill_prefix or "",
                     error=f"Invalid parameters:\n{format_validation_errors(validation.errors)}",
                 )
             effective_args = validation.coerced

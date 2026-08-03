@@ -57,16 +57,27 @@ class SessionWriter:
         self._turn_count = 0
 
     def append(self, event_type: str, data: dict[str, Any] | None = None) -> None:
+        """Append one event.
+
+        A real append, not a read-modify-write (ported from upstream 6.20.54).
+        The old form re-read and rewrote the whole log per event — quadratic in
+        the log's size, and desktop chats grow the longest logs anywhere in the
+        ecosystem, since one file accumulates every turn of a conversation.
+        Rewriting also risked the entire log on a failed rename; an append can
+        only tear the final line, which ``SessionReader`` now skips.
+        """
         event = {"type": event_type, "ts": time.time()}
         if data:
             event.update(data)
-        from clawagents.utils.atomic_write import atomic_write_text
-        existing = ""
+        line = json.dumps(event, default=str) + "\n"
         try:
-            existing = self.path.read_text(encoding="utf-8")
+            with open(self.path, "a", encoding="utf-8") as handle:
+                handle.write(line)
         except FileNotFoundError:
-            pass
-        atomic_write_text(self.path, existing + json.dumps(event, default=str) + "\n")
+            # The session directory can be removed underneath a long chat.
+            self.dir.mkdir(parents=True, exist_ok=True)
+            with open(self.path, "a", encoding="utf-8") as handle:
+                handle.write(line)
 
     def write_chat_meta(
         self,
@@ -91,6 +102,17 @@ class SessionWriter:
 
     def write_system_prompt(self, content: str) -> None:
         self.append("system_prompt", {"content": content})
+
+    def write_user_message(self, content: str) -> None:
+        """Record the prompt that started a turn (upstream 6.20.54 parity).
+
+        On desktop the *gateway* is the caller — it writes the raw text the
+        user typed, before invoke, so a crashed turn still shows the prompt.
+        The engine-side write upstream added in run_bootstrapper is deliberately
+        NOT taken into this fork: it would record the augmented task (project
+        context prepended) as a second, uglier copy of every prompt.
+        """
+        self.append("user_message", {"content": content})
 
     def write_turn_started(self, iteration: int) -> None:
         self._turn_count += 1
@@ -152,11 +174,17 @@ class SessionReader:
         self._load()
 
     def _load(self) -> None:
-        with open(self.path) as f:
+        with open(self.path, encoding="utf-8", errors="replace") as f:
             for line in f:
                 line = line.strip()
-                if line:
+                if not line:
+                    continue
+                try:
                     self.events.append(json.loads(line))
+                except (json.JSONDecodeError, ValueError):
+                    # A process killed mid-append leaves a partial final line.
+                    # Losing that one event beats refusing to load the chat.
+                    continue
 
     def reconstruct_messages(self) -> list[LLMMessage]:
         """Rebuild LLMMessage list from session events."""
