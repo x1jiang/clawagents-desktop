@@ -41,6 +41,9 @@ class AppSettings:
     mcp_enabled: bool = False
     mcp_trust_workspace: bool = False
     context_mode: bool = True
+    # When True (default), agent may show real clinical/tool sample rows with
+    # identifiers redacted. Off = refuse patient/MRN/OR_LOG IDs entirely.
+    allow_clinical_samples: bool = True
     browser_tools: bool = False
     trajectory: bool = False
     learn: bool = False

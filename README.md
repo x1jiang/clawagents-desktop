@@ -34,10 +34,11 @@ xcrun notarytool store-credentials clawagents-notary \
 SKIP_NOTARIZE=1 ./build.sh
 ```
 
-## Features (0.4.30)
+## Features (0.4.31)
 
+- **Allow clinical sample rows (default on):** Settings → Agent checkbox so the agent shows real tool/query sample rows with patient ID / MRN / `OR_LOG` ID redacted, instead of soft-refusing with a PHI disclaimer
 - **Default Auto-approve:** Edit + Execute on
-- **Engine 6.20.53:** split agent loop, chat memory persistence fix, pinned context, goal mode
+- **Engine 6.20.54:** O(1) session append, skill discovery, resume replay
 - **Settings / providers:** OpenAI / Anthropic / Gemini / **xAI** / **AWS Bedrock** (IAM / Mantle / gateway) / Ollama
 - **VS Code parity:** Memory browser, Skill Workshop, Context Observatory toggle, rewind abandoned-branch summary, checkpoint Diff panel
 - Local projects and **SSH remote** projects (`~/.ssh/config`, including `ProxyJump`)

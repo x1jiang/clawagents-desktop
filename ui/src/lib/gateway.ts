@@ -106,6 +106,7 @@ export interface AppSettings {
   mcp_enabled: boolean;
   mcp_trust_workspace: boolean;
   context_mode: boolean;
+  allow_clinical_samples?: boolean;
   browser_tools: boolean;
   trajectory: boolean;
   learn: boolean;

@@ -55,6 +55,7 @@ export function SettingsModal({ onClose }: Props) {
   const [mcpEnabled, setMcpEnabled] = useState(false);
   const [mcpTrust, setMcpTrust] = useState(false);
   const [contextMode, setContextMode] = useState(true);
+  const [allowClinicalSamples, setAllowClinicalSamples] = useState(true);
   const [ensureCompanions, setEnsureCompanions] = useState(true);
   const [contextObservatory, setContextObservatory] = useState(false);
   const [companionBusy, setCompanionBusy] = useState(false);
@@ -107,6 +108,7 @@ export function SettingsModal({ onClose }: Props) {
         setMcpEnabled(Boolean(s.mcp_enabled));
         setMcpTrust(Boolean(s.mcp_trust_workspace));
         setContextMode(s.context_mode !== false);
+        setAllowClinicalSamples(s.allow_clinical_samples !== false);
         setEnsureCompanions(s.ensure_companions !== false);
         setContextObservatory(Boolean(s.context_observatory));
         setBrowserTools(Boolean(s.browser_tools));
@@ -248,6 +250,7 @@ export function SettingsModal({ onClose }: Props) {
           mcp_enabled: mcpEnabled,
           mcp_trust_workspace: mcpTrust,
           context_mode: contextMode,
+          allow_clinical_samples: allowClinicalSamples,
           ensure_companions: ensureCompanions,
           context_observatory: contextObservatory,
           browser_tools: browserTools,
@@ -721,6 +724,7 @@ export function SettingsModal({ onClose }: Props) {
                       [mcpEnabled, setMcpEnabled, "Enable MCP servers (~/.clawagents/mcp.json)"],
                       [mcpTrust, setMcpTrust, "Trust workspace .clawagents/mcp.json"],
                       [contextMode, setContextMode, "Context Mode tools"],
+                      [allowClinicalSamples, setAllowClinicalSamples, "Allow clinical sample rows (redact identifiers)"],
                       [ensureCompanions, setEnsureCompanions, "Ensure companions on Doctor (context-mode / rtk)"],
                       [contextObservatory, setContextObservatory, "Context Observatory (write .clawagents/context-observatory/)"],
                       [browserTools, setBrowserTools, "Browser tools (Playwright)"],

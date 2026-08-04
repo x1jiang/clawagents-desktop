@@ -72,6 +72,7 @@ def _settings_payload(s) -> dict:
         "mcp_enabled": s.mcp_enabled,
         "mcp_trust_workspace": s.mcp_trust_workspace,
         "context_mode": s.context_mode,
+        "allow_clinical_samples": s.allow_clinical_samples,
         "browser_tools": s.browser_tools,
         "trajectory": s.trajectory,
         "learn": s.learn,
@@ -144,6 +145,7 @@ class AppSettingsPatchBody(BaseModel):
     mcp_enabled: bool | None = None
     mcp_trust_workspace: bool | None = None
     context_mode: bool | None = None
+    allow_clinical_samples: bool | None = None
     browser_tools: bool | None = None
     trajectory: bool | None = None
     learn: bool | None = None
@@ -221,6 +223,8 @@ def patch_app_settings(
             settings.mcp_enabled = bool(body.mcp_enabled)
         if "context_mode" in sent and body.context_mode is not None:
             settings.context_mode = bool(body.context_mode)
+        if "allow_clinical_samples" in sent and body.allow_clinical_samples is not None:
+            settings.allow_clinical_samples = bool(body.allow_clinical_samples)
         if "browser_tools" in sent and body.browser_tools is not None:
             settings.browser_tools = bool(body.browser_tools)
         if "trajectory" in sent and body.trajectory is not None:
