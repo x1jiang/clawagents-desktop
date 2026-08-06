@@ -19,12 +19,25 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
 # ─── Python venv ──────────────────────────────────────────────────────
-if [ ! -x "backend/.venv/bin/python3" ]; then
+PYTHON="backend/.venv/bin/python3"
+if [ ! -x "$PYTHON" ]; then
   echo "[start] Creating backend/.venv …"
   python3 -m venv backend/.venv
-  echo "[start] Installing backend in editable mode + tiktoken …"
-  backend/.venv/bin/pip install --upgrade pip >/dev/null
-  backend/.venv/bin/pip install -e backend/ tiktoken
+fi
+
+# A venv directory can survive a source checkout while its editable
+# ``clawagents`` package or the optional MCP dependency is absent/stale. Check
+# imports rather than treating the presence of a Python executable as healthy.
+if ! "$PYTHON" - <<'PY' >/dev/null 2>&1
+from importlib.metadata import version
+import clawagents  # noqa: F401
+
+assert int(version("mcp").split(".", 1)[0]) < 2
+PY
+then
+  echo "[start] Installing compatible desktop backend + MCP support …"
+  "$PYTHON" -m pip install --upgrade pip >/dev/null
+  "$PYTHON" -m pip install -e "backend[mcp]" tiktoken
 else
   echo "[start] Python venv OK."
 fi

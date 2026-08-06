@@ -54,6 +54,18 @@ def test_mcp_subpackage_imports_without_optional_sdk():
     assert mcp_module.MCPServerManager is not None
 
 
+def test_client_session_timeout_matches_mcp_sdk_major_version():
+    """MCP 2 accepts seconds; MCP 1 requires a ``timedelta``."""
+    from datetime import timedelta
+
+    from clawagents.mcp.server import _client_session_read_timeout
+
+    assert _client_session_read_timeout(None, mcp_version="2.0.0") is None
+    assert _client_session_read_timeout(0, mcp_version="2.0.0") is None
+    assert _client_session_read_timeout(120, mcp_version="1.28.1") == timedelta(seconds=120)
+    assert _client_session_read_timeout(120, mcp_version="2.0.0") == 120.0
+
+
 def test_lifecycle_phase_enum_values():
     """Phase enum must include every documented state from the brief."""
     from clawagents.mcp import MCPLifecyclePhase

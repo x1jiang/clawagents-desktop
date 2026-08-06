@@ -22,6 +22,8 @@ import logging
 import os
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
+from datetime import timedelta
+from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Optional, TypedDict, Union
 
@@ -29,6 +31,44 @@ from clawagents.redact import is_secret_name
 from clawagents.tracing import custom_span, tool_span
 
 logger = logging.getLogger(__name__)
+
+
+def _http_timeout_seconds(value: Any) -> float:
+    """Coerce HTTP/SSE timeout params to float seconds for ``httpx``.
+
+    The MCP SDK's ``sse_client`` builds ``httpx.Timeout(timeout, read=sse_read_timeout)``
+    without converting ``timedelta``. ``httpcore``/``anyio`` then do
+    ``current_time() + delay`` and raise
+    ``TypeError: unsupported operand type(s) for +: 'float' and 'datetime.timedelta'``.
+    ``streamablehttp_client`` already converts; we normalize both transports.
+    """
+    if isinstance(value, timedelta):
+        return float(value.total_seconds())
+    return float(value)
+
+
+def _client_session_read_timeout(
+    timeout_seconds: Optional[float], *, mcp_version: Optional[str] = None
+) -> float | timedelta | None:
+    """Return the timeout shape accepted by the installed MCP client SDK.
+
+    MCP 1.x expects ``timedelta`` for ``ClientSession.read_timeout_seconds``;
+    MCP 2.x changed that argument to numeric seconds. Supplying the former to
+    the latter reaches AnyIO as ``float + timedelta``, which prevents stdio
+    MCP servers such as Context Mode from completing their handshake.
+    """
+    if timeout_seconds is None or timeout_seconds <= 0:
+        return None
+    if mcp_version is None:
+        try:
+            mcp_version = package_version("mcp")
+        except PackageNotFoundError:
+            mcp_version = "1"
+    try:
+        major = int(mcp_version.split(".", 1)[0])
+    except (AttributeError, TypeError, ValueError):
+        major = 1
+    return float(timeout_seconds) if major >= 2 else timedelta(seconds=float(timeout_seconds))
 
 
 # ─── Environment scrubbing for stdio MCP servers ──────────────────────────
@@ -193,8 +233,8 @@ class MCPServerSseParams(TypedDict, total=False):
 
     url: str
     headers: dict[str, str]
-    timeout: float
-    sse_read_timeout: float
+    timeout: float | timedelta
+    sse_read_timeout: float | timedelta
 
 
 class MCPServerStreamableHttpParams(TypedDict, total=False):
@@ -202,8 +242,8 @@ class MCPServerStreamableHttpParams(TypedDict, total=False):
 
     url: str
     headers: dict[str, str]
-    timeout: float
-    sse_read_timeout: float
+    timeout: float | timedelta
+    sse_read_timeout: float | timedelta
     terminate_on_close: bool
 
 
@@ -329,18 +369,13 @@ class MCPServer(abc.ABC):
         ):
             return  # Already connecting / ready
         import asyncio as _asyncio
-        from datetime import timedelta
 
         from mcp import ClientSession
 
         self._transition(MCPLifecyclePhase.CONNECTING)
         self._exit_stack = AsyncExitStack()
         timeout_s = self.client_session_timeout_seconds
-        read_timeout = (
-            timedelta(seconds=float(timeout_s))
-            if timeout_s is not None and float(timeout_s) > 0
-            else None
-        )
+        read_timeout = _client_session_read_timeout(timeout_s)
         # Handshake budget: session read timeout, or 30s floor so one hung
         # server cannot block agent construction forever.
         connect_budget = float(timeout_s) if timeout_s and float(timeout_s) > 0 else 30.0
@@ -589,9 +624,14 @@ class MCPServerSse(MCPServer):
         from mcp.client.sse import sse_client
 
         kwargs: dict[str, Any] = {"url": self.params["url"]}
-        for key in ("headers", "timeout", "sse_read_timeout"):
-            if key in self.params:
-                kwargs[key] = self.params[key]  # type: ignore[literal-required]
+        if "headers" in self.params:
+            kwargs["headers"] = self.params["headers"]
+        if "timeout" in self.params:
+            kwargs["timeout"] = _http_timeout_seconds(self.params["timeout"])
+        if "sse_read_timeout" in self.params:
+            kwargs["sse_read_timeout"] = _http_timeout_seconds(
+                self.params["sse_read_timeout"]
+            )
         return sse_client(**kwargs)
 
 
@@ -626,7 +666,14 @@ class MCPServerStreamableHttp(MCPServer):
         from mcp.client.streamable_http import streamablehttp_client
 
         kwargs: dict[str, Any] = {"url": self.params["url"]}
-        for key in ("headers", "timeout", "sse_read_timeout", "terminate_on_close"):
-            if key in self.params:
-                kwargs[key] = self.params[key]  # type: ignore[literal-required]
+        if "headers" in self.params:
+            kwargs["headers"] = self.params["headers"]
+        if "timeout" in self.params:
+            kwargs["timeout"] = _http_timeout_seconds(self.params["timeout"])
+        if "sse_read_timeout" in self.params:
+            kwargs["sse_read_timeout"] = _http_timeout_seconds(
+                self.params["sse_read_timeout"]
+            )
+        if "terminate_on_close" in self.params:
+            kwargs["terminate_on_close"] = self.params["terminate_on_close"]
         return streamablehttp_client(**kwargs)
