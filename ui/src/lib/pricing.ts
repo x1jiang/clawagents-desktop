@@ -69,6 +69,7 @@ const PRICES: Record<string, Price> = {
   "claude-haiku-4-5": withCache(1, 5, 0.1, 1.25),
   "claude-haiku-4-5-20251001": withCache(1, 5, 0.1, 1.25),
   // Google Gemini
+  "gemini-3.7-flash": withCache(0.75, 3.75),
   "gemini-3.6-flash": withCache(1.5, 7.5),
   "gemini-3.5-flash": withCache(1.5, 9),
   "gemini-3.5-flash-lite": withCache(0.3, 2.5),

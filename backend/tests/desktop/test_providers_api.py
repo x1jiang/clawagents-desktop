@@ -30,6 +30,7 @@ def test_returns_catalog(client: TestClient) -> None:
     assert {"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.6"} <= openai_ids
     gemini_ids = {m["id"] for m in by_id["gemini"]["models"]}
     assert {
+        "gemini-3.7-flash",
         "gemini-3.6-flash",
         "gemini-3.5-flash",
         "gemini-3.5-flash-lite",

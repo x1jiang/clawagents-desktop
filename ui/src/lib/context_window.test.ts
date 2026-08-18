@@ -51,7 +51,8 @@ describe("contextWindowFor — current model catalog", () => {
     expect(contextWindowFor("gpt-5.4-nano")).toBe(400_000);
   });
 
-  test("gemini-3.6 / 3.5 / 3.1 family resolve to 1M", () => {
+  test("gemini-3.7 / 3.6 / 3.5 / 3.1 family resolve to 1M", () => {
+    expect(contextWindowFor("gemini-3.7-flash")).toBe(1_000_000);
     expect(contextWindowFor("gemini-3.6-flash")).toBe(1_000_000);
     expect(contextWindowFor("gemini-3.5-flash")).toBe(1_000_000);
     expect(contextWindowFor("gemini-3.5-flash-lite")).toBe(1_000_000);
