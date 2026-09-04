@@ -1,6 +1,6 @@
 {
   "intentional_fork_hashes": {
-    "agent.py": "02b4aea5589caae532b794e0410945edd72df6ec93e155a6145e86c517496015",
+    "agent.py": "56f1631b676b003ef0c1427e876777e9b75535c35111da512b6739e0c88376e7",
     "gateway/server.py": "05159a81d3932a4c7d6f6d690a676b99030902eb8a3610f94a91d0ea0b38725a",
     "graph/agent_loop.py": "709a12ef57f4f8a2b3e33f5b9e7942960c3ac9d7c7763a26e067b0eaa61ea5de",
     "graph/run_bootstrapper.py": "794f5569f533535aff9b463c41e567ab2fcc5726b59c6c26b9f12db8e0de443c",
@@ -279,7 +279,7 @@
     "utils/bounded_output.py"
   ],
   "shared_hashes": {
-    "__init__.py": "1d066e965ce4aa1c30b8eaf8f689ac80fcae7929be03006aa0a5a43cf3b06361",
+    "__init__.py": "4fb1fcbcd14c5a3039baf50105c1af67b56381897f13c6fb0332bba0efe60166",
     "__main__.py": "513b39e14642ace15b550112895bec3fc0d9696e4f8e26314869376dba177040",
     "acp/__init__.py": "ba852d2201e87c79e126fd58f1b88d7320245633c12125dbfb37ddaf3e276ac4",
     "acp/errors.py": "818d652be630903cfb72a7b96a763fb525f155a005519646ffee88ac06b60aa5",
@@ -534,7 +534,7 @@
     "utils/bounded_output.py": "6184cf21ce56c70deebb712a0a6672b8cb2086342deb44fd7370693e37879842"
   },
   "upstream_hashes": {
-    "__init__.py": "1d066e965ce4aa1c30b8eaf8f689ac80fcae7929be03006aa0a5a43cf3b06361",
+    "__init__.py": "4fb1fcbcd14c5a3039baf50105c1af67b56381897f13c6fb0332bba0efe60166",
     "__main__.py": "513b39e14642ace15b550112895bec3fc0d9696e4f8e26314869376dba177040",
     "acp/__init__.py": "ba852d2201e87c79e126fd58f1b88d7320245633c12125dbfb37ddaf3e276ac4",
     "acp/errors.py": "818d652be630903cfb72a7b96a763fb525f155a005519646ffee88ac06b60aa5",
