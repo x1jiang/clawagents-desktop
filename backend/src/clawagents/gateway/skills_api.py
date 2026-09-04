@@ -177,10 +177,32 @@ def _safe_proposal_id(proposal_id: str) -> str:
 
 
 @router.get("/skills/workshop")
-def list_workshop(project_id: str | None = Query(default=None)) -> dict:
+def list_workshop(
+    project_id: str | None = Query(default=None),
+    limit: int | None = Query(default=None),
+) -> dict:
     root = _project_root(project_id)
-    rows = _workshop(root).list()
-    return {"ok": True, "workspace": str(root), "proposals": rows}
+    svc = _workshop(root)
+    rows = svc.list()
+    impact_info = svc.impact(limit=limit)
+    return {
+        "ok": True,
+        "workspace": str(root),
+        "proposals": rows,
+        "skill_impact_path": impact_info.get("skill_impact_path"),
+        "skill_impact_relative_path": impact_info.get("skill_impact_relative_path"),
+        "skill_impact_preview": impact_info.get("skill_impact_preview"),
+    }
+
+
+@router.get("/skills/workshop/impact")
+def get_workshop_impact(
+    project_id: str | None = Query(default=None),
+    limit: int | None = Query(default=None),
+) -> dict:
+    root = _project_root(project_id)
+    out = _workshop(root).impact(limit=limit)
+    return {"ok": True, "workspace": str(root), **out}
 
 
 @router.get("/skills/workshop/{proposal_id}")

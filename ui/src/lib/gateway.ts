@@ -700,7 +700,7 @@ export class GatewayClient {
     });
   }
 
-  listWorkshop(projectId?: string | null): Promise<{
+  listWorkshop(projectId?: string | null, limit?: number): Promise<{
     ok: boolean;
     workspace: string;
     proposals: Array<{
@@ -714,10 +714,32 @@ export class GatewayClient {
       evidence?: string;
       scan_findings: string[];
       support_file_count: number;
+      reason?: string;
     }>;
+    skill_impact_path?: string;
+    skill_impact_relative_path?: string;
+    skill_impact_preview?: string;
   }> {
-    const q = projectId ? `?project_id=${encodeURIComponent(projectId)}` : "";
-    return this.request(`/skills/workshop${q}`);
+    const params = new URLSearchParams();
+    if (projectId) params.set("project_id", projectId);
+    if (limit != null) params.set("limit", String(limit));
+    const qs = params.toString() ? `?${params.toString()}` : "";
+    return this.request(`/skills/workshop${qs}`);
+  }
+
+  impactWorkshop(projectId?: string | null, limit?: number): Promise<{
+    ok: boolean;
+    workspace: string;
+    skill_impact_path?: string;
+    skill_impact_relative_path?: string;
+    skill_impact_preview?: string;
+    content?: string;
+  }> {
+    const params = new URLSearchParams();
+    if (projectId) params.set("project_id", projectId);
+    if (limit != null) params.set("limit", String(limit));
+    const qs = params.toString() ? `?${params.toString()}` : "";
+    return this.request(`/skills/workshop/impact${qs}`);
   }
 
   inspectWorkshop(proposalId: string, projectId?: string | null): Promise<Record<string, unknown>> {

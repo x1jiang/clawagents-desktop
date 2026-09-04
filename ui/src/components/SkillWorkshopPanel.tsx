@@ -15,6 +15,7 @@ interface Proposal {
   scan_findings: string[];
   support_file_count: number;
   body?: string;
+  reason?: string;
 }
 
 interface Props {
@@ -33,6 +34,10 @@ export function SkillWorkshopPanel({ projectId, open, onClose }: Props) {
   const [busyId, setBusyId] = useState<string | null>(null);
   const [installSource, setInstallSource] = useState("");
   const [installing, setInstalling] = useState(false);
+  const [impactPreview, setImpactPreview] = useState<string>("");
+  const [impactRelativePath, setImpactRelativePath] = useState<string>(".clawagents/skill-workshop/skill-impact.md");
+  const [showImpactLedger, setShowImpactLedger] = useState(false);
+  const [actionReason, setActionReason] = useState<Record<string, string>>({});
 
   async function reload() {
     if (!client || !projectId) return;
@@ -44,6 +49,8 @@ export function SkillWorkshopPanel({ projectId, open, onClose }: Props) {
       ]);
       setProposals(ws.proposals || []);
       setPackages(market.packages || []);
+      if (ws.skill_impact_preview) setImpactPreview(ws.skill_impact_preview);
+      if (ws.skill_impact_relative_path) setImpactRelativePath(ws.skill_impact_relative_path);
     } catch (e) {
       pushToast((e as Error).message, "error");
       setProposals([]);
@@ -73,6 +80,7 @@ export function SkillWorkshopPanel({ projectId, open, onClose }: Props) {
   async function act(id: string, action: "apply" | "reject" | "quarantine") {
     if (!client) return;
     setBusyId(id);
+    const reason = actionReason[id]?.trim() || "";
     try {
       let result: {
         ok: boolean;
@@ -84,9 +92,9 @@ export function SkillWorkshopPanel({ projectId, open, onClose }: Props) {
       if (action === "apply") {
         result = await client.applyWorkshop(id, projectId);
       } else if (action === "reject") {
-        result = await client.rejectWorkshop(id, projectId);
+        result = await client.rejectWorkshop(id, projectId, reason);
       } else {
-        result = await client.quarantineWorkshop(id, projectId);
+        result = await client.quarantineWorkshop(id, projectId, reason);
       }
       if (!result.ok) {
         pushToast(result.error || `${action} failed`, "error");
@@ -103,6 +111,11 @@ export function SkillWorkshopPanel({ projectId, open, onClose }: Props) {
           "success",
         );
         setSelected(null);
+        setActionReason((prev) => {
+          const next = { ...prev };
+          delete next[id];
+          return next;
+        });
         await reload();
       }
     } catch (e) {
@@ -214,14 +227,23 @@ export function SkillWorkshopPanel({ projectId, open, onClose }: Props) {
                     Scan findings: {p.scan_findings.slice(0, 2).join("; ")}
                   </p>
                 )}
+                <div className="flex items-center gap-2 pt-1">
+                  <input
+                    type="text"
+                    value={actionReason[p.id] || ""}
+                    onChange={(e) => setActionReason((prev) => ({ ...prev, [p.id]: e.target.value }))}
+                    placeholder="Optional reject/quarantine reason (persisted in skill-impact.md)…"
+                    className="flex-1 px-2 py-1 text-xs border border-gray-300 dark:border-gray-700 rounded bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder-gray-400"
+                  />
+                </div>
                 <div className="flex flex-wrap gap-2">
-                  <button type="button" disabled={busyId === p.id} className="px-2 py-1 text-xs border rounded" onClick={() => void act(p.id, "apply")}>
+                  <button type="button" disabled={busyId === p.id} className="px-2.5 py-1 text-xs font-medium bg-blue-600 hover:bg-blue-700 text-white rounded disabled:opacity-50" onClick={() => void act(p.id, "apply")}>
                     Apply
                   </button>
-                  <button type="button" disabled={busyId === p.id} className="px-2 py-1 text-xs border rounded" onClick={() => void act(p.id, "reject")}>
+                  <button type="button" disabled={busyId === p.id} className="px-2.5 py-1 text-xs border border-red-300 dark:border-red-700 hover:bg-red-50 dark:hover:bg-red-950/30 text-red-700 dark:text-red-300 rounded disabled:opacity-50" onClick={() => void act(p.id, "reject")}>
                     Reject
                   </button>
-                  <button type="button" disabled={busyId === p.id} className="px-2 py-1 text-xs border rounded" onClick={() => void act(p.id, "quarantine")}>
+                  <button type="button" disabled={busyId === p.id} className="px-2.5 py-1 text-xs border border-amber-300 dark:border-amber-700 hover:bg-amber-50 dark:hover:bg-amber-950/30 text-amber-700 dark:text-amber-300 rounded disabled:opacity-50" onClick={() => void act(p.id, "quarantine")}>
                     Quarantine
                   </button>
                 </div>
@@ -233,12 +255,53 @@ export function SkillWorkshopPanel({ projectId, open, onClose }: Props) {
             <section className="space-y-2">
               <h3 className="text-sm font-medium text-gray-800 dark:text-gray-100">History</h3>
               {other.slice(0, 12).map((p) => (
-                <div key={p.id} className="text-xs text-gray-500 dark:text-gray-400 font-mono">
-                  {p.status} · {p.name} · {p.id.slice(0, 8)}
+                <div key={p.id} className="text-xs text-gray-500 dark:text-gray-400 font-mono flex flex-col gap-0.5">
+                  <div className="flex items-baseline gap-2">
+                    <span className="uppercase text-[10px] px-1 py-0.5 rounded bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300 font-semibold">{p.status}</span>
+                    <span className="font-medium text-gray-800 dark:text-gray-200">{p.name}</span>
+                    <span className="text-gray-400 text-[10px]">{p.id.slice(0, 8)}</span>
+                  </div>
+                  {p.reason ? (
+                    <div className="text-[11px] text-gray-600 dark:text-gray-400 pl-2 border-l-2 border-gray-300 dark:border-gray-700 italic">
+                      "{p.reason}"
+                    </div>
+                  ) : null}
                 </div>
               ))}
             </section>
           )}
+
+          <section className="space-y-2 border-t border-gray-200 dark:border-gray-700 pt-3">
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-medium text-gray-800 dark:text-gray-100 flex items-center gap-2">
+                <span>Skill Impact Ledger</span>
+                <span className="text-[10px] text-gray-400 font-mono">({impactRelativePath})</span>
+              </h3>
+              <div className="flex items-center gap-2">
+                {projectId && (
+                  <button
+                    type="button"
+                    className="text-xs text-blue-600 dark:text-blue-300 hover:underline"
+                    onClick={() => openFile(projectId, impactRelativePath)}
+                  >
+                    Open in editor
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="text-xs text-gray-500 hover:text-gray-700 dark:hover:text-gray-300"
+                  onClick={() => setShowImpactLedger(!showImpactLedger)}
+                >
+                  {showImpactLedger ? "Collapse" : "Preview"}
+                </button>
+              </div>
+            </div>
+            {showImpactLedger && (
+              <pre className="text-[11px] max-h-56 overflow-auto whitespace-pre-wrap font-mono bg-gray-50 dark:bg-gray-950 p-3 rounded border border-gray-200 dark:border-gray-800 text-gray-700 dark:text-gray-300">
+                {impactPreview || "(no impact entries recorded yet)"}
+              </pre>
+            )}
+          </section>
 
           {selected && (
             <section className="border border-teal-600/40 rounded-md p-3 space-y-2 bg-teal-50/40 dark:bg-teal-950/20">
