@@ -3,7 +3,8 @@ from importlib.metadata import PackageNotFoundError, version as _pkg_version
 try:
     __version__ = _pkg_version("clawagents")
 except PackageNotFoundError:
-    __version__ = "6.20.66"
+    # Source checkout / editable tree before the dist-info exists.
+    __version__ = "6.20.68"
 
 from clawagents.agent import ClawAgent, create_claw_agent
 from clawagents.run_result import RunResult

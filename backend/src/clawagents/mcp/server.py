@@ -50,12 +50,11 @@ def _http_timeout_seconds(value: Any) -> float:
 def _client_session_read_timeout(
     timeout_seconds: Optional[float], *, mcp_version: Optional[str] = None
 ) -> float | timedelta | None:
-    """Return the timeout shape accepted by the installed MCP client SDK.
+    """Return the timeout type expected by the installed MCP client SDK.
 
-    MCP 1.x expects ``timedelta`` for ``ClientSession.read_timeout_seconds``;
-    MCP 2.x changed that argument to numeric seconds. Supplying the former to
-    the latter reaches AnyIO as ``float + timedelta``, which prevents stdio
-    MCP servers such as Context Mode from completing their handshake.
+    MCP 1.x expects a ``timedelta`` while MCP 2.x expects numeric seconds.
+    Accepting both keeps already-created sidecars working during upgrades;
+    the package constraint keeps fresh installs on the supported 1.x line.
     """
     if timeout_seconds is None or timeout_seconds <= 0:
         return None
