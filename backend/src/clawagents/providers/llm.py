@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -240,7 +241,8 @@ async def _invoke_callback(
     if cb is None:
         return
     try:
-        if asyncio.iscoroutinefunction(cb):
+        # asyncio.iscoroutinefunction is deprecated (removed in 3.16).
+        if inspect.iscoroutinefunction(cb):
             await cb(text)
         else:
             cb(text)
@@ -272,8 +274,6 @@ async def _with_retry(
 
         if _feat_cb("provider_circuit_breaker"):
             from clawagents.circuit_breaker import (
-                BreakerOpen,
-                Outcome,
                 get_provider_breaker,
             )
 

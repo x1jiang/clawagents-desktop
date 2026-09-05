@@ -4,7 +4,7 @@ try:
     __version__ = _pkg_version("clawagents")
 except PackageNotFoundError:
     # Source checkout / editable tree before the dist-info exists.
-    __version__ = "6.20.69"
+    __version__ = "6.20.71"
 
 from clawagents.agent import ClawAgent, create_claw_agent
 from clawagents.run_result import RunResult
@@ -106,7 +106,9 @@ from clawagents.tools.catalog import create_tool_discovery_tools, names_for_tool
 from clawagents.explorer import create_explorer_tools
 from clawagents.prompts import (
     PROMPT_CACHE_BOUNDARY,
+    append_pinned_context,
     append_prompt_injection,
+    build_pinned_block,
     build_prompt_injection,
     build_system_prompt,
 )
@@ -334,10 +336,14 @@ from clawagents.rl import (
 # ── Grok-Build parity (v6.14+) ─────────────────────────────────────────
 from clawagents.autopilot.loop import run_autopilot
 from clawagents.marketplace import install_from_source, list_installed
+# ``list_profiles`` is already exported above from clawagents.paths (the
+# ``~/.clawagents/<profile>`` directory enumerator). The sandbox catalog has
+# the same function name, so re-export it under a distinct alias instead of
+# silently shadowing the paths helper.
 from clawagents.sandbox.profiles import (
     OSSandboxProfile,
     get_profile,
-    list_profiles,
+    list_profiles as list_sandbox_profiles,
     resolve_sandbox,
 )
 from clawagents.tools.subagent_resolve import resolve_subagent, ResolvedSubAgent

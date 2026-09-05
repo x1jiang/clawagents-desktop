@@ -21,16 +21,19 @@ Efficiency features (learned from deepagents/openclaw):
 
 from __future__ import annotations
 
+# This module is a compatibility facade: many helpers were extracted into
+# sibling ``graph/*`` modules but are still imported from here by tests and
+# downstream integrations, so unused-import checks are disabled file-wide.
+# ruff: noqa: F401
+
 import asyncio
 import json
 import logging
-import os
-import re
 import signal
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Literal, Optional
+from typing import Any, Callable, Literal, Optional
 
 from clawagents.providers.llm import LLMProvider, LLMMessage, LLMResponse, NativeToolSchema
 from clawagents.tools.registry import ToolRegistry, ParsedToolCall, ToolResult
@@ -288,28 +291,10 @@ class AgentState:
     guardrail_triggered: Optional[str] = None
 
 
-BASE_SYSTEM_PROMPT = """You are a ClawAgent, an AI assistant that helps users accomplish tasks using tools. You respond with text and tool calls.
-
-## Core Behavior
-- Be concise and direct. Don't over-explain unless asked.
-- NEVER add unnecessary preamble ("Sure!", "Great question!", "I'll now...").
-- If the request is ambiguous, ask questions before acting.
-
-## Doing Tasks
-When the user asks you to do something:
-1. Think briefly about your approach, then act immediately using tools.
-2. After getting tool results, continue using more tools or provide the final answer.
-3. When done, provide the final answer directly. Do NOT ask if the user wants more.
-
-Keep working until the task is fully complete.
-
-## Efficiency Rules
-- NEVER re-read a file you already have in context. Use the data from previous tool results.
-- NEVER call the same tool with the same arguments twice. If you already have the result, use it.
-- Batch independent tool calls into a single response when possible (use the array syntax).
-- Prefer fewer, well-targeted tool calls over many exploratory ones.
-- Use todo/planning tools only for broad or long-running tasks. Skip todo bookkeeping for bounded lookup, read, compare, or JSON-report tasks.
-- Once tool results contain enough evidence to answer, stop calling tools and answer directly. Do not call tools only to mark progress complete."""
+# Built-in base prompt now lives in clawagents.prompts.base (configurable via
+# base_prompt=, CLAW_BASE_PROMPT[_FILE], .clawagents/base-prompt.md). This name
+# is kept as a re-export for callers that imported it from here.
+from clawagents.prompts.base import DEFAULT_BASE_SYSTEM_PROMPT as BASE_SYSTEM_PROMPT
 
 
 # (Token estimation + arg truncation imported above from tool_observation)

@@ -24,15 +24,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
 from typing import Any, Callable
 
-from clawagents.channels.types import ChannelAdapter, ChannelMessage
+from clawagents.channels.types import ChannelMessage
 
 _BAILEYS_HELPER = '''
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require("baileys");
@@ -127,7 +125,7 @@ class WhatsAppAdapter:
 
     async def _read_loop(self) -> None:
         assert self._proc and self._proc.stdout
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         while True:
             line = await loop.run_in_executor(None, self._proc.stdout.readline)
             if not line:
